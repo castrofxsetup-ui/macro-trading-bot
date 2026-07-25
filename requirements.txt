@@ -1,2 +1,4 @@
 discord.py==2.4.0
 audioop-lts
+fastapi==0.111.0
+uvicorn==0.30.1
