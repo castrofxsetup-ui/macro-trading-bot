@@ -24,7 +24,7 @@ threading.Thread(target=run_web_server, daemon=True).start()
 
 # НАСТРОЙКИ КАНАЛОВ БОТА
 NEWS_CHANNEL_ID = 1528319066513604688     # Ветка для красных новостей Forex Factory
-STREAMS_CHANNEL_ID = 1528506824687485118  # Ветка для уведомлений о стримах и мероприятия
+STREAMS_CHANNEL_ID = 1528506824687485118  # Ветка для уведомлений о стримах и мероприятиях
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -35,12 +35,12 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Базы данных для предотвращения дубликатов сообщений
 notified_news = set()
-notified_events_30m = set()  # База для новых уведомлений за 30 минут
+notified_events_30m = set()
 
 @bot.event
 async def on_ready():
-    print(f"Бот {bot.user.name} успешно обновлен на 30-минутные уведомления!")
-    main_checking_loop.start()  # Запуск цикла ежеминутной проверки
+    print(f"Бот {bot.user.name} успешно запущен с исправленными ссылками!")
+    main_checking_loop.start()
 
 @tasks.loop(seconds=60)
 async def main_checking_loop():
@@ -86,7 +86,7 @@ async def main_checking_loop():
         except Exception as e:
             print(f"Ошибка календаря: {e}")
 
-    # 2. МОДУЛЬ МОНИТОРИНГА МЕРОПРИЯТИЙ (ОПОВЕЩЕНИЕ ЗА СТРОГО 30 МИНУТ)
+    # 2. МОДУЛЬ МОНИТОРИНГА МЕРОПРИЯТИЙ (ИСПРАВЛЕННЫЙ ТЕКСТ И ССЫЛКА)
     streams_channel = bot.get_channel(STREAMS_CHANNEL_ID)
     if streams_channel:
         for guild in bot.guilds:
@@ -97,19 +97,20 @@ async def main_checking_loop():
                         continue
                     
                     time_to_start = event.start_time - now_utc
-                    event_url = f"https://discord.com{guild.id}/{event.id}"
 
-                    # Оповещение за 30 минут (интервал от 28 до 32 минут для стабильности таймера)
+                    # Оповещение за 30 минут (интервал для стабильности таймера)
                     if timedelta(minutes=28) <= time_to_start <= timedelta(minutes=32) and event.id not in notified_events_30m:
-                        # Текст строго по вашему шаблону с двумя отступами перед ссылкой
+                        
+                        # Текст строго по вашему ТЗ: звездочки, эмодзи, два пустых отступа
                         msg_text = (
                             f"@everyone ⏰ Напоминаем: через полчаса начинается **{event.name}**. Присоединяйтесь 👇\n\n\n"
-                            f"{event_url}"
+                            f"{event.url}"  # Официальный метод discord.py для генерации кликабельной ссылки на ивент
                         )
+                        
                         await streams_channel.send(msg_text)
                         notified_events_30m.add(event.id)
             except Exception as e:
                 print(f"Ошибка проверки мероприятий: {e}")
 
-# Безопасный вызов токена из скрытых настроек хостинга
+# Запуск
 bot.run(os.getenv("DISCORD_TOKEN"))
