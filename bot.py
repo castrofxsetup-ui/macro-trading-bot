@@ -193,8 +193,9 @@ async def main_checking_loop():
                 embed = discord.Embed(title="Ежедневный экономический календарь Forex", description=embed_description, color=0x2f3136)
                 await news_channel.send(embed=embed)
             last_daily_report_date = current_date_str
-        except Exception as e:
-            print(f"Ошибка ежедневной сводки: {e}")
+        # ... этот кусок заменяет всё, что вы прислали (от e}") до конца вашего сообщения) ...
+except Exception as e:
+    print(f"Произошла ошибка: {e}")
 
     # МОДУЛЬ 2. МОНИТОРИНГ КРАСНЫХ НОВОСТЕЙ (ЗА 15 МИНУТ)
     if news_channel:
@@ -225,4 +226,13 @@ async def main_checking_loop():
                 if timedelta(minutes=14) <= time_diff <= timedelta(minutes=16) and event_id not in notified_news:
                     flag = FLAGS.get(currency.upper(), "🌐")
                     embed_description = f"**Ожидаемые события:**\n{flag} **{currency}** — {title}\n⏰ {time_str} (Нью-Йорк)\n🔴 HIGH\n\n<sub>⌛️Публикация через 15 минут</sub>"
+                    
+                    # Создаем и отправляем эмбед в канал новостей
                     embed = discord.Embed(description=embed_description, color=0xff0000)
+                    await news_channel.send(embed=embed)
+                    
+                    # Добавляем новость в список отправленных, чтобы бот не спамил
+                    notified_news.add(event_id)
+                    
+        except Exception as news_err:
+            print(f"Ошибка при парсинге новостей ForexFactory: {news_err}")
