@@ -39,24 +39,8 @@ notified_events_30m = set()
 
 @bot.event
 async def on_ready():
-    print(f"Бот {bot.user.name} успешно запущен бесплатно!")
-    
-    # --- БЛОК АВТОМАТИЧЕСКОЙ УСТАНОВКИ АВАТАРКИ ---
-    try:
-        # ВСТАВЬТЕ СЮДА ВАШУ ССЫЛКУ НА КАРТИНКУ МЕЖДУ КАВЫЧКАМИ:
-        avatar_url = "https://cdn.discordapp.com/attachments/1474850205525606676/1530387902108794943/IMG_8625.png?ex=6a65644d&is=6a6412cd&hm=80097ab09427cd46b65462bcd09583454435c9f0b043b2c7f4d1d436bef026bf&" 
-        
-        req = urllib.request.Request(avatar_url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req) as response:
-            avatar_data = response.read()
-        await bot.user.edit(avatar=avatar_data)
-        print("Аватарка бота успешно обновлена через код!")
-    except Exception as e:
-        print(f"Не удалось обновить аватарку: {e}")
-    # ----------------------------------------------
-
-    main_checking_loop.start()  # Запуск цикла ежеминутной проверки
-
+    print(f"Бот {bot.user.name} успешно запущен в чистом режиме!")
+    main_checking_loop.start()
 
 @tasks.loop(seconds=60)
 async def main_checking_loop():
@@ -102,7 +86,7 @@ async def main_checking_loop():
         except Exception as e:
             print(f"Ошибка календаря: {e}")
 
-    # 2. МОДУЛЬ МОНИТОРИНГА МЕРОПРИЯТИЙ (ИСПРАВЛЕННЫЙ ТЕКСТ И ССЫЛКА)
+    # 2. МОДУЛЬ МОНИТОРИНГА МЕРОПРИЯТИЙ (ОПОВЕЩЕНИЕ ЗА 30 МИНУТ)
     streams_channel = bot.get_channel(STREAMS_CHANNEL_ID)
     if streams_channel:
         for guild in bot.guilds:
@@ -114,19 +98,15 @@ async def main_checking_loop():
                     
                     time_to_start = event.start_time - now_utc
 
-                    # Оповещение за 30 минут (интервал для стабильности таймера)
                     if timedelta(minutes=28) <= time_to_start <= timedelta(minutes=32) and event.id not in notified_events_30m:
-                        
-                        # Текст строго по вашему ТЗ: звездочки, эмодзи, два пустых отступа
                         msg_text = (
                             f"@everyone ⏰ Напоминаем: через полчаса начинается **{event.name}**. Присоединяйтесь 👇\n\n\n"
-                            f"{event.url}"  # Официальный метод discord.py для генерации кликабельной ссылки на ивент
+                            f"{event.url}"
                         )
-                        
                         await streams_channel.send(msg_text)
                         notified_events_30m.add(event.id)
             except Exception as e:
                 print(f"Ошибка проверки мероприятий: {e}")
 
-# Запуск
+# Запуск через скрытые настройки хостинга
 bot.run(os.getenv("DISCORD_TOKEN"))
