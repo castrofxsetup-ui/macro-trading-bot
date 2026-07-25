@@ -22,9 +22,9 @@ def run_web_server():
 threading.Thread(target=run_web_server, daemon=True).start()
 # ----------------------------------------------------
 
-# ТОЧНЫЕ НАСТРОЙКИ ВЕТОК И КАНАЛОВ ИЗ ВАШЕГО ЗАПРОСА
+# НАСТРОЙКИ КАНАЛОВ БОТА
 NEWS_CHANNEL_ID = 1528319066513604688     # Ветка для красных новостей Forex Factory
-STREAMS_CHANNEL_ID = 1528506824687485118  # Ветка для уведомлений о стримах и мероприятиях
+STREAMS_CHANNEL_ID = 1528506824687485118  # Ветка для уведомлений о стримах и мероприятия
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -35,12 +35,11 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Базы данных для предотвращения дубликатов сообщений
 notified_news = set()
-notified_events_60m = set()
-notified_events_15m = set()
+notified_events_30m = set()  # База для новых уведомлений за 30 минут
 
 @bot.event
 async def on_ready():
-    print(f"Бот {bot.user.name} успешно запущен!")
+    print(f"Бот {bot.user.name} успешно обновлен на 30-минутные уведомления!")
     main_checking_loop.start()  # Запуск цикла ежеминутной проверки
 
 @tasks.loop(seconds=60)
@@ -67,7 +66,6 @@ async def main_checking_loop():
                 time_str = event.find('time').text
                 
                 try:
-                    # Время в XML-фиде идет по Нью-Йорку (EST/EDT, UTC-5)
                     event_datetime = datetime.strptime(f"{date_str} {time_str}", "%m-%d-%Y %I:%M%p").replace(tzinfo=timezone(timedelta(hours=-5)))
                 except Exception:
                     continue
@@ -75,7 +73,6 @@ async def main_checking_loop():
                 time_diff = event_datetime - now_utc
                 event_id = f"{title}_{date_str}_{time_str}"
 
-                # Строго за 30 минут (интервал от 29 до 31 минуты для надежности парсинга)
                 if timedelta(minutes=29) <= time_diff <= timedelta(minutes=31) and event_id not in notified_news:
                     embed = discord.Embed(title="🚨 ВНИМАНИЕ! КРАСНЫЕ НОВОСТИ", color=0xff0000)
                     embed.add_field(name="Ожидаемые события:", value=title, inline=False)
@@ -89,7 +86,7 @@ async def main_checking_loop():
         except Exception as e:
             print(f"Ошибка календаря: {e}")
 
-    # 2. МОДУЛЬ МОНИТОРИНГА МЕРОПРИЯТИЙ И СТРИМОВ СЕРВЕРА
+    # 2. МОДУЛЬ МОНИТОРИНГА МЕРОПРИЯТИЙ (ОПОВЕЩЕНИЕ ЗА СТРОГО 30 МИНУТ)
     streams_channel = bot.get_channel(STREAMS_CHANNEL_ID)
     if streams_channel:
         for guild in bot.guilds:
@@ -102,25 +99,15 @@ async def main_checking_loop():
                     time_to_start = event.start_time - now_utc
                     event_url = f"https://discord.com{guild.id}/{event.id}"
 
-                    # Оповещение за 60 минут
-                    if timedelta(minutes=58) <= time_to_start <= timedelta(minutes=62) and event.id not in notified_events_60m:
+                    # Оповещение за 30 минут (интервал от 28 до 32 минут для стабильности таймера)
+                    if timedelta(minutes=28) <= time_to_start <= timedelta(minutes=32) and event.id not in notified_events_30m:
+                        # Текст строго по вашему шаблону с двумя отступами перед ссылкой
                         msg_text = (
-                            f"@everyone Напоминаем: через 60 минут начинается {event.name}\n"
-                            f"Присоединяйтесь!\n"
+                            f"@everyone ⏰ Напоминаем: через полчаса начинается **{event.name}**. Присоединяйтесь 👇\n\n\n"
                             f"{event_url}"
                         )
                         await streams_channel.send(msg_text)
-                        notified_events_60m.add(event.id)
-
-                    # Оповещение за 15 минут
-                    if timedelta(minutes=13) <= time_to_start <= timedelta(minutes=17) and event.id not in notified_events_15m:
-                        msg_text = (
-                            f"@everyone Напоминаем: через 15 минут начинается {event.name}\n"
-                            f"Присоединяйтесь!\n"
-                            f"{event_url}"
-                        )
-                        await streams_channel.send(msg_text)
-                        notified_events_15m.add(event.id)
+                        notified_events_30m.add(event.id)
             except Exception as e:
                 print(f"Ошибка проверки мероприятий: {e}")
 
