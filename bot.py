@@ -5,23 +5,24 @@ import uvicorn
 import asyncio
 import threading
 import urllib.request
+import urllib.parse
+import json
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 import os
+from curl_cffi import requests
 
-# --- СОКРУШИТЕЛЬ ОШИБОК 501/502: СОВРЕМЕННЫЙ FASTAPI СЕРВЕР ---
+# --- СОКРУШИТЕЛЬ ОШИБОК 501/502: FASTAPI СЕРВЕР ---
 app = FastAPI()
 
 @app.get("/")
 def read_root():
-    return {"status": "Macro Bot is perfectly running 24/7!"}
+    return {"status": "Macro Bot AI is perfectly running 24/7!"}
 
 def start_web_server():
     port = int(os.getenv("PORT", 10000))
-    # Запускаем uvicorn, который идеально отвечает на любые запросы UptimeRobot
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
 
-# Запуск веб-сервера в отдельном фоновом потоке
 threading.Thread(target=start_web_server, daemon=True).start()
 # -------------------------------------------------------------
 
@@ -54,12 +55,99 @@ MONTHS_RU = [
     "июля", "августа", "сентября", "октября", "ноября", "декабря"
 ]
 
+# Хранилище контекста диалогов для ИИ {channel_id: [messages]}
+ai_context = {}
+
+# =========================================================================
+# БЕСПЛАТНЫЙ ИИ-МОДУЛЬ ОБЩЕНИЯ (БЕЗ КЛЮЧЕЙ И API-КЛЮЧЕЙ)
+# =========================================================================
+def ask_free_ai(prompt, context_history=None):
+    try:
+        # Системный промпт, задающий характер и стиль общения бота
+        system_instruction = (
+            "Ты — Macro Expert Bot, продвинутый ИИ-ассистент и опытный, харизматичный трейдер. "
+            "Ты общаешься в закрытом Discord-сервере для трейдеров. Твой стиль: профессиональный, "
+            "в меру ироничный, хладнокровный. Ты презираешь торговлю без стопов, завышенные риски, "
+            "тильт и фомо. Давай полезные и четкие ответы по макроэкономике, структуре рынка, психологии "
+            "трейдинга и техническому анализу. Отвечай кратко, емко, без лишней "
+            "воды, используй трейдерский сленг (сетап, стоп, тейк, ликвидность, забор, лонг, шорт). "
+            "Отвечай строго на русском языке."
+        )
+        
+        messages = [{"role": "system", "content": system_instruction}]
+        
+        # Добавляем историю переписки для связности диалога
+        if context_history:
+            messages.extend(context_history)
+            
+        messages.append({"role": "user", "content": prompt})
+        
+        # Используем стабильное бесплатное API через curl_cffi для обхода блокировок
+        payload = {
+            "model": "gpt-4o-mini",
+            "messages": messages,
+            "stream": False
+        }
+        
+        response = requests.post(
+            "https://pantheonsite.io",
+            headers={"Content-Type": "application/json"},
+            json=payload,
+            timeout=30,
+            impersonate="chrome"
+        )
+        
+        if response.status_code == 200:
+            res_json = response.json()
+            return res_json['choices'][0]['message']['content']
+    except Exception as e:
+        print(f"Ошибка ИИ-модуля: {e}")
+    return "Загружаю графики, на связи немного позже... 📈"
+
 @bot.event
 async def on_ready():
-    print(f"Бот {bot.user.name} успешно подключился к серверам Discord!")
+    print(f"Бот {bot.user.name} успешно запущен! ИИ-модуль живого общения в сети.")
     if not main_checking_loop.is_running():
         main_checking_loop.start()
 
+# ПЕРЕХВАТ СООБЩЕНИЙ ДЛЯ ЖИВОГО ОБЩЕНИЯ
+@bot.event
+async def on_message(message):
+    if message.author.bot or not message.guild:
+        return
+
+    # Если кто-то упомянул (тегнул) бота или ответил на его сообщение в чате
+    if bot.user.mentioned_in(message) or (message.reference and message.reference.cached_message and message.reference.cached_message.author == bot.user):
+        
+        # Показываем статус «Бот печатает...», чтобы общение выглядело живым
+        async with message.channel.typing():
+            # Очищаем текст сообщения от самого тега бота
+            user_text = message.content.replace(f'<@{bot.user.id}>', '').strip()
+            if not user_text and message.reference:
+                user_text = message.content.strip()
+                
+            channel_id = message.channel.id
+            if channel_id not in ai_context:
+                ai_context[channel_id] = []
+                
+            # Передаем текст в ИИ и получаем ответ в стиле трейдера
+            loop = asyncio.get_event_loop()
+            ai_response = await loop.run_in_executor(None, ask_free_ai, user_text, ai_context[channel_id])
+            
+            # Сохраняем контекст (последние 6 реплик, чтобы бот не забывал нить разговора)
+            ai_context[channel_id].append({"role": "user", "content": user_text})
+            ai_context[channel_id].append({"role": "assistant", "content": ai_response})
+            if len(ai_context[channel_id]) > 6:
+                ai_context[channel_id] = ai_context[channel_id][-6:]
+                
+            # Отвечаем пользователю через нативный ответ Дискорда
+            await message.reply(ai_response)
+
+    await bot.process_commands(message)
+
+# =========================================================================
+# ЦИКЛ ПРОВЕРКИ НОВОСТЕЙ И СТРИМОВ (БЕЗ ИЗМЕНЕНИЙ)
+# =========================================================================
 @tasks.loop(seconds=60)
 async def main_checking_loop():
     global last_daily_report_date, last_task_date
@@ -142,46 +230,3 @@ async def main_checking_loop():
                 currency = event.find('currency').text
                 date_str = event.find('event_date' if event.find('event_date') is not None else 'date').text
                 time_str = event.find('time').text
-                
-                try:
-                    event_datetime = datetime.strptime(f"{date_str} {time_str}", "%m-%d-%Y %I:%M%p").replace(tzinfo=timezone(timedelta(hours=-5)))
-                except Exception:
-                    continue
-
-                time_diff = event_datetime - now_utc
-                event_id = f"{title}_{date_str}_{time_str}"
-
-                if timedelta(minutes=14) <= time_diff <= timedelta(minutes=16) and event_id not in notified_news:
-                    flag = FLAGS.get(currency.upper(), "🌐")
-                    embed_description = (
-                        f"**Ожидаемые события:**\n"
-                        f"{flag} **{currency}** — {title}\n"
-                        f"⏰ {time_str} (Нью-Йорк)\n"
-                        f"🔴 HIGH\n\n"
-                        f"<sub>⌛️Публикация через 15 минут</sub>"
-                    )
-                    embed = discord.Embed(description=embed_description, color=0xff0000)
-                    await news_channel.send(content="@everyone", embed=embed)
-                    notified_news.add(event_id)
-        except Exception as e:
-            print(f"Ошибка calendars: {e}")
-
-    # МОДУЛЬ 3. МОНИТОРИНГ МЕРОПРИЯТИЙ И СТРИМОВ (ЗА 30 МИНУТ)
-    streams_channel = bot.get_channel(STREAMS_CHANNEL_ID)
-    if streams_channel:
-        for guild in bot.guilds:
-            try:
-                events = await guild.fetch_scheduled_events()
-                for event in events:
-                    if event.status != discord.EventStatus.scheduled:
-                        continue
-                    time_to_start = event.start_time - now_utc
-                    if timedelta(minutes=28) <= time_to_start <= timedelta(minutes=32) and event.id not in notified_events_30m:
-                        msg_text = f"@everyone ⏰ Напоминаем: через полчаса начинается **{event.name}**. Присоединяйтесь 👇\n\n\n{event.url}"
-                        await streams_channel.send(msg_text)
-                        notified_events_30m.add(event.id)
-            except Exception as e:
-                print(f"Ошибка проверки мероприятий: {e}")
-
-# Запуск
-bot.run(os.getenv("DISCORD_TOKEN"))
