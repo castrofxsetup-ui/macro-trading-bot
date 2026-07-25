@@ -5,11 +5,10 @@ import uvicorn
 import asyncio
 import threading
 import urllib.request
-import json
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 import os
-from curl_cffi import requests
+import google.generativeai as genai
 
 # --- ВЕБ-СЕРВЕР ДЛЯ ОБХОДА ПЛАТНОГО ТАРИФА RENDER ---
 app = FastAPI()
@@ -30,8 +29,8 @@ NEWS_CHANNEL_ID = 1528319066513604688     # Ветка для новостей F
 STREAMS_CHANNEL_ID = 1528506824687485118  # Ветка для уведомлений о стримах
 TASK_CHANNEL_ID = 1502292137889501235     # Ветка для утренних заданий дня
 
-# URL с реальным XML-календарём ForexFactory (сам forexfactory.com отдаёт HTML,
-# а не XML — если парсить главную страницу как XML, скрипт падает с ошибкой).
+# Реальный публичный XML-календарь ForexFactory
+# (forexfactory.com отдаёт HTML, а не XML — парсинг главной страницы падал с ошибкой)
 FF_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
 
 intents = discord.Intents.default()
@@ -62,42 +61,50 @@ MONTHS_RU = [
 ai_context = {}
 
 # =========================================================================
-# БЕСПЛАТНЫЙ ИИ-МОДУЛЬ ОБЩЕНИЯ (РАБОТАЕТ СТРОГО НА ОТВЕТЫ И ТЕГИ)
+# ИИ-МОДУЛЬ ОБЩЕНИЯ — GOOGLE GEMINI (бесплатный тариф Google AI Studio)
 # =========================================================================
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+SYSTEM_INSTRUCTION = (
+    "Ты — Macro Expert Bot, опытный трейдер и наставник в закрытом трейдинг-комьюнити. "
+    "Твой стиль: профессиональный, в меру ироничный, хладнокровный, но по-настоящему заботливый. "
+    "Ты против торговли без стопов, завышенных рисков и тильта. Давай чёткие ответы по макроэкономике, "
+    "структуре рынка, риск-менеджменту и психологии трейдинга. Отвечай кратко, без воды, используй "
+    "трейдерский сленг (сетап, стоп, тейк, ликвидность, забор, лонг, шорт). "
+    "Ты умеешь поддерживать обычный разговор, помнишь контекст переписки и продолжаешь диалог естественно. "
+    "Если человек делится эмоциональными трудностями (тильт, страх, выгорание, неудачи в трейдинге или в жизни) — "
+    "переходи в поддерживающий, тёплый тон, без сарказма, выслушай и помоги словом, как хороший старший друг. "
+    "Отвечай строго на русском языке."
+)
+
+gemini_model = None
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_model = genai.GenerativeModel(
+        model_name="gemini-1.5-flash",
+        system_instruction=SYSTEM_INSTRUCTION,
+    )
+
+
 def ask_free_ai(prompt, context_history=None):
+    if not gemini_model:
+        print("Ошибка ИИ: не задан GEMINI_API_KEY в переменных окружения.")
+        return "Секунду, настраиваю графики... (ИИ временно не настроен)"
+
     try:
-        system_instruction = (
-            "Ты — Macro Expert Bot, продвинутый ИИ-ассистент и опытный трейдер. "
-            "Ты общаешься на закрытом сервере. Твой стиль: профессиональный, в меру ироничный, хладнокровный. "
-            "Ты против торговли без стопов, завышенных рисков и тильта. Давай чёткие ответы по макроэкономике, "
-            "структуре рынка, психологии и тех.анализу. Отвечай кратко, без воды, используй сленг (сетап, стоп, "
-            "тейк, ликвидность, забор, лонг, шорт). Отвечай строго на русском языке."
-        )
-
-        messages = [{"role": "system", "content": system_instruction}]
+        gemini_history = []
         if context_history:
-            messages.extend(context_history)
-        messages.append({"role": "user", "content": prompt})
+            for msg in context_history:
+                role = "model" if msg["role"] == "assistant" else "user"
+                gemini_history.append({"role": role, "parts": [msg["content"]]})
 
-        payload = {
-            "model": "gpt-4o-mini",
-            "messages": messages,
-            "stream": False
-        }
-
-        response = requests.post(
-            "https://pantheonsite.io",
-            headers={"Content-Type": "application/json"},
-            json=payload,
-            timeout=30,
-            impersonate="chrome"
-        )
-        if response.status_code == 200:
-            # БАГ БЫЛ ЗДЕСЬ: "choices" — это список, нужен индекс [0]
-            return response.json()['choices'][0]['message']['content']
+        chat = gemini_model.start_chat(history=gemini_history)
+        response = chat.send_message(prompt)
+        return response.text
     except Exception as e:
-        print(f"Ошибка ИИ: {e}")
-    return "Загружаю графики, на связи немного позже... 📈"
+        print(f"Ошибка ИИ (Gemini): {e}")
+        return "Секунду, графики подвисли — попробуй написать ещё раз через пару секунд. 📈"
+
 
 @bot.event
 async def on_ready():
@@ -110,7 +117,6 @@ async def on_message(message):
     if message.author.bot or not message.guild:
         return
 
-    # Отвечаем, если бота тегнули ИЛИ ответили на его сообщение
     if bot.user.mentioned_in(message) or (message.reference and message.reference.cached_message and message.reference.cached_message.author == bot.user):
         async with message.channel.typing():
             user_text = message.content.replace(f'<@{bot.user.id}>', '').strip()
@@ -147,7 +153,6 @@ async def main_checking_loop():
     task_channel = bot.get_channel(TASK_CHANNEL_ID)
     current_date_str = now_msk.strftime("%Y-%m-%d")
 
-    # МОДУЛЬ 0. ЗАДАНИЕ ДНЯ (09:30 МСК)
     if task_channel and now_msk.weekday() < 5:
         if now_msk.hour == 9 and now_msk.minute == 30 and last_task_date != current_date_str:
             embed_text = (
@@ -159,7 +164,6 @@ async def main_checking_loop():
             await task_channel.send(embed=embed)
             last_task_date = current_date_str
 
-    # МОДУЛЬ 1. ЕЖЕДНЕВНЫЙ КАЛЕНДАРЬ (08:00 МСК)
     if news_channel and now_msk.hour == 8 and now_msk.minute == 0 and last_daily_report_date != current_date_str:
         try:
             req = urllib.request.Request(FF_CALENDAR_URL, headers={'User-Agent': 'Mozilla/5.0'})
@@ -202,11 +206,8 @@ async def main_checking_loop():
                 await news_channel.send(embed=embed)
             last_daily_report_date = current_date_str
         except Exception as e:
-            # БАГ БЫЛ ЗДЕСЬ: except был на уровне отступа 0 (вне функции), а не внутри try —
-            # из-за этого файл вообще не проходил синтаксическую проверку Python.
             print(f"Произошла ошибка в МОДУЛЕ 1 (календарь): {e}")
 
-    # МОДУЛЬ 2. МОНИТОРИНГ КРАСНЫХ НОВОСТЕЙ (ЗА 15 МИНУТ)
     if news_channel:
         try:
             req = urllib.request.Request(FF_CALENDAR_URL, headers={'User-Agent': 'Mozilla/5.0'})
@@ -248,8 +249,7 @@ async def main_checking_loop():
             print(f"Ошибка при парсинге новостей ForexFactory: {news_err}")
 
 # =========================================================================
-# ЗАПУСК БОТА (в исходном файле этого блока не было вообще —
-# без него бот никогда не подключается к Discord)
+# ЗАПУСК БОТА
 # =========================================================================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
