@@ -39,8 +39,24 @@ notified_events_30m = set()
 
 @bot.event
 async def on_ready():
-    print(f"Бот {bot.user.name} успешно запущен с исправленными ссылками!")
-    main_checking_loop.start()
+    print(f"Бот {bot.user.name} успешно запущен бесплатно!")
+    
+    # --- БЛОК АВТОМАТИЧЕСКОЙ УСТАНОВКИ АВАТАРКИ ---
+    try:
+        # ВСТАВЬТЕ СЮДА ВАШУ ССЫЛКУ НА КАРТИНКУ МЕЖДУ КАВЫЧКАМИ:
+        avatar_url = "https://cdn.discordapp.com/attachments/1474850205525606676/1530387902108794943/IMG_8625.png?ex=6a65644d&is=6a6412cd&hm=80097ab09427cd46b65462bcd09583454435c9f0b043b2c7f4d1d436bef026bf&" 
+        
+        req = urllib.request.Request(avatar_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as response:
+            avatar_data = response.read()
+        await bot.user.edit(avatar=avatar_data)
+        print("Аватарка бота успешно обновлена через код!")
+    except Exception as e:
+        print(f"Не удалось обновить аватарку: {e}")
+    # ----------------------------------------------
+
+    main_checking_loop.start()  # Запуск цикла ежеминутной проверки
+
 
 @tasks.loop(seconds=60)
 async def main_checking_loop():
