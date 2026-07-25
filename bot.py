@@ -30,6 +30,10 @@ NEWS_CHANNEL_ID = 1528319066513604688     # Ветка для новостей F
 STREAMS_CHANNEL_ID = 1528506824687485118  # Ветка для уведомлений о стримах
 TASK_CHANNEL_ID = 1502292137889501235     # Ветка для утренних заданий дня
 
+# URL с реальным XML-календарём ForexFactory (сам forexfactory.com отдаёт HTML,
+# а не XML — если парсить главную страницу как XML, скрипт падает с ошибкой).
+FF_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
@@ -43,14 +47,14 @@ last_daily_report_date = ""
 last_task_date = ""
 
 FLAGS = {
-    "USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", 
-    "JPY": "🇯🇵", "AUD": "🇦🇺", "CAD": "🇨🇦", 
+    "USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧",
+    "JPY": "🇯🇵", "AUD": "🇦🇺", "CAD": "🇨🇦",
     "CHF": "🇨🇭", "NZD": "🇳🇿", "CNY": "🇨🇳"
 }
 
 DAYS_RU = ["ПН", "ВТ", "СР", "ЧТ", "ПТ", "СБ", "ВС"]
 MONTHS_RU = [
-    "января", "февраля", "марта", "апреля", "мая", "июня", 
+    "января", "февраля", "марта", "апреля", "мая", "июня",
     "июля", "августа", "сентября", "октября", "ноября", "декабря"
 ]
 
@@ -69,18 +73,18 @@ def ask_free_ai(prompt, context_history=None):
             "структуре рынка, психологии и тех.анализу. Отвечай кратко, без воды, используй сленг (сетап, стоп, "
             "тейк, ликвидность, забор, лонг, шорт). Отвечай строго на русском языке."
         )
-        
+
         messages = [{"role": "system", "content": system_instruction}]
         if context_history:
             messages.extend(context_history)
         messages.append({"role": "user", "content": prompt})
-        
+
         payload = {
             "model": "gpt-4o-mini",
             "messages": messages,
             "stream": False
         }
-        
+
         response = requests.post(
             "https://pantheonsite.io",
             headers={"Content-Type": "application/json"},
@@ -89,7 +93,8 @@ def ask_free_ai(prompt, context_history=None):
             impersonate="chrome"
         )
         if response.status_code == 200:
-            return response.json()['choices']['message']['content']
+            # БАГ БЫЛ ЗДЕСЬ: "choices" — это список, нужен индекс [0]
+            return response.json()['choices'][0]['message']['content']
     except Exception as e:
         print(f"Ошибка ИИ: {e}")
     return "Загружаю графики, на связи немного позже... 📈"
@@ -111,19 +116,19 @@ async def on_message(message):
             user_text = message.content.replace(f'<@{bot.user.id}>', '').strip()
             if not user_text and message.reference:
                 user_text = message.content.strip()
-                
+
             channel_id = message.channel.id
             if channel_id not in ai_context:
                 ai_context[channel_id] = []
-                
+
             loop = asyncio.get_event_loop()
             ai_response = await loop.run_in_executor(None, ask_free_ai, user_text, ai_context[channel_id])
-            
+
             ai_context[channel_id].append({"role": "user", "content": user_text})
             ai_context[channel_id].append({"role": "assistant", "content": ai_response})
             if len(ai_context[channel_id]) > 6:
                 ai_context[channel_id] = ai_context[channel_id][-6:]
-                
+
             await message.reply(ai_response)
 
     await bot.process_commands(message)
@@ -134,10 +139,10 @@ async def on_message(message):
 @tasks.loop(seconds=60)
 async def main_checking_loop():
     global last_daily_report_date, last_task_date
-    
+
     now_utc = datetime.now(timezone.utc)
     now_msk = now_utc + timedelta(hours=3)
-    
+
     news_channel = bot.get_channel(NEWS_CHANNEL_ID)
     task_channel = bot.get_channel(TASK_CHANNEL_ID)
     current_date_str = now_msk.strftime("%Y-%m-%d")
@@ -157,24 +162,27 @@ async def main_checking_loop():
     # МОДУЛЬ 1. ЕЖЕДНЕВНЫЙ КАЛЕНДАРЬ (08:00 МСК)
     if news_channel and now_msk.hour == 8 and now_msk.minute == 0 and last_daily_report_date != current_date_str:
         try:
-            url = "https://forexfactory.com"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req) as response:
+            req = urllib.request.Request(FF_CALENDAR_URL, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=15) as response:
                 xml_data = response.read()
-            
+
             root = ET.fromstring(xml_data)
             daily_events = []
-            
+
             for event in root.findall('event'):
                 impact = event.find('impact').text
                 if impact not in ["High", "Medium"]:
                     continue
-                    
+
                 title = event.find('title').text
                 currency = event.find('currency').text
-                date_str = event.find('event_date' if event.find('event_date') is not None else 'date').text
+                date_node = event.find('date')
+                date_str = date_node.text if date_node is not None else None
                 time_str = event.find('time').text
-                
+
+                if not date_str:
+                    continue
+
                 try:
                     event_date_obj = datetime.strptime(date_str, "%m-%d-%Y")
                     if event_date_obj.day == now_msk.day and event_date_obj.month == now_msk.month:
@@ -183,7 +191,7 @@ async def main_checking_loop():
                         daily_events.append(f"⏰ {time_str} | {flag} **{currency}** — {title}\n{impact_tag}")
                 except Exception:
                     continue
-            
+
             if daily_events:
                 day_name = DAYS_RU[now_msk.weekday()]
                 month_name = MONTHS_RU[now_msk.month - 1]
@@ -193,28 +201,32 @@ async def main_checking_loop():
                 embed = discord.Embed(title="Ежедневный экономический календарь Forex", description=embed_description, color=0x2f3136)
                 await news_channel.send(embed=embed)
             last_daily_report_date = current_date_str
-        # ... этот кусок заменяет всё, что вы прислали (от e}") до конца вашего сообщения) ...
-except Exception as e:
-    print(f"Произошла ошибка: {e}")
+        except Exception as e:
+            # БАГ БЫЛ ЗДЕСЬ: except был на уровне отступа 0 (вне функции), а не внутри try —
+            # из-за этого файл вообще не проходил синтаксическую проверку Python.
+            print(f"Произошла ошибка в МОДУЛЕ 1 (календарь): {e}")
 
     # МОДУЛЬ 2. МОНИТОРИНГ КРАСНЫХ НОВОСТЕЙ (ЗА 15 МИНУТ)
     if news_channel:
         try:
-            url = "https://forexfactory.com"
-            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req) as response:
+            req = urllib.request.Request(FF_CALENDAR_URL, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=15) as response:
                 xml_data = response.read()
-            
+
             root = ET.fromstring(xml_data)
             for event in root.findall('event'):
                 if event.find('impact').text != "High":
                     continue
-                    
+
                 title = event.find('title').text
                 currency = event.find('currency').text
-                date_str = event.find('event_date' if event.find('event_date') is not None else 'date').text
+                date_node = event.find('date')
+                date_str = date_node.text if date_node is not None else None
                 time_str = event.find('time').text
-                
+
+                if not date_str:
+                    continue
+
                 try:
                     event_datetime = datetime.strptime(f"{date_str} {time_str}", "%m-%d-%Y %I:%M%p").replace(tzinfo=timezone(timedelta(hours=-5)))
                 except Exception:
@@ -226,13 +238,25 @@ except Exception as e:
                 if timedelta(minutes=14) <= time_diff <= timedelta(minutes=16) and event_id not in notified_news:
                     flag = FLAGS.get(currency.upper(), "🌐")
                     embed_description = f"**Ожидаемые события:**\n{flag} **{currency}** — {title}\n⏰ {time_str} (Нью-Йорк)\n🔴 HIGH\n\n<sub>⌛️Публикация через 15 минут</sub>"
-                    
-                    # Создаем и отправляем эмбед в канал новостей
+
                     embed = discord.Embed(description=embed_description, color=0xff0000)
                     await news_channel.send(embed=embed)
-                    
-                    # Добавляем новость в список отправленных, чтобы бот не спамил
+
                     notified_news.add(event_id)
-                    
+
         except Exception as news_err:
             print(f"Ошибка при парсинге новостей ForexFactory: {news_err}")
+
+# =========================================================================
+# ЗАПУСК БОТА (в исходном файле этого блока не было вообще —
+# без него бот никогда не подключается к Discord)
+# =========================================================================
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+
+if not DISCORD_TOKEN:
+    raise RuntimeError(
+        "Не найден DISCORD_TOKEN. Добавь переменную окружения DISCORD_TOKEN "
+        "в настройках сервиса на Render (Environment -> Environment Variables)."
+    )
+
+bot.run(DISCORD_TOKEN)
