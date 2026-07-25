@@ -1,30 +1,29 @@
 import discord
 from discord.ext import commands, tasks
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from fastapi import FastAPI
+import uvicorn
+import asyncio
 import threading
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 import os
 
-# --- АВТОМАТИЧЕСКИЙ ВЕБ-СЕРВЕР ДЛЯ ОБХОДА ПЛАТНОГО ТАРИФА RENDER ---
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/html")
-        self.end_headers()
-        self.wfile.write(b"Macro Bot is perfectly running!")
+# --- СОКРУШИТЕЛЬ ОШИБОК 501/502: СОВРЕМЕННЫЙ FASTAPI СЕРВЕР ---
+app = FastAPI()
 
-def run_web_server():
-    # Render автоматически передает свободный порт в переменную окружения PORT.
-    # Если её нет, используем стандартный 10000.
+@app.get("/")
+def read_root():
+    return {"status": "Macro Bot is perfectly running 24/7!"}
+
+def start_web_server():
     port = int(os.getenv("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    server.serve_forever()
+    # Запускаем uvicorn, который идеально отвечает на любые запросы UptimeRobot
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="warning")
 
-# Запускаем сервер строго в фоновом потоке
-threading.Thread(target=run_web_server, daemon=True).start()
-# ------------------------------------------------------------------
+# Запуск веб-сервера в отдельном фоновом потоке
+threading.Thread(target=start_web_server, daemon=True).start()
+# -------------------------------------------------------------
 
 # НАСТРОЙКИ КАНАЛОВ БОТА
 NEWS_CHANNEL_ID = 1528319066513604688     # Ветка для новостей Forex Factory
@@ -165,7 +164,7 @@ async def main_checking_loop():
                     await news_channel.send(content="@everyone", embed=embed)
                     notified_news.add(event_id)
         except Exception as e:
-            print(f"Ошибка календаря: {e}")
+            print(f"Ошибка calendars: {e}")
 
     # МОДУЛЬ 3. МОНИТОРИНГ МЕРОПРИЯТИЙ И СТРИМОВ (ЗА 30 МИНУТ)
     streams_channel = bot.get_channel(STREAMS_CHANNEL_ID)
