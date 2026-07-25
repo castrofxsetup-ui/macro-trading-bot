@@ -65,7 +65,7 @@ def ask_free_ai(prompt, context_history=None):
         system_instruction = (
             "Ты — Macro Expert Bot, продвинутый ИИ-ассистент и опытный трейдер. "
             "Ты общаешься на закрытом сервере. Твой стиль: профессиональный, в меру ироничный, хладнокровный. "
-            "Ты против торговли без стопов, завышенных рисков и тильта. Давай четкие ответы по макроэкономике, "
+            "Ты против торговли без стопов, завышенных рисков и тильта. Давай чёткие ответы по макроэкономике, "
             "структуре рынка, психологии и тех.анализу. Отвечай кратко, без воды, используй сленг (сетап, стоп, "
             "тейк, ликвидность, забор, лонг, шорт). Отвечай строго на русском языке."
         )
@@ -224,9 +224,5 @@ async def main_checking_loop():
 
                 if timedelta(minutes=14) <= time_diff <= timedelta(minutes=16) and event_id not in notified_news:
                     flag = FLAGS.get(currency.upper(), "🌐")
-                    embed_description = (
-                        f"**Ожидаемые события:**\n"
-                        f"{flag} **{currency}** — {title}\n"
-                        f"⏰ {time_str} (Нью-Йорк)\n"
-                        f"🔴 HIGH\n\n"
-                        f"<sub>⌛️Публикация через 15 минут</sub>"
+                    embed_description = f"**Ожидаемые события:**\n{flag} **{currency}** — {title}\n⏰ {time_str} (Нью-Йорк)\n🔴 HIGH\n\n<sub>⌛️Публикация через 15 минут</sub>"
+                    embed = discord.Embed(description=embed_description, color=0xff0000)
