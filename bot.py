@@ -53,7 +53,7 @@ MONTHS_RU = [
 
 @bot.event
 async def on_ready():
-    print(f"Бот {bot.user.name} успешно запущен в режиме профессиональных Embed-карточек!")
+    print(f"Бот {bot.user.name} успешно запущен в чистом макро-режиме (Embed)!")
     main_checking_loop.start()
 
 @tasks.loop(seconds=60)
@@ -97,7 +97,7 @@ async def main_checking_loop():
                         flag = FLAGS.get(currency.upper(), "🌐")
                         impact_tag = "🔴 HIGH" if impact == "High" else "🟠 MEDIUM"
                         
-                        # Собираем компактную структуру: важность снизу каждой новости
+                        # Статус важности строго снизу под анонсом
                         daily_events.append(f"⏰ {time_str} | {flag} **{currency}** — {title}\n{impact_tag}")
                 except Exception:
                     continue
@@ -109,7 +109,6 @@ async def main_checking_loop():
                 
                 events_text = "\n\n".join(daily_events)
                 
-                # Формируем компактное описание для карточки сводки
                 embed_description = (
                     f"**Запланированные мероприятия:**\n"
                     f"{date_header}\n\n"
@@ -119,7 +118,7 @@ async def main_checking_loop():
                 embed = discord.Embed(
                     title="Ежедневный экономический календарь Forex",
                     description=embed_description,
-                    color=0x2f3136  # Темно-серый цвет рамки для компактности
+                    color=0x2f3136  # Компактный темно-серый цвет
                 )
                 
                 await news_channel.send(embed=embed)
@@ -160,7 +159,7 @@ async def main_checking_loop():
                 if timedelta(minutes=14) <= time_diff <= timedelta(minutes=16) and event_id not in notified_news:
                     flag = FLAGS.get(currency.upper(), "🌐")
                     
-                    # Структурируем компактное описание для срочной карточки
+                    # Компактная структура: актив жирным, новость на одной строке через тире
                     embed_description = (
                         f"**Ожидаемые события:**\n"
                         f"{flag} **{currency}** — {title}\n"
@@ -169,17 +168,16 @@ async def main_checking_loop():
                         f"<sub>⌛️Публикация через 15 минут</sub>"
                     )
 
-                    # Ярко-красная рамка для привлечения максимального внимания
                     embed = discord.Embed(description=embed_description, color=0xff0000)
 
-                    # Отправляем чистый тег над карточкой
+                    # Тег идет чистой строкой над карточкой
                     await news_channel.send(content="@everyone", embed=embed)
                     notified_news.add(event_id)
         except Exception as e:
             print(f"Ошибка календаря: {e}")
 
     # =========================================================================
-    # МОДУЛЬ 3. МОНИТОРИНГ МЕРОПРИЯТИЙ И СТРИМОВ (ЗА 30 МИНУТ)
+    # МОДУЛЬ 3. МОНИТОРИНГ МЕРОПРИЯТИЙ И СТРИМОВ (ЗА 30 МИНУТ ДО СТАРТА)
     # =========================================================================
     streams_channel = bot.get_channel(STREAMS_CHANNEL_ID)
     if streams_channel:
@@ -193,6 +191,7 @@ async def main_checking_loop():
                     time_to_start = event.start_time - now_utc
 
                     if timedelta(minutes=28) <= time_to_start <= timedelta(minutes=32) and event.id not in notified_events_30m:
+                        # Уведомление со строгими отступами и жирным названием в звездочках
                         msg_text = (
                             f"@everyone ⏰ Напоминаем: через полчаса начинается **{event.name}**. Присоединяйтесь 👇\n\n\n"
                             f"{event.url}"
