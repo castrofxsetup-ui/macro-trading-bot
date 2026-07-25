@@ -24,7 +24,8 @@ threading.Thread(target=run_web_server, daemon=True).start()
 
 # НАСТРОЙКИ КАНАЛОВ БОТА
 NEWS_CHANNEL_ID = 1528319066513604688     # Ветка для новостей Forex Factory
-STREAMS_CHANNEL_ID = 1528506824687485118  # Ветка для уведомлений о стримах и мероприятиях
+STREAMS_CHANNEL_ID = 1528506824687485118  # Ветка для уведомлений о стримах
+TASK_CHANNEL_ID = 1502292137889501235     # Ветка для утренних заданий дня
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -36,7 +37,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # Базы данных для предотвращения дубликатов сообщений
 notified_news = set()
 notified_events_30m = set()
-last_daily_report_date = ""  # Чтобы сводка выходила строго один раз в день
+last_daily_report_date = ""  # Контроль отправки утреннего календаря
+last_task_date = ""          # Контроль отправки задания дня
 
 # Словари для флагов и перевода дат
 FLAGS = {
@@ -53,24 +55,46 @@ MONTHS_RU = [
 
 @bot.event
 async def on_ready():
-    print(f"Бот {bot.user.name} успешно запущен в чистом макро-режиме (Embed)!")
+    print(f"Бот {bot.user.name} успешно запущен! Добавлен модуль утренних заданий.")
     main_checking_loop.start()
 
 @tasks.loop(seconds=60)
 async def main_checking_loop():
-    global last_daily_report_date
+    global last_daily_report_date, last_task_date
     
     # Рассчитываем текущее время в UTC и МСК (UTC+3)
     now_utc = datetime.now(timezone.utc)
     now_msk = now_utc + timedelta(hours=3)
     
     news_channel = bot.get_channel(NEWS_CHANNEL_ID)
+    task_channel = bot.get_channel(TASK_CHANNEL_ID)
+    current_date_str = now_msk.strftime("%Y-%m-%d")
 
     # =========================================================================
-    # МОДУЛЬ 1. ЕЖЕДНЕВНЫЙ ЭКОНОМИЧЕСКИЙ КАЛЕНДАРЬ (EMBED-ВИД В 8:00 ПО МСК)
+    # МОДУЛЬ 0. УТРЕННЕЕ ЗАДАНИЕ ДНЯ (КАЖДЫЙ БУДНИЙ ДЕНЬ В 09:30 ПО МСК)
     # =========================================================================
-    current_date_str = now_msk.strftime("%Y-%m-%d")
-    
+    # Считаем дни: 0-Пендельник, 1-Вторник... 4-Пятница. Все, что меньше 5 — будни.
+    if task_channel and now_msk.weekday() < 5:
+        if now_msk.hour == 9 and now_msk.minute == 30 and last_task_date != current_date_str:
+            
+            embed_text = (
+                "Найдите сегодня на графиках один качественный сетап по тренду "
+                "с риск-ревардом от 1:3 и скиньте в соответствующую ветку на сервере. "
+                "Автор лучшего разбора получит бонусную печеньку в карму!"
+            )
+            
+            embed = discord.Embed(
+                title="🎯 Задание дня:",
+                description=embed_text,
+                color=0x3498db  # Приятный синий цвет для повседневных задач
+            )
+            
+            await task_channel.send(embed=embed)
+            last_task_date = current_date_str  # Фиксируем день, чтобы не дублировать
+
+    # =========================================================================
+    # МОДУЛЬ 1. ЕЖЕДНЕВНЫЙ ЭКОНОМИЧЕСКИЙ КАЛЕНДАРЬ (В 08:00 ПО МСК)
+    # =========================================================================
     if news_channel and now_msk.hour == 8 and now_msk.minute == 0 and last_daily_report_date != current_date_str:
         try:
             url = "https://forexfactory.com"
@@ -96,8 +120,6 @@ async def main_checking_loop():
                     if event_date_obj.day == now_msk.day and event_date_obj.month == now_msk.month:
                         flag = FLAGS.get(currency.upper(), "🌐")
                         impact_tag = "🔴 HIGH" if impact == "High" else "🟠 MEDIUM"
-                        
-                        # Статус важности строго снизу под анонсом
                         daily_events.append(f"⏰ {time_str} | {flag} **{currency}** — {title}\n{impact_tag}")
                 except Exception:
                     continue
@@ -108,28 +130,21 @@ async def main_checking_loop():
                 date_header = f"{day_name}, {now_msk.day} {month_name}"
                 
                 events_text = "\n\n".join(daily_events)
-                
-                embed_description = (
-                    f"**Запланированные мероприятия:**\n"
-                    f"{date_header}\n\n"
-                    f"{events_text}"
-                )
+                embed_description = f"**Запланированные мероприятия:**\n{date_header}\n\n{events_text}"
                 
                 embed = discord.Embed(
                     title="Ежедневный экономический календарь Forex",
                     description=embed_description,
-                    color=0x2f3136  # Компактный темно-серый цвет
+                    color=0x2f3136
                 )
-                
                 await news_channel.send(embed=embed)
             
             last_daily_report_date = current_date_str
-            
         except Exception as e:
-            print(f"Ошибка создания ежедневной сводки: {e}")
+            print(f"Ошибка ежедневной сводки: {e}")
 
     # =========================================================================
-    # МОДУЛЬ 2. МОНИТОРИНГ КРАСНЫХ НОВОСТЕЙ (EMBED ЗА 15 МИНУТ С ТЕГОМ @everyone)
+    # МОДУЛЬ 2. МОНИТОРИНГ КРАСНЫХ НОВОСТЕЙ (ЗА 15 МИНУТ С ТЕГОМ @everyone)
     # =========================================================================
     if news_channel:
         try:
@@ -158,8 +173,6 @@ async def main_checking_loop():
 
                 if timedelta(minutes=14) <= time_diff <= timedelta(minutes=16) and event_id not in notified_news:
                     flag = FLAGS.get(currency.upper(), "🌐")
-                    
-                    # Компактная структура: актив жирным, новость на одной строке через тире
                     embed_description = (
                         f"**Ожидаемые события:**\n"
                         f"{flag} **{currency}** — {title}\n"
@@ -169,15 +182,13 @@ async def main_checking_loop():
                     )
 
                     embed = discord.Embed(description=embed_description, color=0xff0000)
-
-                    # Тег идет чистой строкой над карточкой
                     await news_channel.send(content="@everyone", embed=embed)
                     notified_news.add(event_id)
         except Exception as e:
             print(f"Ошибка календаря: {e}")
 
     # =========================================================================
-    # МОДУЛЬ 3. МОНИТОРИНГ МЕРОПРИЯТИЙ И СТРИМОВ (ЗА 30 МИНУТ ДО СТАРТА)
+    # МОДУЛЬ 3. МОНИТОРИНГ МЕРОПРИЯТИЙ И СТРИМОВ (ЗА 30 МИНУТ)
     # =========================================================================
     streams_channel = bot.get_channel(STREAMS_CHANNEL_ID)
     if streams_channel:
@@ -191,7 +202,6 @@ async def main_checking_loop():
                     time_to_start = event.start_time - now_utc
 
                     if timedelta(minutes=28) <= time_to_start <= timedelta(minutes=32) and event.id not in notified_events_30m:
-                        # Уведомление со строгими отступами и жирным названием в звездочках
                         msg_text = (
                             f"@everyone ⏰ Напоминаем: через полчаса начинается **{event.name}**. Присоединяйтесь 👇\n\n\n"
                             f"{event.url}"
