@@ -1,7 +1,6 @@
-google-genai
+groq
 discord.py
 fastapi
 uvicorn
-groq
 yfinance
 httpx
