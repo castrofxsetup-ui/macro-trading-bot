@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import httpx
 import discord
@@ -33,73 +34,123 @@ def read_root():
     return {"status": "ok", "bot": "Legacy Bot with Real-time Market Data & Groq AI"}
 
 # ==========================================
-# 2. МОДУЛЬ РЕАЛЬНЫХ КАТИРОВОК РЫНКА (Trading/Market Data)
+# 2. МАРШРУТИЗАЦИЯ И ТИКТЕРЫ (ТОЧНОЕ ОПРЕДЕЛЕНИЕ АКТИВА)
 # ==========================================
 
-# Сварка популярных тикеров для yfinance
-TICKER_MAP = {
-    "GOLD": "GC=F", "XAUUSD": "GC=F", "ЗОЛОТО": "GC=F",
-    "SILVER": "SI=F", "XAGUSD": "SI=F",
-    "EURUSD": "EURUSD=X", "EUR/USD": "EURUSD=X",
-    "GBPUSD": "GBPUSD=X", "GBP/USD": "GBPUSD=X",
-    "USDJPY": "JPY=X", "USD/JPY": "JPY=X",
-    "BTC": "BTC-USD", "BTCUSD": "BTC-USD", "БИТКОИН": "BTC-USD",
-    "ETH": "ETH-USD", "ETHUSD": "ETH-USD",
-    "SPX": "^GSPC", "SP500": "^GSPC", "S&P500": "^GSPC",
-    "NDX": "^IXIC", "NASDAQ": "^IXIC", "NAS100": "NQ=F",
-    "DXY": "DX-Y.NYB", "USDT": "USDT-USD"
+# Точная карта соответствия запросов пользователя с символами Yahoo Finance
+TICKER_DICTIONARY = {
+    # Криптовалюта
+    "BTC": "BTC-USD", "BITCOIN": "BTC-USD", "БИТКОИН": "BTC-USD", "БИТКОЙН": "BTC-USD", "BTCUSD": "BTC-USD",
+    "ETH": "ETH-USD", "ETHEREUM": "ETH-USD", "ЭФИР": "ETH-USD", "ЭФИРИУМ": "ETH-USD", "ETHUSD": "ETH-USD",
+    "SOL": "SOL-USD", "SOLANA": "SOL-USD", "СОЛАНА": "SOL-USD",
+    "XRP": "XRP-USD", "RIPPLE": "XRP-USD", "РИППЛ": "XRP-USD",
+
+    # Металлы
+    "GOLD": "GC=F", "XAUUSD": "GC=F", "ЗОЛОТО": "GC=F", "XAU": "GC=F",
+    "SILVER": "SI=F", "XAGUSD": "SI=F", "СЕРЕБРО": "SI=F", "XAG": "SI=F",
+
+    # Форекс пары
+    "EURUSD": "EURUSD=X", "EUR/USD": "EURUSD=X", "ЕВРО": "EURUSD=X",
+    "GBPUSD": "GBPUSD=X", "GBP/USD": "GBPUSD=X", "ФУНТ": "GBPUSD=X",
+    "USDJPY": "JPY=X", "USD/JPY": "JPY=X", "ИЕНА": "JPY=X", "ЙЕНА": "JPY=X",
+    "AUDUSD": "AUDUSD=X", "AUD/USD": "AUDUSD=X",
+    "USDCAD": "CAD=X", "USD/CAD": "CAD=X",
+    "USDCHF": "CHF=X", "USD/CHF": "CHF=X",
+    "DXY": "DX-Y.NYB", "ДОЛЛАР": "DX-Y.NYB", "ИНДЕКС ДОЛЛАРА": "DX-Y.NYB",
+
+    # Индексы
+    "SPX": "^GSPC", "SP500": "^GSPC", "S&P500": "^GSPC", "S&P 500": "^GSPC",
+    "NDX": "^IXIC", "NASDAQ": "^IXIC", "НАСДАК": "^IXIC", "NAS100": "NQ=F",
+    "DOW": "^DJI", "DJI": "^DJI", "ДЖОНС": "^DJI"
 }
 
-def get_market_data_summary(text: str) -> str:
-    """Автоматически находит упоминания активов в тексте и запрашивает живые цены"""
-    found_data = []
-    words = text.upper().replace("/", "").split()
+def extract_tickers_from_query(text: str):
+    """Ищет только те активы, которые пользователь явно попросил проанализировать"""
+    clean_text = re.sub(r'[^\w\s/]', '', text.upper())
+    words = clean_text.split()
     
-    # Проверяем, есть ли упоминания известного тикера
-    tickers_to_check = set()
+    detected_tickers = {}
+    
     for word in words:
-        if word in TICKER_MAP:
-            tickers_to_check.add(TICKER_MAP[word])
-            
-    # Если явных совпадений нет, но спросили про основные рынки — добавим ключевые
-    if not tickers_to_check and any(k in text.lower() for k in ["рынок", "цена", "курс", "какая цена"]):
-        tickers_to_check = {"GC=F", "EURUSD=X", "BTC-USD"}
+        if word in TICKER_DICTIONARY:
+            name = word
+            ticker = TICKER_DICTIONARY[word]
+            detected_tickers[ticker] = name
 
-    for symbol in tickers_to_check:
+    # Проверка словосочетаний (например "S&P 500", "Индекс доллара")
+    text_upper = text.upper()
+    for key, ticker in TICKER_DICTIONARY.items():
+        if key in text_upper and ticker not in detected_tickers:
+            detected_tickers[ticker] = key
+
+    return detected_tickers
+
+def fetch_live_market_context(user_query: str) -> str:
+    """Получает ДНЕВНЫЕ свежие котировки (OHLCV) строго по запрошенному активу"""
+    target_tickers = extract_tickers_from_query(user_query)
+    
+    if not target_tickers:
+        return ""
+
+    context_lines = ["=== АКТУАЛЬНЫЕ КОТИРОВКИ И ДАННЫЕ РЫНКА (РЕАЛЬНОЕ ВРЕМЯ) ==="]
+
+    for symbol, user_name in target_tickers.items():
         try:
             ticker = yf.Ticker(symbol)
-            fast_info = ticker.fast_info
-            price = fast_info.last_price
-            prev_close = fast_info.previous_close
-            change_pct = ((price - prev_close) / prev_close) * 100 if prev_close else 0.0
+            # Запрашиваем данные свечи за последние 5 дней для точного High/Low
+            hist = ticker.history(period="5d")
             
-            found_data.append(
-                f"• {symbol}: Текущая цена = {price:.4f} (Изменение за день: {change_pct:+.2f}%)"
+            if hist.empty:
+                continue
+
+            latest_row = hist.iloc[-1]
+            prev_row = hist.iloc[-2] if len(hist) > 1 else latest_row
+
+            current_price = latest_row["Close"]
+            day_high = latest_row["High"]
+            day_low = latest_row["Low"]
+            prev_close = prev_row["Close"]
+            change_pct = ((current_price - prev_close) / prev_close) * 100
+
+            # Дополнительный High/Low за вчера (для ликвидности PDH/PDL - Previous Day High/Low)
+            pdh = prev_row["High"]
+            pdl = prev_row["Low"]
+
+            context_lines.append(
+                f"• АКТИВ: {user_name} ({symbol})\n"
+                f"  - Текущая цена: {current_price:.2f}\n"
+                f"  - Дневной максимум (High): {day_high:.2f}\n"
+                f"  - Дневной минимум (Low): {day_low:.2f}\n"
+                f"  - Вчерашний High (PDH): {pdh:.2f}\n"
+                f"  - Вчерашний Low (PDL): {pdl:.2f}\n"
+                f"  - Изменение за день: {change_pct:+.2f}%\n"
             )
         except Exception as e:
-            print(f"[Market Data Error] Не удалось получить данные по {symbol}: {e}")
+            print(f"[Market Data Error] Ошибка получения данных для {symbol}: {e}")
 
-    if found_data:
-        return "\n--- АКТУАЛЬНЫЕ ДАННЫЕ РЫНКА (REAL-TIME DATA) ---\n" + "\n".join(found_data) + "\n-------------------------------------------\n"
-    return ""
+    context_lines.append("ВАЖНО: При ответе опирайся СТРОГО на эти цены и уровни High/Low! Не придумывай другие значения цен.")
+    return "\n".join(context_lines)
 
 # ==========================================
-# 3. СИСТЕМНЫЙ ПРОМПТ С УЧЕТОМ СВЕЖИХ ДАННЫХ
+# 3. СИСТЕМНЫЙ ПРОМПТ
 # ==========================================
 
 SYSTEM_PROMPT = """
-Ты — эрудированный ИИ-ассистент и ментор в закрытом Discord-сообществе для трейдеров.
+Ты — профессиональный аналитик и ментор в закрытом Discord-сообществе для трейдеров.
 
 ТВОЯ СПЕЦИАЛИЗАЦИЯ И МЕХАНИКА АНАЛИЗА:
 1. Основа твоего анализа — концепции Smart Money Concepts (SMC), Inner Circle Trader (ICT) и методология Alchemist MSNR.
 2. Категорически ИЗБЕГАЙ и НЕ ИСПОЛЬЗУЙ классический технический анализ (никаких индикаторов RSI, MACD, скользящих средних, линий тренда, фигурного анализа вроде "голова и плечи", "двойное дно" и т.д.).
-3. Ты объясняешь движения рынка исключительно через механику ликвидности (Liquidity Sweep, Buy-side / Sell-side Liquidity), работу алгоритма доставки цены (IPDA), дисбалансы (FVG / Fair Value Gap), имбалансы, блоки заказов (Order Block, Breaker Block, Mitigation Block) и структуры MSNR (Market Structure, Market Structure Shift / MSS, Change of Character / CHOCh).
-4. Тебе могут передаваться актуальные рыночные данные в реальном времени. Опирайся на эти точные цифры при ответе о текущей цене активов!
+3. Ты объясняешь движения рынка исключительно через механику ликвидности (Liquidity Sweep, Buy-side / Sell-side Liquidity, PDH/PDL), работу алгоритма доставки цены (IPDA), дисбалансы (FVG / Fair Value Gap), имбалансы, блоки заказов (Order Block, Breaker Block) и структуры MSNR (Market Structure, Market Structure Shift / MSS, Change of Character / CHOCh).
+
+СТРОГИЕ ПРАВИЛА ПО ЦЕНАМ И АКТИВАМ:
+1. Внимательно смотри на переданный контекст рыночных данных! Использовать нужно СТРОГО те текущие цены и значения High/Low, которые переданы в блоке "АКТУАЛЬНЫЕ КОТИРОВКИ".
+2. Не путай активы. Если спрашивают про Биткоин (BTC), говори ТОЛЬКО про Биткоин и его текущую цену. Если спрашивают про Золото — говори ТОЛЬКО про Золото.
+3. Уровни поддержки/сопротивления (FVG, Order Block, Liquidity Pool) строй ВОКРУГ реальной текущей цены и диапазонов High/Low, переданных тебе.
 
 СТИЛЬ ОБЩЕНИЯ:
-- Профессиональный, уверенный, лаконичный и подстроенный под трейдинг-комьюнити.
-- Используй терминологию ICT/SMC/MSNR на английском или с общепринятой транслитерацией (FVG, OB, Liquidity Grab, BOS, MSS, MSNR, BPR).
-- Помни: ты ментор и наставник, ориентированный на институциональное понимание механики цены.
+- Профессиональный, уверенный, лаконичный.
+- Используй терминологию ICT/SMC/MSNR на английском или с общепринятой транслитерацией (FVG, OB, Liquidity Grab, BOS, MSS, MSNR, BPR, PDH, PDL).
 """
 
 # ==========================================
@@ -110,13 +161,14 @@ async def get_groq_ai_response(user_message: str) -> str:
     if not groq_client:
         return "⚠️ Ошибка: Переменная `GROQ_API_KEY` не настроена на сервисе Render."
 
-    # 1. Получаем живые цены по тикерам из запроса
-    market_context = await asyncio.to_thread(get_market_data_summary, user_message)
+    # 1. Вытягиваем актуальные котировки строго под запрошенный актив
+    market_context = await asyncio.to_thread(fetch_live_market_context, user_message)
     
-    # 2. Формируем итоговый промпт для ИИ
-    full_prompt = user_message
+    # 2. Формируем итоговый запрос к модели
     if market_context:
-        full_prompt = f"{market_context}\nЗапрос пользователя: {user_message}"
+        full_prompt = f"{market_context}\n\nЗапрос пользователя: {user_message}"
+    else:
+        full_prompt = user_message
 
     try:
         completion = await groq_client.chat.completions.create(
@@ -125,7 +177,7 @@ async def get_groq_ai_response(user_message: str) -> str:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": full_prompt}
             ],
-            temperature=0.5,
+            temperature=0.3, # Пониженный шум для более точных ответов по цифрам
             max_tokens=1024,
         )
         return completion.choices[0].message.content
@@ -143,7 +195,7 @@ async def get_groq_ai_response(user_message: str) -> str:
 @bot.event
 async def on_ready():
     print(f"✅ Бот {bot.user.name} успешно подключился к серверам Discord!")
-    print(f"📊 Подключен модуль реальных котировок (yfinance/Trading Data)")
+    print(f"📊 Подключен модуль точных рыночных данных (OHLCV / Market Data)")
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -154,7 +206,7 @@ async def on_message(message: discord.Message):
         async with message.channel.typing():
             clean_content = message.content.replace(f"<@{bot.user.id}>", "").strip()
             if not clean_content:
-                clean_content = "Привет! Какие котировки или концепции SMC/ICT/MSNR тебя интересуют?"
+                clean_content = "Привет! Напиши актив (например: BTC, Gold, EURUSD, SPX), и я дам актуальный разбор по SMC/ICT/MSNR."
             
             ai_reply = await get_groq_ai_response(clean_content)
             
@@ -168,16 +220,16 @@ async def on_message(message: discord.Message):
 
 @bot.command(name="price")
 async def price_command(ctx: commands.Context, *, symbol: str):
-    """Команда !price EURUSD / !price GOLD для быстрого получения текущей цены"""
+    """Команда !price BTC / !price GOLD для получения текущих точных котировок"""
     async with ctx.typing():
-        data = await asyncio.to_thread(get_market_data_summary, symbol)
+        data = await asyncio.to_thread(fetch_live_market_context, symbol)
         if data:
             await ctx.reply(data)
         else:
-            await ctx.reply(f"Не удалось найти котировки по активу: {symbol}")
+            await ctx.reply(f"Не удалось распознать актив или получить котировки по: `{symbol}`")
 
 # ==========================================
-# 6. ЗАПУСК
+# 6. ЗАПУСК ВЕБ-СЕРВЕРА И БОТА
 # ==========================================
 
 async def run_fastapi():
