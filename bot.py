@@ -5,6 +5,7 @@ import uvicorn
 import asyncio
 import threading
 import urllib.request
+import urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 import os
@@ -65,10 +66,38 @@ MONTHS_RU = [
 ai_context = {}
 
 # =========================================================================
-# ИИ-МОДУЛЬ ОБЩЕНИЯ — Google Gen AI SDK (актуальный, gemini-2.5-flash)
+# КЕШ КАЛЕНДАРЯ FOREXFACTORY
+# Раньше XML скачивался заново КАЖДУЮ минуту (МОДУЛЬ 2 крутится в цикле 60с) —
+# это и вызывало "HTTP Error 429: Too Many Requests" от источника.
+# Теперь данные обновляются не чаще, чем раз в CACHE_TTL секунд, и переиспользуются
+# и в МОДУЛЕ 1, и в МОДУЛЕ 2.
+# =========================================================================
+CACHE_TTL = 180  # секунд между реальными обращениями к nfs.faireconomy.media
+_ff_cache = {"root": None, "fetched_at": None}
+
+def get_ff_calendar():
+    now = datetime.now(timezone.utc)
+    if _ff_cache["root"] is not None and _ff_cache["fetched_at"] is not None:
+        if (now - _ff_cache["fetched_at"]).total_seconds() < CACHE_TTL:
+            return _ff_cache["root"]
+
+    req = urllib.request.Request(FF_CALENDAR_URL, headers={'User-Agent': 'Mozilla/5.0'})
+    with urllib.request.urlopen(req, timeout=15) as response:
+        xml_data = response.read()
+    root = ET.fromstring(xml_data)
+
+    _ff_cache["root"] = root
+    _ff_cache["fetched_at"] = now
+    return root
+
+# =========================================================================
+# ИИ-МОДУЛЬ ОБЩЕНИЯ — Google Gen AI SDK
 # =========================================================================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = "gemini-2.5-flash"
+# gemini-3.5-flash: стабильная GA-модель Google на июль 2026.
+# Если Google снова закроет доступ новым ключам (как было с 1.5 и 2.5),
+# следующий кандидат на замену — "gemini-3.6-flash" (вышла 21.07.2026).
+GEMINI_MODEL = "gemini-3.5-flash"
 
 SYSTEM_INSTRUCTION = (
     "Ты — Macro Expert Bot, опытный трейдер и наставник в закрытом трейдинг-комьюнити. "
@@ -107,8 +136,6 @@ def ask_free_ai(prompt, context_history=None):
         )
         return response.text
     except Exception as e:
-        # Полный текст ошибки печатается в логи Render — по нему сразу видно,
-        # что не так: неверный ключ, лимит запросов, недоступная модель и т.д.
         print(f"Ошибка ИИ (Gemini): {e}", flush=True)
         return "Секунду, графики подвисли — попробуй написать ещё раз через пару секунд. 📈"
 
@@ -164,6 +191,7 @@ async def main_checking_loop():
     task_channel = bot.get_channel(TASK_CHANNEL_ID)
     current_date_str = now_msk.strftime("%Y-%m-%d")
 
+    # МОДУЛЬ 0. ЗАДАНИЕ ДНЯ (09:30 МСК)
     if task_channel and now_msk.weekday() < 5:
         if now_msk.hour == 9 and now_msk.minute == 30 and last_task_date != current_date_str:
             embed_text = (
@@ -175,13 +203,10 @@ async def main_checking_loop():
             await task_channel.send(embed=embed)
             last_task_date = current_date_str
 
+    # МОДУЛЬ 1. ЕЖЕДНЕВНЫЙ КАЛЕНДАРЬ (08:00 МСК)
     if news_channel and now_msk.hour == 8 and now_msk.minute == 0 and last_daily_report_date != current_date_str:
         try:
-            req = urllib.request.Request(FF_CALENDAR_URL, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=15) as response:
-                xml_data = response.read()
-
-            root = ET.fromstring(xml_data)
+            root = get_ff_calendar()
             daily_events = []
 
             for event in root.findall('event'):
@@ -216,16 +241,15 @@ async def main_checking_loop():
                 embed = discord.Embed(title="Ежедневный экономический календарь Forex", description=embed_description, color=0x2f3136)
                 await news_channel.send(embed=embed)
             last_daily_report_date = current_date_str
+        except urllib.error.HTTPError as e:
+            print(f"Произошла ошибка в МОДУЛЕ 1 (календарь): HTTP {e.code} {e.reason}", flush=True)
         except Exception as e:
             print(f"Произошла ошибка в МОДУЛЕ 1 (календарь): {e}", flush=True)
 
+    # МОДУЛЬ 2. МОНИТОРИНГ КРАСНЫХ НОВОСТЕЙ (ЗА 15 МИНУТ)
     if news_channel:
         try:
-            req = urllib.request.Request(FF_CALENDAR_URL, headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req, timeout=15) as response:
-                xml_data = response.read()
-
-            root = ET.fromstring(xml_data)
+            root = get_ff_calendar()
             for event in root.findall('event'):
                 if event.find('impact').text != "High":
                     continue
@@ -256,6 +280,8 @@ async def main_checking_loop():
 
                     notified_news.add(event_id)
 
+        except urllib.error.HTTPError as e:
+            print(f"Ошибка при парсинге новостей ForexFactory: HTTP {e.code} {e.reason}", flush=True)
         except Exception as news_err:
             print(f"Ошибка при парсинге новостей ForexFactory: {news_err}", flush=True)
 
