@@ -8,7 +8,8 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 import os
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 
 # --- ВЕБ-СЕРВЕР ДЛЯ ОБХОДА ПЛАТНОГО ТАРИФА RENDER ---
 app = FastAPI()
@@ -27,10 +28,13 @@ threading.Thread(target=start_web_server, daemon=True).start()
 # НАСТРОЙКИ КАНАЛОВ БОТА
 NEWS_CHANNEL_ID = 1528319066513604688     # Ветка для новостей Forex Factory
 STREAMS_CHANNEL_ID = 1528506824687485118  # Ветка для уведомлений о стримах
-TASK_CHANNEL_ID = 1502292137889501235     # Ветка для утренних заданий дня
+TASK_CHANNEL_ID = 1502292137889501235     # Ветка для утренних заданий дня И для общения с ИИ
+
+# ИИ отвечает ТОЛЬКО в этом канале — в любых других ветках бот не реагирует
+# на упоминания/ответы вообще, даже если его тегнуть.
+AI_CHAT_CHANNEL_ID = TASK_CHANNEL_ID
 
 # Реальный публичный XML-календарь ForexFactory
-# (forexfactory.com отдаёт HTML, а не XML — парсинг главной страницы падал с ошибкой)
 FF_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
 
 intents = discord.Intents.default()
@@ -61,9 +65,10 @@ MONTHS_RU = [
 ai_context = {}
 
 # =========================================================================
-# ИИ-МОДУЛЬ ОБЩЕНИЯ — GOOGLE GEMINI (бесплатный тариф Google AI Studio)
+# ИИ-МОДУЛЬ ОБЩЕНИЯ — Google Gen AI SDK (актуальный, gemini-2.5-flash)
 # =========================================================================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = "gemini-2.5-flash"
 
 SYSTEM_INSTRUCTION = (
     "Ты — Macro Expert Bot, опытный трейдер и наставник в закрытом трейдинг-комьюнити. "
@@ -77,31 +82,33 @@ SYSTEM_INSTRUCTION = (
     "Отвечай строго на русском языке."
 )
 
-gemini_model = None
+gemini_client = None
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel(
-        model_name="gemini-1.5-flash",
-        system_instruction=SYSTEM_INSTRUCTION,
-    )
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
 
 def ask_free_ai(prompt, context_history=None):
-    if not gemini_model:
+    if not gemini_client:
         print("Ошибка ИИ: не задан GEMINI_API_KEY в переменных окружения.")
         return "Секунду, настраиваю графики... (ИИ временно не настроен)"
 
     try:
-        gemini_history = []
+        contents = []
         if context_history:
             for msg in context_history:
                 role = "model" if msg["role"] == "assistant" else "user"
-                gemini_history.append({"role": role, "parts": [msg["content"]]})
+                contents.append(genai_types.Content(role=role, parts=[genai_types.Part(text=msg["content"])]))
+        contents.append(genai_types.Content(role="user", parts=[genai_types.Part(text=prompt)]))
 
-        chat = gemini_model.start_chat(history=gemini_history)
-        response = chat.send_message(prompt)
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=contents,
+            config=genai_types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION),
+        )
         return response.text
     except Exception as e:
+        # Полный текст ошибки печатается в логи Render — по нему сразу видно,
+        # что не так: неверный ключ, лимит запросов, недоступная модель и т.д.
         print(f"Ошибка ИИ (Gemini): {e}")
         return "Секунду, графики подвисли — попробуй написать ещё раз через пару секунд. 📈"
 
@@ -117,25 +124,28 @@ async def on_message(message):
     if message.author.bot or not message.guild:
         return
 
-    if bot.user.mentioned_in(message) or (message.reference and message.reference.cached_message and message.reference.cached_message.author == bot.user):
-        async with message.channel.typing():
-            user_text = message.content.replace(f'<@{bot.user.id}>', '').strip()
-            if not user_text and message.reference:
-                user_text = message.content.strip()
+    # ИИ реагирует ТОЛЬКО в канале AI_CHAT_CHANNEL_ID.
+    # В любой другой ветке — полностью игнорируем упоминания/ответы боту.
+    if message.channel.id == AI_CHAT_CHANNEL_ID:
+        if bot.user.mentioned_in(message) or (message.reference and message.reference.cached_message and message.reference.cached_message.author == bot.user):
+            async with message.channel.typing():
+                user_text = message.content.replace(f'<@{bot.user.id}>', '').strip()
+                if not user_text and message.reference:
+                    user_text = message.content.strip()
 
-            channel_id = message.channel.id
-            if channel_id not in ai_context:
-                ai_context[channel_id] = []
+                channel_id = message.channel.id
+                if channel_id not in ai_context:
+                    ai_context[channel_id] = []
 
-            loop = asyncio.get_event_loop()
-            ai_response = await loop.run_in_executor(None, ask_free_ai, user_text, ai_context[channel_id])
+                loop = asyncio.get_event_loop()
+                ai_response = await loop.run_in_executor(None, ask_free_ai, user_text, ai_context[channel_id])
 
-            ai_context[channel_id].append({"role": "user", "content": user_text})
-            ai_context[channel_id].append({"role": "assistant", "content": ai_response})
-            if len(ai_context[channel_id]) > 6:
-                ai_context[channel_id] = ai_context[channel_id][-6:]
+                ai_context[channel_id].append({"role": "user", "content": user_text})
+                ai_context[channel_id].append({"role": "assistant", "content": ai_response})
+                if len(ai_context[channel_id]) > 6:
+                    ai_context[channel_id] = ai_context[channel_id][-6:]
 
-            await message.reply(ai_response)
+                await message.reply(ai_response)
 
     await bot.process_commands(message)
 
