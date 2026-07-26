@@ -1,5 +1,6 @@
 import os
 import re
+import base64
 import asyncio
 import discord
 from discord.ext import commands
@@ -7,8 +8,6 @@ from fastapi import FastAPI
 import uvicorn
 from groq import AsyncGroq
 import yfinance as yf
-from google import genai
-from google.genai import types
 
 # ==========================================
 # 1. ИНИЦИАЛИЗАЦИЯ И НАСТРОЙКИ
@@ -16,32 +15,25 @@ from google.genai import types
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
-# Проверка наличия ключей
 if not DISCORD_TOKEN:
     print("⚠️ WARNING: DISCORD_TOKEN не найден в переменных окружения Render!")
 if not GROQ_API_KEY:
     print("⚠️ WARNING: GROQ_API_KEY не найден в переменных окружения Render!")
-if not GEMINI_API_KEY:
-    print("⚠️ WARNING: GEMINI_API_KEY не найден в переменных окружения (нужен для анализа графиков)!")
 
-# Клиенты ИИ
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-# Прямой клиент Gemini API
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 # Настройки Discord бота
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Веб-сервер FastAPI (для Render)
+# Веб-сервер FastAPI для Render Health Check (поддержка GET и HEAD)
 app = FastAPI()
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def read_root():
-    return {"status": "ok", "bot": "Legacy Bot with Real-time Data & Direct Gemini Vision Analysis"}
+    return {"status": "ok", "bot": "Macro Bot powered fully by Groq API"}
 
 # ==========================================
 # 2. МАРШРУТИЗАЦИЯ И ТИКЕРЫ (yfinance)
@@ -128,7 +120,7 @@ def fetch_live_market_context(user_query: str) -> str:
     return "\n".join(context_lines)
 
 # ==========================================
-# 3. СИСТЕМНЫЕ ПРОМПТЫ (SMC/ICT)
+# 3. СИСТЕМНЫЕ ПРОМПТЫ (SMC/ICT/MSNR)
 # ==========================================
 
 SYSTEM_PROMPT = """
@@ -155,53 +147,56 @@ VISION_PROMPT = SYSTEM_PROMPT + """
 """
 
 # ==========================================
-# 4. ЗАПРОСЫ К ИИ (Groq Текст + Прямой Gemini Vision)
+# 4. ЗАПРОСЫ К GROQ API (ТЕКСТ И VISION)
 # ==========================================
 
-async def get_gemini_vision_response(user_message: str, image_bytes: bytes, mime_type: str) -> str:
-    """Прямой бесплатный анализ скриншотов через официальный Google Gemini API"""
-    if not gemini_client:
-        return "⚠️ Ошибка: Переменная `GEMINI_API_KEY` не настроена на сервисе Render!"
+async def get_groq_vision_response(user_message: str, image_bytes: bytes, mime_type: str) -> str:
+    """Анализ скриншотов через модель Groq Vision (llama-3.2-11b-vision-preview)"""
+    if not groq_client:
+        return "⚠️ Ошибка: Переменная `GROQ_API_KEY` не настроена на сервисе Render!"
 
-    # Получаем контекст рынка (High/Low)
     market_context = await asyncio.to_thread(fetch_live_market_context, user_message)
-    prompt_text = user_message if user_message else "Проанализируй этот сетап и позиции (Entry/Stop/Take) по концепциям SMC, ICT и Alchemist MSNR."
+    prompt_text = user_message if user_message else "Проанализируй этот сетап по концепциям SMC, ICT и Alchemist MSNR."
     
-    # Объединяем промпт с рыночными данными
     if market_context:
         prompt_text = f"{market_context}\n\nЗапрос пользователя по графику: {prompt_text}"
 
-    try:
-        # Google GenAI библиотека требует синхронного вызова, оборачиваем в поток
-        def _call_gemini():
-            # Модель Gemini 2.0 Flash — быстрая, бесплатная и мультимодальная
-            response = gemini_client.models.generate_content(
-                model="gemini-2.0-flash",
-                contents=[
-                    # Данные изображения
-                    types.Part.from_bytes(data=image_bytes, mime_type=mime_type),
-                    # Текстовый запрос
-                    prompt_text
-                ],
-                config=types.GenerateContentConfig(
-                    system_instruction=VISION_PROMPT,
-                    temperature=0.3
-                )
-            )
-            return response.text
+    # Кодирование картинки в base64
+    base64_image = base64.b64encode(image_bytes).decode('utf-8')
+    data_url = f"data:{mime_type};base64,{base64_image}"
 
-        # Запускаем синхронную функцию в асинхронном потоке
-        return await asyncio.to_thread(_call_gemini)
+    try:
+        completion = await groq_client.chat.completions.create(
+            model="llama-3.2-11b-vision-preview",
+            messages=[
+                {"role": "system", "content": VISION_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt_text},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": data_url}
+                        }
+                    ]
+                }
+            ],
+            temperature=0.2,
+            max_tokens=1200
+        )
+        return completion.choices[0].message.content
     except Exception as e:
-        print(f"[GEMINI ERROR] Ошибка обработки изображения: {e}")
-        return f"⚠️ Ошибка при анализе графика через Gemini API: {e}"
+        error_str = str(e)
+        if "429" in error_str:
+            return "⏳ Превышен временный лимит запросов Groq API. Пожалуйста, подождите 30-60 секунд."
+        print(f"[GROQ VISION ERROR] Ошибка обработки изображения: {e}")
+        return f"⚠️ Ошибка при анализе графика через Groq Vision: {e}"
 
 async def get_groq_ai_response(user_message: str) -> str:
-    """Текстовые ответы через сверхбыстрый Groq (Llama 3.3)"""
+    """Текстовые ответы через Llama 3.3 70B Versatile"""
     if not groq_client:
         return "⚠️ Ошибка: Переменная `GROQ_API_KEY` не настроена на сервисе Render."
 
-    # Добавляем рыночные данные, если упомянут актив
     market_context = await asyncio.to_thread(fetch_live_market_context, user_message)
     full_prompt = f"{market_context}\n\nЗапрос пользователя: {user_message}" if market_context else user_message
 
@@ -218,7 +213,6 @@ async def get_groq_ai_response(user_message: str) -> str:
         return completion.choices[0].message.content
     except Exception as e:
         error_str = str(e)
-        # Обработка лимитов запросов
         if "429" in error_str:
             return "⏳ Достигнут временный лимит запросов Groq API. Пожалуйста, подождите минуту."
         print(f"[ERROR] Ошибка Groq API: {e}")
@@ -231,54 +225,46 @@ async def get_groq_ai_response(user_message: str) -> str:
 @bot.event
 async def on_ready():
     print(f"✅ Бот {bot.user.name} успешно подключился к Discord!")
-    print(f"👁️ Активирован прямой модуль анализа графиков (Gemini 2.0 Flash синхронно в потоке)")
+    print(f"👁️ Анализ графиков переведен на Groq Vision (llama-3.2-11b-vision-preview)")
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Игнорируем свои сообщения
     if message.author == bot.user:
         return
 
-    # Отвечаем на упоминания или DM
     if bot.user in message.mentions or isinstance(message.channel, discord.DMChannel):
         async with message.channel.typing():
-            # Очищаем текст от упоминания бота
             clean_content = message.content.replace(f"<@{bot.user.id}>", "").strip()
 
-            # Проверяем прикрепленные изображения
             image_attachment = None
             if message.attachments:
                 for att in message.attachments:
-                    # Простая проверка на MIME тип
                     if att.content_type and att.content_type.startswith("image/"):
                         image_attachment = att
                         break
 
-            # СЦЕНАРИЙ 1: Отправлен скриншот графика
+            # Если прикреплена картинка -> вызваем Groq Vision
             if image_attachment:
                 try:
                     img_bytes = await image_attachment.read()
                     mime_type = image_attachment.content_type or "image/png"
-                    # Вызываем Gemini
-                    ai_reply = await get_gemini_vision_response(clean_content, img_bytes, mime_type)
+                    ai_reply = await get_groq_vision_response(clean_content, img_bytes, mime_type)
                 except Exception as e:
                     ai_reply = f"⚠️ Не удалось прочитать скриншот: {e}"
             
-            # СЦЕНАРИЙ 2: Просто текстовый запрос
+            # Если только текст -> вызываем Groq Llama 3.3
             else:
                 if not clean_content:
                     clean_content = "Привет! Пришли скриншот графика или задай вопрос по концепциям SMC/ICT/MSNR."
-                # Вызываем Groq
                 ai_reply = await get_groq_ai_response(clean_content)
             
-            # Отправка ответа (с разбивкой, если >2000 символов)
+            # Разбивка длинных сообщений для Discord (лимит 2000 символов)
             if len(ai_reply) > 2000:
                 for i in range(0, len(ai_reply), 1900):
                     await message.reply(ai_reply[i:i+1900])
             else:
                 await message.reply(ai_reply)
 
-    # Процессинг команд бота, если они есть
     await bot.process_commands(message)
 
 # ==========================================
@@ -296,12 +282,10 @@ async def main():
         print("CRITICAL ERROR: DISCORD_TOKEN не задан.")
         return
     
-    # Запускаем FastAPI и Discord-бота одновременно
     await asyncio.gather(
         run_fastapi(),
         bot.start(DISCORD_TOKEN)
     )
 
 if __name__ == "__main__":
-    # Точка входа
     asyncio.run(main())
