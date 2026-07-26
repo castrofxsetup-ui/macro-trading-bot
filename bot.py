@@ -16,11 +16,14 @@ import yfinance as yf
 
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 
 if not DISCORD_TOKEN:
     print("⚠️ WARNING: DISCORD_TOKEN не найден в переменных окружения!")
 if not GROQ_API_KEY:
     print("⚠️ WARNING: GROQ_API_KEY не найден в переменных окружения!")
+if not OPENROUTER_API_KEY:
+    print("⚠️ WARNING: OPENROUTER_API_KEY не найден в переменных окружения (нужен для Vision)!")
 
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
@@ -146,13 +149,13 @@ VISION_PROMPT = SYSTEM_PROMPT + """
 """
 
 # ==========================================
-# 4. ЗАПРОСЫ К GROQ API
+# 4. ЗАПРОСЫ К ИИ (GROQ ТЕКСТ + OPENROUTER VISION)
 # ==========================================
 
-async def get_groq_vision_response(user_message: str, image_bytes: bytes) -> str:
-    """Анализ скриншотов с использованием актуальных моделей Groq Vision Instruct"""
-    if not groq_client:
-        return "⚠️ Ошибка: Переменная `GROQ_API_KEY` не настроена на сервисе Render."
+async def get_openrouter_vision_response(user_message: str, image_bytes: bytes) -> str:
+    """Анализ скриншотов через бесплатный OpenRouter Vision API"""
+    if not OPENROUTER_API_KEY:
+        return "⚠️ Ошибка: Переменная `OPENROUTER_API_KEY` не добавлена в переменные окружения Render!"
 
     base64_image = base64.b64encode(image_bytes).decode('utf-8')
     market_context = await asyncio.to_thread(fetch_live_market_context, user_message)
@@ -161,43 +164,45 @@ async def get_groq_vision_response(user_message: str, image_bytes: bytes) -> str
     if market_context:
         prompt_text = f"{market_context}\n\nЗапрос пользователя по графику: {prompt_text}"
 
-    # Список АКТУАЛЬНЫХ моделей Groq Vision Instruct
-    vision_models = [
-        "llama-3.2-11b-vision-instruct",
-        "llama-3.2-90b-vision-instruct"
-    ]
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-    last_error = None
-
-    for model_name in vision_models:
-        try:
-            print(f"[VISION] Пробуем запустить модель: {model_name}")
-            completion = await groq_client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": VISION_PROMPT},
+    payload = {
+        "model": "meta-llama/llama-3.2-11b-vision-instruct:free",
+        "messages": [
+            {"role": "system", "content": VISION_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt_text},
                     {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt_text},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image}"
-                                }
-                            }
-                        ]
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{base64_image}"
+                        }
                     }
-                ],
-                temperature=0.3,
-                max_tokens=1200,
-            )
-            return completion.choices[0].message.content
-        except Exception as e:
-            print(f"[VISION WARNING] Ошибка модели {model_name}: {e}")
-            last_error = e
+                ]
+            }
+        ],
+        "temperature": 0.3,
+        "max_tokens": 1200
+    }
 
-    return f"⚠️ Ошибка при анализе изображения: {last_error}"
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
+            response_json = response.json()
+
+            if "choices" in response_json and len(response_json["choices"]) > 0:
+                return response_json["choices"][0]["message"]["content"]
+            else:
+                print(f"[OPENROUTER ERROR] {response_json}")
+                return f"⚠️ Ошибка OpenRouter API: {response_json.get('error', {}).get('message', 'Неизвестная ошибка')}"
+    except Exception as e:
+        print(f"[VISION ERROR] {e}")
+        return f"⚠️ Ошибка обработки скриншота: {e}"
 
 async def get_groq_ai_response(user_message: str) -> str:
     if not groq_client:
@@ -231,7 +236,7 @@ async def get_groq_ai_response(user_message: str) -> str:
 @bot.event
 async def on_ready():
     print(f"✅ Бот {bot.user.name} успешно подключился!")
-    print(f"👁️ Активирован мультимодальный модуль с актуальными моделями Groq Vision Instruct")
+    print(f"👁️ Активирован модуль анализа графиков (OpenRouter Llama 3.2 Vision Free)")
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -254,7 +259,7 @@ async def on_message(message: discord.Message):
             if image_attachment:
                 try:
                     img_bytes = await image_attachment.read()
-                    ai_reply = await get_groq_vision_response(clean_content, img_bytes)
+                    ai_reply = await get_openrouter_vision_response(clean_content, img_bytes)
                 except Exception as e:
                     ai_reply = f"⚠️ Не удалось прочитать скриншот: {e}"
             else:
