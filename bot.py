@@ -150,7 +150,7 @@ VISION_PROMPT = SYSTEM_PROMPT + """
 # ==========================================
 
 async def get_groq_vision_response(user_message: str, image_bytes: bytes) -> str:
-    """Анализ скриншотов с использованием модели Llama 3.2 Vision"""
+    """Анализ скриншотов с использованием актуальной модели Llama 3.2 Vision"""
     if not groq_client:
         return "⚠️ Ошибка: Переменная `GROQ_API_KEY` не настроена на сервисе Render."
 
@@ -163,7 +163,7 @@ async def get_groq_vision_response(user_message: str, image_bytes: bytes) -> str
             prompt_text = f"{market_context}\n\nЗапрос пользователя по графику: {prompt_text}"
 
         completion = await groq_client.chat.completions.create(
-            model="llama-3.2-11b-vision-preview", # Бесплатная зрячая модель Groq
+            model="llama-3.2-11b-vision-instruct",  # Актуальное имя модели Vision в Groq
             messages=[
                 {"role": "system", "content": VISION_PROMPT},
                 {
@@ -219,7 +219,7 @@ async def get_groq_ai_response(user_message: str) -> str:
 @bot.event
 async def on_ready():
     print(f"✅ Бот {bot.user.name} успешно подключился!")
-    print(f"👁️ Активирован модуль распознавания скриншотов (Llama 3.2 Vision)")
+    print(f"👁️ Активирован модуль распознавания скриншотов (Llama 3.2 Vision Instruct)")
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -230,7 +230,7 @@ async def on_message(message: discord.Message):
         async with message.channel.typing():
             clean_content = message.content.replace(f"<@{bot.user.id}>", "").strip()
 
-            # Проверяем, прикреплено ли изображение
+            # Проверяем прикрепленные изображения
             image_attachment = None
             if message.attachments:
                 for att in message.attachments:
@@ -246,12 +246,11 @@ async def on_message(message: discord.Message):
                 except Exception as e:
                     ai_reply = f"⚠️ Не удалось прочитать скриншот: {e}"
             else:
-                # Если только текстовый запрос
                 if not clean_content:
                     clean_content = "Привет! Пришли скриншот графика или задай вопрос по концепциям SMC/ICT/MSNR."
                 ai_reply = await get_groq_ai_response(clean_content)
             
-            # Отправка ответа с разбивкой при превышении лимитов Discord
+            # Отправка ответа
             if len(ai_reply) > 2000:
                 for i in range(0, len(ai_reply), 1900):
                     await message.reply(ai_reply[i:i+1900])
