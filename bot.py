@@ -1,5 +1,6 @@
 import os
 import re
+import base64
 import asyncio
 import httpx
 import discord
@@ -31,13 +32,12 @@ app = FastAPI()
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "bot": "Legacy Bot with Real-time Market Data & Groq AI"}
+    return {"status": "ok", "bot": "Legacy Bot with Real-time Data & Vision Analysis"}
 
 # ==========================================
-# 2. МАРШРУТИЗАЦИЯ И ТИКТЕРЫ (ТОЧНОЕ ОПРЕДЕЛЕНИЕ АКТИВА)
+# 2. МАРШРУТИЗАЦИЯ И ТИКЕРЫ
 # ==========================================
 
-# Точная карта соответствия запросов пользователя с символами Yahoo Finance
 TICKER_DICTIONARY = {
     # Криптовалюта
     "BTC": "BTC-USD", "BITCOIN": "BTC-USD", "БИТКОИН": "BTC-USD", "БИТКОЙН": "BTC-USD", "BTCUSD": "BTC-USD",
@@ -65,19 +65,14 @@ TICKER_DICTIONARY = {
 }
 
 def extract_tickers_from_query(text: str):
-    """Ищет только те активы, которые пользователь явно попросил проанализировать"""
     clean_text = re.sub(r'[^\w\s/]', '', text.upper())
     words = clean_text.split()
-    
     detected_tickers = {}
     
     for word in words:
         if word in TICKER_DICTIONARY:
-            name = word
-            ticker = TICKER_DICTIONARY[word]
-            detected_tickers[ticker] = name
+            detected_tickers[TICKER_DICTIONARY[word]] = word
 
-    # Проверка словосочетаний (например "S&P 500", "Индекс доллара")
     text_upper = text.upper()
     for key, ticker in TICKER_DICTIONARY.items():
         if key in text_upper and ticker not in detected_tickers:
@@ -86,9 +81,7 @@ def extract_tickers_from_query(text: str):
     return detected_tickers
 
 def fetch_live_market_context(user_query: str) -> str:
-    """Получает ДНЕВНЫЕ свежие котировки (OHLCV) строго по запрошенному активу"""
     target_tickers = extract_tickers_from_query(user_query)
-    
     if not target_tickers:
         return ""
 
@@ -97,9 +90,7 @@ def fetch_live_market_context(user_query: str) -> str:
     for symbol, user_name in target_tickers.items():
         try:
             ticker = yf.Ticker(symbol)
-            # Запрашиваем данные свечи за последние 5 дней для точного High/Low
             hist = ticker.history(period="5d")
-            
             if hist.empty:
                 continue
 
@@ -112,27 +103,23 @@ def fetch_live_market_context(user_query: str) -> str:
             prev_close = prev_row["Close"]
             change_pct = ((current_price - prev_close) / prev_close) * 100
 
-            # Дополнительный High/Low за вчера (для ликвидности PDH/PDL - Previous Day High/Low)
-            pdh = prev_row["High"]
-            pdl = prev_row["Low"]
-
             context_lines.append(
                 f"• АКТИВ: {user_name} ({symbol})\n"
                 f"  - Текущая цена: {current_price:.2f}\n"
                 f"  - Дневной максимум (High): {day_high:.2f}\n"
                 f"  - Дневной минимум (Low): {day_low:.2f}\n"
-                f"  - Вчерашний High (PDH): {pdh:.2f}\n"
-                f"  - Вчерашний Low (PDL): {pdl:.2f}\n"
+                f"  - Вчерашний High (PDH): {prev_row['High']:.2f}\n"
+                f"  - Вчерашний Low (PDL): {prev_row['Low']:.2f}\n"
                 f"  - Изменение за день: {change_pct:+.2f}%\n"
             )
         except Exception as e:
             print(f"[Market Data Error] Ошибка получения данных для {symbol}: {e}")
 
-    context_lines.append("ВАЖНО: При ответе опирайся СТРОГО на эти цены и уровни High/Low! Не придумывай другие значения цен.")
+    context_lines.append("ВАЖНО: Опирайся на эти данные при сопоставлении с графиком!")
     return "\n".join(context_lines)
 
 # ==========================================
-# 3. СИСТЕМНЫЙ ПРОМПТ
+# 3. СИСТЕМНЫЕ ПРОМПТЫ
 # ==========================================
 
 SYSTEM_PROMPT = """
@@ -140,35 +127,72 @@ SYSTEM_PROMPT = """
 
 ТВОЯ СПЕЦИАЛИЗАЦИЯ И МЕХАНИКА АНАЛИЗА:
 1. Основа твоего анализа — концепции Smart Money Concepts (SMC), Inner Circle Trader (ICT) и методология Alchemist MSNR.
-2. Категорически ИЗБЕГАЙ и НЕ ИСПОЛЬЗУЙ классический технический анализ (никаких индикаторов RSI, MACD, скользящих средних, линий тренда, фигурного анализа вроде "голова и плечи", "двойное дно" и т.д.).
+2. Категорически ИЗБЕГАЙ и НЕ ИСПОЛЬЗУЙ классический технический анализ (никаких индикаторов RSI, MACD, скользящих средних, линий тренда, фигур вроде "голова и плечи").
 3. Ты объясняешь движения рынка исключительно через механику ликвидности (Liquidity Sweep, Buy-side / Sell-side Liquidity, PDH/PDL), работу алгоритма доставки цены (IPDA), дисбалансы (FVG / Fair Value Gap), имбалансы, блоки заказов (Order Block, Breaker Block) и структуры MSNR (Market Structure, Market Structure Shift / MSS, Change of Character / CHOCh).
+"""
 
-СТРОГИЕ ПРАВИЛА ПО ЦЕНАМ И АКТИВАМ:
-1. Внимательно смотри на переданный контекст рыночных данных! Использовать нужно СТРОГО те текущие цены и значения High/Low, которые переданы в блоке "АКТУАЛЬНЫЕ КОТИРОВКИ".
-2. Не путай активы. Если спрашивают про Биткоин (BTC), говори ТОЛЬКО про Биткоин и его текущую цену. Если спрашивают про Золото — говори ТОЛЬКО про Золото.
-3. Уровни поддержки/сопротивления (FVG, Order Block, Liquidity Pool) строй ВОКРУГ реальной текущей цены и диапазонов High/Low, переданных тебе.
-
-СТИЛЬ ОБЩЕНИЯ:
-- Профессиональный, уверенный, лаконичный.
-- Используй терминологию ICT/SMC/MSNR на английском или с общепринятой транслитерацией (FVG, OB, Liquidity Grab, BOS, MSS, MSNR, BPR, PDH, PDL).
+VISION_PROMPT = SYSTEM_PROMPT + """
+ИНСТРУКЦИЯ ПО АНАЛИЗУ СКРИНШОТОВ ГРАФИКА:
+- Внимательно изучи прикрепленный скриншот с TradingView.
+- Определи актив, таймфрейм и направление сетапа (Short / Long).
+- Оцени локацию точки входа (Entry), уровня Stop Loss и Take Profit.
+- Проверь валидность сетапа по концепциям ICT/SMC/MSNR:
+  1. Был ли сдвиг структуры (MSS / BOS)?
+  2. Захвачена ли ликвидность перед входом (Liquidity Sweep)?
+  3. Находится ли вход в зоне FVG, Order Block или Premium/Discount?
+  4. Безопасен ли Стоп-лосс (стоит ли за валидным фракталом/блоком)?
+  5. Логичен ли Тейк-профит (направлен ли на снятие пула ликвидности)?
+- Дай четкое заключение: Качество сетапа (High Probability / Low Probability), его плюсы и минусы, и что стоит подправить.
 """
 
 # ==========================================
-# 4. ЗАПРОС К GROQ API С ОБОГАЩЕНИЕМ ДАННЫМИ
+# 4. ЗАПРОСЫ К GROQ API (ТЕКСТ И КАРТИНКИ)
 # ==========================================
+
+async def get_groq_vision_response(user_message: str, image_bytes: bytes) -> str:
+    """Анализ скриншотов с использованием модели Llama 3.2 Vision"""
+    if not groq_client:
+        return "⚠️ Ошибка: Переменная `GROQ_API_KEY` не настроена на сервисе Render."
+
+    try:
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+        
+        market_context = await asyncio.to_thread(fetch_live_market_context, user_message)
+        prompt_text = user_message if user_message else "Проанализируй этот сетап и позиции (Entry/Stop/Take) по концепциям SMC, ICT и Alchemist MSNR."
+        if market_context:
+            prompt_text = f"{market_context}\n\nЗапрос пользователя по графику: {prompt_text}"
+
+        completion = await groq_client.chat.completions.create(
+            model="llama-3.2-11b-vision-preview", # Бесплатная зрячая модель Groq
+            messages=[
+                {"role": "system", "content": VISION_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt_text},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            temperature=0.3,
+            max_tokens=1200,
+        )
+        return completion.choices[0].message.content
+    except Exception as e:
+        print(f"[ERROR] Vision API Error: {e}")
+        return f"⚠️ Ошибка при анализе изображения: {e}"
 
 async def get_groq_ai_response(user_message: str) -> str:
     if not groq_client:
         return "⚠️ Ошибка: Переменная `GROQ_API_KEY` не настроена на сервисе Render."
 
-    # 1. Вытягиваем актуальные котировки строго под запрошенный актив
     market_context = await asyncio.to_thread(fetch_live_market_context, user_message)
-    
-    # 2. Формируем итоговый запрос к модели
-    if market_context:
-        full_prompt = f"{market_context}\n\nЗапрос пользователя: {user_message}"
-    else:
-        full_prompt = user_message
+    full_prompt = f"{market_context}\n\nЗапрос пользователя: {user_message}" if market_context else user_message
 
     try:
         completion = await groq_client.chat.completions.create(
@@ -177,7 +201,7 @@ async def get_groq_ai_response(user_message: str) -> str:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": full_prompt}
             ],
-            temperature=0.3, # Пониженный шум для более точных ответов по цифрам
+            temperature=0.3,
             max_tokens=1024,
         )
         return completion.choices[0].message.content
@@ -194,8 +218,8 @@ async def get_groq_ai_response(user_message: str) -> str:
 
 @bot.event
 async def on_ready():
-    print(f"✅ Бот {bot.user.name} успешно подключился к серверам Discord!")
-    print(f"📊 Подключен модуль точных рыночных данных (OHLCV / Market Data)")
+    print(f"✅ Бот {bot.user.name} успешно подключился!")
+    print(f"👁️ Активирован модуль распознавания скриншотов (Llama 3.2 Vision)")
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -205,11 +229,29 @@ async def on_message(message: discord.Message):
     if bot.user in message.mentions or isinstance(message.channel, discord.DMChannel):
         async with message.channel.typing():
             clean_content = message.content.replace(f"<@{bot.user.id}>", "").strip()
-            if not clean_content:
-                clean_content = "Привет! Напиши актив (например: BTC, Gold, EURUSD, SPX), и я дам актуальный разбор по SMC/ICT/MSNR."
+
+            # Проверяем, прикреплено ли изображение
+            image_attachment = None
+            if message.attachments:
+                for att in message.attachments:
+                    if att.content_type and att.content_type.startswith("image/"):
+                        image_attachment = att
+                        break
+
+            # Если отправлен скриншот
+            if image_attachment:
+                try:
+                    img_bytes = await image_attachment.read()
+                    ai_reply = await get_groq_vision_response(clean_content, img_bytes)
+                except Exception as e:
+                    ai_reply = f"⚠️ Не удалось прочитать скриншот: {e}"
+            else:
+                # Если только текстовый запрос
+                if not clean_content:
+                    clean_content = "Привет! Пришли скриншот графика или задай вопрос по концепциям SMC/ICT/MSNR."
+                ai_reply = await get_groq_ai_response(clean_content)
             
-            ai_reply = await get_groq_ai_response(clean_content)
-            
+            # Отправка ответа с разбивкой при превышении лимитов Discord
             if len(ai_reply) > 2000:
                 for i in range(0, len(ai_reply), 1900):
                     await message.reply(ai_reply[i:i+1900])
@@ -217,16 +259,6 @@ async def on_message(message: discord.Message):
                 await message.reply(ai_reply)
 
     await bot.process_commands(message)
-
-@bot.command(name="price")
-async def price_command(ctx: commands.Context, *, symbol: str):
-    """Команда !price BTC / !price GOLD для получения текущих точных котировок"""
-    async with ctx.typing():
-        data = await asyncio.to_thread(fetch_live_market_context, symbol)
-        if data:
-            await ctx.reply(data)
-        else:
-            await ctx.reply(f"Не удалось распознать актив или получить котировки по: `{symbol}`")
 
 # ==========================================
 # 6. ЗАПУСК ВЕБ-СЕРВЕРА И БОТА
