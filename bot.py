@@ -90,6 +90,14 @@ def get_ff_calendar():
     _ff_cache["fetched_at"] = now
     return root
 
+
+def _ev_text(event, tag):
+    """Безопасно достаёт .text у дочернего тега XML-события.
+    Раньше event.find('impact').text падал с 'NoneType' object has no attribute 'text',
+    если у конкретного события в фиде не было такого тега (бывает у holiday/all-day событий)."""
+    node = event.find(tag)
+    return node.text if node is not None else None
+
 # =========================================================================
 # ИИ-МОДУЛЬ ОБЩЕНИЯ — Google Gen AI SDK
 # =========================================================================
@@ -210,17 +218,16 @@ async def main_checking_loop():
             daily_events = []
 
             for event in root.findall('event'):
-                impact = event.find('impact').text
+                impact = _ev_text(event, 'impact')
                 if impact not in ["High", "Medium"]:
                     continue
 
-                title = event.find('title').text
-                currency = event.find('currency').text
-                date_node = event.find('date')
-                date_str = date_node.text if date_node is not None else None
-                time_str = event.find('time').text
+                title = _ev_text(event, 'title')
+                currency = _ev_text(event, 'currency')
+                date_str = _ev_text(event, 'date')
+                time_str = _ev_text(event, 'time')
 
-                if not date_str:
+                if not date_str or not time_str or not title or not currency:
                     continue
 
                 try:
@@ -251,16 +258,16 @@ async def main_checking_loop():
         try:
             root = get_ff_calendar()
             for event in root.findall('event'):
-                if event.find('impact').text != "High":
+                impact = _ev_text(event, 'impact')
+                if impact != "High":
                     continue
 
-                title = event.find('title').text
-                currency = event.find('currency').text
-                date_node = event.find('date')
-                date_str = date_node.text if date_node is not None else None
-                time_str = event.find('time').text
+                title = _ev_text(event, 'title')
+                currency = _ev_text(event, 'currency')
+                date_str = _ev_text(event, 'date')
+                time_str = _ev_text(event, 'time')
 
-                if not date_str:
+                if not date_str or not time_str or not title or not currency:
                     continue
 
                 try:
