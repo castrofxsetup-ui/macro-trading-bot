@@ -151,7 +151,7 @@ VISION_PROMPT = SYSTEM_PROMPT + """
 # ==========================================
 
 async def get_groq_vision_response(user_message: str, image_bytes: bytes, mime_type: str) -> str:
-    """Анализ скриншотов через модель Groq Vision (llama-3.2-11b-vision-preview)"""
+    """Анализ скриншотов через модель Groq Vision (meta-llama/llama-3.2-11b-vision-instruct)"""
     if not groq_client:
         return "⚠️ Ошибка: Переменная `GROQ_API_KEY` не настроена на сервисе Render!"
 
@@ -167,7 +167,7 @@ async def get_groq_vision_response(user_message: str, image_bytes: bytes, mime_t
 
     try:
         completion = await groq_client.chat.completions.create(
-            model="llama-3.2-11b-vision-preview",
+            model="meta-llama/llama-3.2-11b-vision-instruct",
             messages=[
                 {"role": "system", "content": VISION_PROMPT},
                 {
@@ -225,7 +225,7 @@ async def get_groq_ai_response(user_message: str) -> str:
 @bot.event
 async def on_ready():
     print(f"✅ Бот {bot.user.name} успешно подключился к Discord!")
-    print(f"👁️ Анализ графиков переведен на Groq Vision (llama-3.2-11b-vision-preview)")
+    print(f"👁️ Анализ графиков переведен на Groq Vision (meta-llama/llama-3.2-11b-vision-instruct)")
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -243,7 +243,7 @@ async def on_message(message: discord.Message):
                         image_attachment = att
                         break
 
-            # Если прикреплена картинка -> вызваем Groq Vision
+            # Если прикреплена картинка -> вызываем Groq Vision
             if image_attachment:
                 try:
                     img_bytes = await image_attachment.read()
