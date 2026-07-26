@@ -166,13 +166,16 @@ async def get_openrouter_vision_response(user_message: str, image_bytes: bytes) 
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://render.com",
+        "X-Title": "Discord Trading Bot"
     }
 
-    # Проверенные и актуальные бесплатные модели OpenRouter для графика
+    # Актуальные 100% рабочие бесплатные мультимодальные модели
     vision_models = [
-        "google/gemini-2.0-flash-exp:free",
-        "meta-llama/llama-3.2-90b-vision-instruct:free"
+        "qwen/qwen2.5-vl-72b-instruct:free",
+        "google/gemini-2.0-flash-001:free",
+        "mistralai/pixtral-12b:free"
     ]
 
     for model_name in vision_models:
