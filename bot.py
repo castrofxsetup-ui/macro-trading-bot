@@ -146,11 +146,11 @@ VISION_PROMPT = SYSTEM_PROMPT + """
 """
 
 # ==========================================
-# 4. ЗАПРОСЫ К GROQ API С АВТОПЕРЕКЛЮЧЕНИЕМ
+# 4. ЗАПРОСЫ К GROQ API
 # ==========================================
 
 async def get_groq_vision_response(user_message: str, image_bytes: bytes) -> str:
-    """Анализ скриншотов с перебором доступных Vision моделей"""
+    """Анализ скриншотов с использованием актуальных моделей Groq Vision Instruct"""
     if not groq_client:
         return "⚠️ Ошибка: Переменная `GROQ_API_KEY` не настроена на сервисе Render."
 
@@ -161,11 +161,10 @@ async def get_groq_vision_response(user_message: str, image_bytes: bytes) -> str
     if market_context:
         prompt_text = f"{market_context}\n\nЗапрос пользователя по графику: {prompt_text}"
 
-    # Список актуальных мультимодальных моделей Groq
+    # Список АКТУАЛЬНЫХ моделей Groq Vision Instruct
     vision_models = [
-        "llama-3.2-11b-vision-preview",
-        "llama-3.2-90b-vision-preview",
-        "llava-v1.5-7b-4096-preview"
+        "llama-3.2-11b-vision-instruct",
+        "llama-3.2-90b-vision-instruct"
     ]
 
     last_error = None
@@ -198,7 +197,7 @@ async def get_groq_vision_response(user_message: str, image_bytes: bytes) -> str
             print(f"[VISION WARNING] Ошибка модели {model_name}: {e}")
             last_error = e
 
-    return f"⚠️ Ошибка при анализе изображения (все модели недоступны): {last_error}"
+    return f"⚠️ Ошибка при анализе изображения: {last_error}"
 
 async def get_groq_ai_response(user_message: str) -> str:
     if not groq_client:
@@ -232,7 +231,7 @@ async def get_groq_ai_response(user_message: str) -> str:
 @bot.event
 async def on_ready():
     print(f"✅ Бот {bot.user.name} успешно подключился!")
-    print(f"👁️ Активирован мультимодальный модуль с автоматическим переключением моделей Vision")
+    print(f"👁️ Активирован мультимодальный модуль с актуальными моделями Groq Vision Instruct")
 
 @bot.event
 async def on_message(message: discord.Message):
