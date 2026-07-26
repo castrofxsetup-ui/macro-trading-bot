@@ -169,40 +169,48 @@ async def get_openrouter_vision_response(user_message: str, image_bytes: bytes) 
         "Content-Type": "application/json"
     }
 
-    payload = {
-        "model": "meta-llama/llama-3.2-11b-vision-instruct:free",
-        "messages": [
-            {"role": "system", "content": VISION_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt_text},
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/jpeg;base64,{base64_image}"
+    # Актуальные рабочие бесплатные мультимодальные модели
+    vision_models = [
+        "google/gemini-2.0-flash-lite-preview-02-05:free",
+        "qwen/qwen-2.5-vl-72b-instruct:free"
+    ]
+
+    for model_name in vision_models:
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": VISION_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt_text},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
                         }
-                    }
-                ]
-            }
-        ],
-        "temperature": 0.3,
-        "max_tokens": 1200
-    }
+                    ]
+                }
+            ],
+            "temperature": 0.3,
+            "max_tokens": 1200
+        }
 
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
-            response_json = response.json()
+        try:
+            print(f"[VISION] Пробуем запустить модель OpenRouter: {model_name}")
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=payload)
+                response_json = response.json()
 
-            if "choices" in response_json and len(response_json["choices"]) > 0:
-                return response_json["choices"][0]["message"]["content"]
-            else:
-                print(f"[OPENROUTER ERROR] {response_json}")
-                return f"⚠️ Ошибка OpenRouter API: {response_json.get('error', {}).get('message', 'Неизвестная ошибка')}"
-    except Exception as e:
-        print(f"[VISION ERROR] {e}")
-        return f"⚠️ Ошибка обработки скриншота: {e}"
+                if "choices" in response_json and len(response_json["choices"]) > 0:
+                    return response_json["choices"][0]["message"]["content"]
+                else:
+                    print(f"[OPENROUTER WARNING] Ошибка модели {model_name}: {response_json}")
+        except Exception as e:
+            print(f"[VISION ERROR] Ошибка запроса к модели {model_name}: {e}")
+
+    return "⚠️ Не удалось получить ответ от моделей анализа скриншотов. Попробуйте еще раз через минуту."
 
 async def get_groq_ai_response(user_message: str) -> str:
     if not groq_client:
@@ -236,7 +244,7 @@ async def get_groq_ai_response(user_message: str) -> str:
 @bot.event
 async def on_ready():
     print(f"✅ Бот {bot.user.name} успешно подключился!")
-    print(f"👁️ Активирован модуль анализа графиков (OpenRouter Llama 3.2 Vision Free)")
+    print(f"👁️ Активирован модуль анализа графиков (OpenRouter Free Vision)")
 
 @bot.event
 async def on_message(message: discord.Message):
