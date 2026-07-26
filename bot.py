@@ -1,6 +1,5 @@
 import os
 import re
-import base64
 import asyncio
 import discord
 from discord.ext import commands
@@ -28,7 +27,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Веб-сервер FastAPI для Render Health Check (поддержка GET и HEAD)
+# Веб-сервер FastAPI для Render Health Check
 app = FastAPI()
 
 @app.api_route("/", methods=["GET", "HEAD"])
@@ -116,11 +115,11 @@ def fetch_live_market_context(user_query: str) -> str:
         except Exception as e:
             print(f"[Market Data Error] Ошибка получения данных для {symbol}: {e}")
 
-    context_lines.append("ВАЖНО: Опирайся на эти данные при сопоставлении с графиком!")
+    context_lines.append("ВАЖНО: Опирайся на эти данные при сопоставлении с вопросом пользователя!")
     return "\n".join(context_lines)
 
 # ==========================================
-# 3. СИСТЕМНЫЕ ПРОМПТЫ (SMC/ICT/MSNR)
+# 3. СИСТЕМНЫЙ ПРОМПТ (SMC/ICT/MSNR)
 # ==========================================
 
 SYSTEM_PROMPT = """
@@ -132,65 +131,9 @@ SYSTEM_PROMPT = """
 3. Ты объясняешь движения рынка исключительно через механику ликвидности (Liquidity Sweep, Buy-side / Sell-side Liquidity, PDH/PDL), работу алгоритма доставки цены (IPDA), дисбалансы (FVG / Fair Value Gap), имбалансы, блоки заказов (Order Block, Breaker Block) и структуры MSNR (Market Structure, Market Structure Shift / MSS, Change of Character / CHOCh).
 """
 
-VISION_PROMPT = SYSTEM_PROMPT + """
-ИНСТРУКЦИЯ ПО АНАЛИЗУ СКРИНШОТОВ ГРАФИКА:
-- Внимательно изучи прикрепленный скриншот с TradingView.
-- Определи актив, таймфрейм и направление сетапа (Short / Long).
-- Оцени локацию точки входа (Entry), уровня Stop Loss и Take Profit.
-- Проверь валидность сетапа по концепциям ICT/SMC/MSNR:
-  1. Был ли сдвиг структуры (MSS / BOS)?
-  2. Захвачена ли ликвидность перед входом (Liquidity Sweep)?
-  3. Находится ли вход в зоне FVG, Order Block или Premium/Discount?
-  4. Безопасен ли Стоп-лосс (стоит ли за валидным фракталом/блоком)?
-  5. Логичен ли Тейк-профит (направлен ли на снятие пула ликвидности)?
-- Дай четкое заключение: Качество сетапа (High Probability / Low Probability), его плюсы и минусы, и что стоит подправить.
-"""
-
 # ==========================================
-# 4. ЗАПРОСЫ К GROQ API (ТЕКСТ И VISION)
+# 4. ЗАПРОСЫ К GROQ API (ТЕКСТ)
 # ==========================================
-
-async def get_groq_vision_response(user_message: str, image_bytes: bytes, mime_type: str) -> str:
-    """Анализ скриншотов через модель Groq Vision (meta-llama/llama-3.2-11b-vision-instruct)"""
-    if not groq_client:
-        return "⚠️ Ошибка: Переменная `GROQ_API_KEY` не настроена на сервисе Render!"
-
-    market_context = await asyncio.to_thread(fetch_live_market_context, user_message)
-    prompt_text = user_message if user_message else "Проанализируй этот сетап по концепциям SMC, ICT и Alchemist MSNR."
-    
-    if market_context:
-        prompt_text = f"{market_context}\n\nЗапрос пользователя по графику: {prompt_text}"
-
-    # Кодирование картинки в base64
-    base64_image = base64.b64encode(image_bytes).decode('utf-8')
-    data_url = f"data:{mime_type};base64,{base64_image}"
-
-    try:
-        completion = await groq_client.chat.completions.create(
-            model="meta-llama/llama-3.2-11b-vision-instruct",
-            messages=[
-                {"role": "system", "content": VISION_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt_text},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": data_url}
-                        }
-                    ]
-                }
-            ],
-            temperature=0.2,
-            max_tokens=1200
-        )
-        return completion.choices[0].message.content
-    except Exception as e:
-        error_str = str(e)
-        if "429" in error_str:
-            return "⏳ Превышен временный лимит запросов Groq API. Пожалуйста, подождите 30-60 секунд."
-        print(f"[GROQ VISION ERROR] Ошибка обработки изображения: {e}")
-        return f"⚠️ Ошибка при анализе графика через Groq Vision: {e}"
 
 async def get_groq_ai_response(user_message: str) -> str:
     """Текстовые ответы через Llama 3.3 70B Versatile"""
@@ -225,7 +168,7 @@ async def get_groq_ai_response(user_message: str) -> str:
 @bot.event
 async def on_ready():
     print(f"✅ Бот {bot.user.name} успешно подключился к Discord!")
-    print(f"👁️ Анализ графиков переведен на Groq Vision (meta-llama/llama-3.2-11b-vision-instruct)")
+    print("💬 Текстовый режим анализа и онлайн-данные yfinance готовы к работе.")
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -236,27 +179,10 @@ async def on_message(message: discord.Message):
         async with message.channel.typing():
             clean_content = message.content.replace(f"<@{bot.user.id}>", "").strip()
 
-            image_attachment = None
-            if message.attachments:
-                for att in message.attachments:
-                    if att.content_type and att.content_type.startswith("image/"):
-                        image_attachment = att
-                        break
+            if not clean_content:
+                clean_content = "Привет! Задай вопрос по концепциям SMC/ICT/MSNR или спроси актуальные уровни/котировки по активу."
 
-            # Если прикреплена картинка -> вызываем Groq Vision
-            if image_attachment:
-                try:
-                    img_bytes = await image_attachment.read()
-                    mime_type = image_attachment.content_type or "image/png"
-                    ai_reply = await get_groq_vision_response(clean_content, img_bytes, mime_type)
-                except Exception as e:
-                    ai_reply = f"⚠️ Не удалось прочитать скриншот: {e}"
-            
-            # Если только текст -> вызываем Groq Llama 3.3
-            else:
-                if not clean_content:
-                    clean_content = "Привет! Пришли скриншот графика или задай вопрос по концепциям SMC/ICT/MSNR."
-                ai_reply = await get_groq_ai_response(clean_content)
+            ai_reply = await get_groq_ai_response(clean_content)
             
             # Разбивка длинных сообщений для Discord (лимит 2000 символов)
             if len(ai_reply) > 2000:
