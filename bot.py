@@ -89,7 +89,7 @@ if GEMINI_API_KEY:
 
 def ask_free_ai(prompt, context_history=None):
     if not gemini_client:
-        print("Ошибка ИИ: не задан GEMINI_API_KEY в переменных окружения.")
+        print("Ошибка ИИ: не задан GEMINI_API_KEY в переменных окружения.", flush=True)
         return "Секунду, настраиваю графики... (ИИ временно не настроен)"
 
     try:
@@ -109,13 +109,13 @@ def ask_free_ai(prompt, context_history=None):
     except Exception as e:
         # Полный текст ошибки печатается в логи Render — по нему сразу видно,
         # что не так: неверный ключ, лимит запросов, недоступная модель и т.д.
-        print(f"Ошибка ИИ (Gemini): {e}")
+        print(f"Ошибка ИИ (Gemini): {e}", flush=True)
         return "Секунду, графики подвисли — попробуй написать ещё раз через пару секунд. 📈"
 
 
 @bot.event
 async def on_ready():
-    print(f"Бот {bot.user.name} успешно подключился к серверам Discord!")
+    print(f"Бот {bot.user.name} успешно подключился к серверам Discord!", flush=True)
     if not main_checking_loop.is_running():
         main_checking_loop.start()
 
@@ -128,6 +128,7 @@ async def on_message(message):
     # В любой другой ветке — полностью игнорируем упоминания/ответы боту.
     if message.channel.id == AI_CHAT_CHANNEL_ID:
         if bot.user.mentioned_in(message) or (message.reference and message.reference.cached_message and message.reference.cached_message.author == bot.user):
+            print(f"[AI] Получено сообщение от {message.author}: {message.content!r}", flush=True)
             async with message.channel.typing():
                 user_text = message.content.replace(f'<@{bot.user.id}>', '').strip()
                 if not user_text and message.reference:
@@ -216,7 +217,7 @@ async def main_checking_loop():
                 await news_channel.send(embed=embed)
             last_daily_report_date = current_date_str
         except Exception as e:
-            print(f"Произошла ошибка в МОДУЛЕ 1 (календарь): {e}")
+            print(f"Произошла ошибка в МОДУЛЕ 1 (календарь): {e}", flush=True)
 
     if news_channel:
         try:
@@ -256,7 +257,7 @@ async def main_checking_loop():
                     notified_news.add(event_id)
 
         except Exception as news_err:
-            print(f"Ошибка при парсинге новостей ForexFactory: {news_err}")
+            print(f"Ошибка при парсинге новостей ForexFactory: {news_err}", flush=True)
 
 # =========================================================================
 # ЗАПУСК БОТА
