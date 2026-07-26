@@ -169,10 +169,10 @@ async def get_openrouter_vision_response(user_message: str, image_bytes: bytes) 
         "Content-Type": "application/json"
     }
 
-    # Актуальные рабочие бесплатные мультимодальные модели
+    # Проверенные и актуальные бесплатные модели OpenRouter для графика
     vision_models = [
-        "google/gemini-2.0-flash-lite-preview-02-05:free",
-        "qwen/qwen-2.5-vl-72b-instruct:free"
+        "google/gemini-2.0-flash-exp:free",
+        "meta-llama/llama-3.2-90b-vision-instruct:free"
     ]
 
     for model_name in vision_models:
