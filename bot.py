@@ -146,46 +146,59 @@ VISION_PROMPT = SYSTEM_PROMPT + """
 """
 
 # ==========================================
-# 4. ЗАПРОСЫ К GROQ API (ТЕКСТ И КАРТИНКИ)
+# 4. ЗАПРОСЫ К GROQ API С АВТОПЕРЕКЛЮЧЕНИЕМ
 # ==========================================
 
 async def get_groq_vision_response(user_message: str, image_bytes: bytes) -> str:
-    """Анализ скриншотов с использованием актуальной модели Llama 3.2 Vision"""
+    """Анализ скриншотов с перебором доступных Vision моделей"""
     if not groq_client:
         return "⚠️ Ошибка: Переменная `GROQ_API_KEY` не настроена на сервисе Render."
 
-    try:
-        base64_image = base64.b64encode(image_bytes).decode('utf-8')
-        
-        market_context = await asyncio.to_thread(fetch_live_market_context, user_message)
-        prompt_text = user_message if user_message else "Проанализируй этот сетап и позиции (Entry/Stop/Take) по концепциям SMC, ICT и Alchemist MSNR."
-        if market_context:
-            prompt_text = f"{market_context}\n\nЗапрос пользователя по графику: {prompt_text}"
+    base64_image = base64.b64encode(image_bytes).decode('utf-8')
+    market_context = await asyncio.to_thread(fetch_live_market_context, user_message)
+    
+    prompt_text = user_message if user_message else "Проанализируй этот сетап и позиции (Entry/Stop/Take) по концепциям SMC, ICT и Alchemist MSNR."
+    if market_context:
+        prompt_text = f"{market_context}\n\nЗапрос пользователя по графику: {prompt_text}"
 
-        completion = await groq_client.chat.completions.create(
-            model="llama-3.2-11b-vision-instruct",  # Актуальное имя модели Vision в Groq
-            messages=[
-                {"role": "system", "content": VISION_PROMPT},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt_text},
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
+    # Список актуальных мультимодальных моделей Groq
+    vision_models = [
+        "llama-3.2-11b-vision-preview",
+        "llama-3.2-90b-vision-preview",
+        "llava-v1.5-7b-4096-preview"
+    ]
+
+    last_error = None
+
+    for model_name in vision_models:
+        try:
+            print(f"[VISION] Пробуем запустить модель: {model_name}")
+            completion = await groq_client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": VISION_PROMPT},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt_text},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/jpeg;base64,{base64_image}"
+                                }
                             }
-                        }
-                    ]
-                }
-            ],
-            temperature=0.3,
-            max_tokens=1200,
-        )
-        return completion.choices[0].message.content
-    except Exception as e:
-        print(f"[ERROR] Vision API Error: {e}")
-        return f"⚠️ Ошибка при анализе изображения: {e}"
+                        ]
+                    }
+                ],
+                temperature=0.3,
+                max_tokens=1200,
+            )
+            return completion.choices[0].message.content
+        except Exception as e:
+            print(f"[VISION WARNING] Ошибка модели {model_name}: {e}")
+            last_error = e
+
+    return f"⚠️ Ошибка при анализе изображения (все модели недоступны): {last_error}"
 
 async def get_groq_ai_response(user_message: str) -> str:
     if not groq_client:
@@ -219,7 +232,7 @@ async def get_groq_ai_response(user_message: str) -> str:
 @bot.event
 async def on_ready():
     print(f"✅ Бот {bot.user.name} успешно подключился!")
-    print(f"👁️ Активирован модуль распознавания скриншотов (Llama 3.2 Vision Instruct)")
+    print(f"👁️ Активирован мультимодальный модуль с автоматическим переключением моделей Vision")
 
 @bot.event
 async def on_message(message: discord.Message):
