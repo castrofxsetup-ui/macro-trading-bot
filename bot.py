@@ -15,6 +15,10 @@ import yfinance as yf
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
+# ИИ отвечает ТОЛЬКО в этом канале — в любых других каналах и в личных
+# сообщениях бот полностью игнорирует упоминания/ответы.
+AI_CHAT_CHANNEL_ID = 1502292137889501235
+
 if not DISCORD_TOKEN:
     print("⚠️ WARNING: DISCORD_TOKEN не найден в переменных окружения Render!")
 if not GROQ_API_KEY:
@@ -33,6 +37,15 @@ app = FastAPI()
 @app.api_route("/", methods=["GET", "HEAD"])
 def read_root():
     return {"status": "ok", "bot": "Macro Bot powered fully by Groq API"}
+
+# ==========================================
+# 1.1 ПАМЯТЬ ДИАЛОГОВ — ОТДЕЛЬНО НА КАЖДОГО ЮЗЕРА
+# ==========================================
+# Ключ — user_id (а не channel_id!): один пользователь = один непрерывный диалог,
+# независимо от того, что пишут другие люди в том же канале.
+# Формат: {user_id: [{"role": "user"/"assistant", "content": "..."}]}
+user_ai_context = {}
+MAX_HISTORY_MESSAGES = 10  # сколько последних сообщений (юзер+бот) хранить на юзера
 
 # ==========================================
 # 2. МАРШРУТИЗАЦИЯ И ТИКЕРЫ (yfinance)
@@ -68,7 +81,7 @@ def extract_tickers_from_query(text: str):
     clean_text = re.sub(r'[^\w\s/]', '', text.upper())
     words = clean_text.split()
     detected_tickers = {}
-    
+
     for word in words:
         if word in TICKER_DICTIONARY:
             detected_tickers[TICKER_DICTIONARY[word]] = word
@@ -129,37 +142,51 @@ SYSTEM_PROMPT = """
 1. Основа твоего анализа — концепции Smart Money Concepts (SMC), Inner Circle Trader (ICT) и методология Alchemist MSNR.
 2. Категорически ИЗБЕГАЙ и НЕ ИСПОЛЬЗУЙ классический технический анализ (никаких индикаторов RSI, MACD, скользящих средних, линий тренда, фигур вроде "голова и плечи").
 3. Ты объясняешь движения рынка исключительно через механику ликвидности (Liquidity Sweep, Buy-side / Sell-side Liquidity, PDH/PDL), работу алгоритма доставки цены (IPDA), дисбалансы (FVG / Fair Value Gap), имбалансы, блоки заказов (Order Block, Breaker Block) и структуры MSNR (Market Structure, Market Structure Shift / MSS, Change of Character / CHOCh).
+4. Ты помнишь контекст текущего диалога с этим конкретным пользователем и отвечаешь с учётом того, что обсуждали раньше — не начинай каждый раз "с нуля".
 """
 
 # ==========================================
-# 4. ЗАПРОСЫ К GROQ API (ТЕКСТ)
+# 4. ЗАПРОСЫ К GROQ API (ТЕКСТ, С ПАМЯТЬЮ ПО ЮЗЕРУ)
 # ==========================================
 
-async def get_groq_ai_response(user_message: str) -> str:
-    """Текстовые ответы через Llama 3.3 70B Versatile"""
+async def get_groq_ai_response(user_id: int, user_message: str) -> str:
+    """Текстовые ответы через Llama 3.3 70B Versatile, с историей диалога конкретного пользователя."""
     if not groq_client:
         return "⚠️ Ошибка: Переменная `GROQ_API_KEY` не настроена на сервисе Render."
 
     market_context = await asyncio.to_thread(fetch_live_market_context, user_message)
     full_prompt = f"{market_context}\n\nЗапрос пользователя: {user_message}" if market_context else user_message
 
+    history = user_ai_context.get(user_id, [])
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": full_prompt})
+
     try:
         completion = await groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": full_prompt}
-            ],
+            messages=messages,
             temperature=0.3,
             max_tokens=1024,
         )
-        return completion.choices[0].message.content
+        reply = completion.choices[0].message.content
+
+        # Сохраняем в историю именно исходное сообщение юзера (без подмешанных котировок),
+        # чтобы история не раздувалась служебными данными от yfinance.
+        history.append({"role": "user", "content": user_message})
+        history.append({"role": "assistant", "content": reply})
+        if len(history) > MAX_HISTORY_MESSAGES:
+            history = history[-MAX_HISTORY_MESSAGES:]
+        user_ai_context[user_id] = history
+
+        return reply
     except Exception as e:
         error_str = str(e)
         if "429" in error_str:
             return "⏳ Достигнут временный лимит запросов Groq API. Пожалуйста, подождите минуту."
         print(f"[ERROR] Ошибка Groq API: {e}")
-        return f"⚠️ Ошибка при запросе к ИИ: {e}"
+        return "⚠️ Секунду, что-то с ИИ пошло не так — попробуй написать ещё раз через пару секунд."
 
 # ==========================================
 # 5. СОБЫТИЯ И КОМАНДЫ DISCORD БОТА
@@ -168,26 +195,39 @@ async def get_groq_ai_response(user_message: str) -> str:
 @bot.event
 async def on_ready():
     print(f"✅ Бот {bot.user.name} успешно подключился к Discord!")
-    print("💬 Текстовый режим анализа и онлайн-данные yfinance готовы к работе.")
+    print(f"💬 ИИ отвечает только в канале ID {AI_CHAT_CHANNEL_ID}. Память диалогов — по каждому юзеру отдельно.")
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author == bot.user:
+    if message.author == bot.user or message.author.bot:
         return
 
-    if bot.user in message.mentions or isinstance(message.channel, discord.DMChannel):
+    # Работаем только в одном заданном канале — никаких личных сообщений
+    # и никаких других каналов сервера.
+    if message.channel.id != AI_CHAT_CHANNEL_ID:
+        await bot.process_commands(message)
+        return
+
+    is_mention = bot.user in message.mentions
+    is_reply_to_bot = bool(
+        message.reference
+        and message.reference.cached_message
+        and message.reference.cached_message.author == bot.user
+    )
+
+    if is_mention or is_reply_to_bot:
         async with message.channel.typing():
             clean_content = message.content.replace(f"<@{bot.user.id}>", "").strip()
 
             if not clean_content:
                 clean_content = "Привет! Задай вопрос по концепциям SMC/ICT/MSNR или спроси актуальные уровни/котировки по активу."
 
-            ai_reply = await get_groq_ai_response(clean_content)
-            
+            ai_reply = await get_groq_ai_response(message.author.id, clean_content)
+
             # Разбивка длинных сообщений для Discord (лимит 2000 символов)
             if len(ai_reply) > 2000:
                 for i in range(0, len(ai_reply), 1900):
-                    await message.reply(ai_reply[i:i+1900])
+                    await message.reply(ai_reply[i:i + 1900])
             else:
                 await message.reply(ai_reply)
 
@@ -207,7 +247,7 @@ async def main():
     if not DISCORD_TOKEN:
         print("CRITICAL ERROR: DISCORD_TOKEN не задан.")
         return
-    
+
     await asyncio.gather(
         run_fastapi(),
         bot.start(DISCORD_TOKEN)
