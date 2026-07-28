@@ -99,7 +99,6 @@ async def generate_daily_news_embed() -> discord.Embed:
                 events_list.append(f"{flag} **{country}** | 🕘 `{time_msk} МСК` — **{title}** ({badge})")
 
     if events_list:
-        # Разбиваем на несколько полей, если событий слишком много
         chunk_size = 10
         for i in range(0, len(events_list), chunk_size):
             chunk = events_list[i:i + chunk_size]
@@ -118,45 +117,41 @@ async def generate_weekly_news_embed() -> discord.Embed:
     now_msk = datetime.now(MSK_TZ)
 
     monday = now_msk - timedelta(days=now_msk.weekday())
-    friday = monday + timedelta(days=4)
+    sunday = monday + timedelta(days=6)
     month_name_ru = MONTHS_RU[monday.month - 1]
 
     embed = discord.Embed(
         title="🗓️ Экономический календарь на неделю",
-        description=f"*📅 {month_name_ru}, {monday.strftime('%d.%m')} — {friday.strftime('%d.%m')}*\n",
+        description=f"*📅 {month_name_ru}, {monday.strftime('%d.%m')} — {sunday.strftime('%d.%m')}*\n",
         color=discord.Color.gold()
     )
 
-    # Группируем события по дням недели (ПН..ПТ)
-    grouped_events = {i: [] for i in range(5)}
+    grouped_events = {i: [] for i in range(7)}
 
     for item in data:
-        utc_date = item.get("date", "")
-        dt_msk, time_msk = convert_to_msk(utc_date)
+        impact = item.get("impact", "")
+        if impact in ["High", "Medium"]:
+            utc_date = item.get("date", "")
+            dt_msk, time_msk = convert_to_msk(utc_date)
 
-        if monday.date() <= dt_msk.date() <= friday.date():
-            impact = item.get("impact", "")
-            if impact in ["High", "Medium"]:
-                day_idx = dt_msk.weekday()
-                if day_idx in grouped_events:
-                    country = item.get("country", "USD").upper()
-                    title = item.get("title", "Event")
-                    flag = COUNTRY_FLAGS.get(country, "🌐")
-                    badge = "🔴 HIGH" if impact == "High" else "🟠 MEDIUM"
+            day_idx = dt_msk.weekday()
+            country = item.get("country", "USD").upper()
+            title = item.get("title", "Event")
+            flag = COUNTRY_FLAGS.get(country, "🌐")
+            badge = "🔴 HIGH" if impact == "High" else "🟠 MEDIUM"
 
-                    grouped_events[day_idx].append(
-                        f"{flag} **{country}** | 🕘 `{time_msk}` — {title} ({badge})"
-                    )
+            grouped_events[day_idx].append(
+                f"{flag} **{country}** | 🕘 `{time_msk}` — {title} ({badge})"
+            )
 
     has_events = False
-    for day_idx in range(5):
+    for day_idx in range(7):
         events = grouped_events[day_idx]
         if events:
             has_events = True
             current_day_date = monday + timedelta(days=day_idx)
             day_title = f"📅 {DAYS_RU[day_idx].capitalize()} ({current_day_date.strftime('%d.%m')})"
             
-            # Помещаем не более 10 событий на день внутри поля
             embed.add_field(
                 name=day_title,
                 value="\n".join(events[:10]),
@@ -260,6 +255,29 @@ async def test_30min(ctx):
         now_msk = datetime.now(MSK_TZ)
         time_str = now_msk.strftime("%H:%M")
         embed = generate_30min_warning_embed("USD", "Базовый индекс потребительских цен (ИПЦ)", time_str)
+        await channel.send(content="@everyone", embed=embed)
+        await ctx.message.add_reaction("✅")
+
+@bot.command(name="breaking_news")
+@commands.has_permissions(administrator=True)
+async def breaking_news(ctx, country: str, *, title: str):
+    channel = bot.get_channel(NEWS_CHANNEL_ID)
+    if channel:
+        now_msk = datetime.now(MSK_TZ)
+        time_str = now_msk.strftime("%H:%M")
+        flag = COUNTRY_FLAGS.get(country.upper(), "🌐")
+
+        embed = discord.Embed(
+            title="⚠️ Внимание! Внеплановый анонс!",
+            description=f"🕘 **{now_msk.strftime('%A')} {time_str} МСК**",
+            color=discord.Color.red()
+        )
+        embed.add_field(
+            name=f"{flag} **{country.upper()}** — {title}",
+            value="🔴 **HIGH**",
+            inline=False
+        )
+        embed.set_footer(text="⚠️ Будьте аккуратны!")
         await channel.send(content="@everyone", embed=embed)
         await ctx.message.add_reaction("✅")
 
