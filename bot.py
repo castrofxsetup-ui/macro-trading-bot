@@ -10,7 +10,6 @@ import uvicorn
 from groq import AsyncGroq
 import yfinance as yf
 import httpx
-from bs4 import BeautifulSoup
 
 # ==========================================
 # 1. ИНИЦИАЛИЗАЦИЯ И НАСТРОЙКИ
@@ -50,7 +49,7 @@ def read_root():
 user_ai_context = {}
 MAX_HISTORY_MESSAGES = 10
 
-# Хранилище запланированных стримов: список словарей [{"title": ..., "time": datetime, "notified": bool}]
+# Хранилище запланированных стримов
 upcoming_streams = []
 
 # База заданий дня по SMC / ICT / MSNR
@@ -145,51 +144,53 @@ def fetch_live_market_context(user_query: str) -> str:
     return "\n".join(context_lines)
 
 # ==========================================
-# 3. МОДУЛЬ ПАРСИНГА NЕWS (FOREXFACTORY)
+# 3. МОДУЛЬ ПАРСИНГА NEWS (API БЕЗ БЛОКИРОВОК)
 # ==========================================
 
 async def fetch_forexfactory_news() -> str:
-    """Получает ключевые новости с высоким импактом (High Impact) с ForexFactory"""
-    url = "https://www.forexfactory.com/calendar"
+    """Загружает новости высокого импакта через стабильный JSON API без Cloudflare блокировок"""
+    url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json"
     }
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
             response = await client.get(url, headers=headers, timeout=10.0)
-            if response.status_code != 200:
-                return "⚠️ Не удалось подключиться к ForexFactory."
-
-            soup = BeautifulSoup(response.text, "html.parser")
-            rows = soup.find_all("tr", class_="calendar__row")
             
+            if response.status_code != 200:
+                return f"⚠️ Не удалось загрузить календарь новостей (код {response.status_code})."
+
+            data = response.json()
             news_events = []
-            for row in rows:
-                impact_td = row.find("td", class_="calendar__impact")
-                if not impact_td:
-                    continue
+            
+            # Получаем текущую дату в UTC
+            today_str = datetime.now(pytz.utc).strftime("%Y-%m-%d")
+
+            for item in data:
+                # Фильтруем по дате (сегодня) и импакту (High)
+                event_date = item.get("date", "")[:10]
+                impact = item.get("impact", "")
                 
-                # Фильтруем события по красному флажку (High Impact)
-                impact_span = impact_td.find("span", class_="red") or impact_td.find("span", class_="icon--ff-impact-red")
-                if impact_span:
-                    time_td = row.find("td", class_="calendar__time")
-                    currency_td = row.find("td", class_="calendar__currency")
-                    event_td = row.find("td", class_="calendar__event")
-
-                    time_str = time_td.text.strip() if time_td else "All Day"
-                    currency_str = currency_td.text.strip() if currency_td else "USD"
-                    event_str = event_td.text.strip() if event_td else "High Impact Event"
-
-                    news_events.append(f"🔴 **[{time_str}] {currency_str}**: {event_str}")
+                if event_date == today_str and impact == "High":
+                    # Форматируем время HH:MM
+                    time_raw = item.get("date", "")
+                    time_str = time_raw[11:16] if len(time_raw) >= 16 else "All Day"
+                    
+                    country = item.get("country", "USD")
+                    title = item.get("title", "High Impact Event")
+                    
+                    news_events.append(f"🔴 **[{time_str} UTC] {country}**: {title}")
 
             if not news_events:
-                return "📅 На сегодня не запланировано важных новостей (High Impact)."
+                return "📅 На сегодня не запланировано важных экономических новостей (High Impact)."
 
             return "📊 **ВАЖНЫЕ ЭКОНОМИЧЕСКИЕ НОВОСТИ НА СЕГОДНЯ (HIGH IMPACT):**\n\n" + "\n".join(news_events)
+
     except Exception as e:
         print(f"[News Error] {e}")
-        return "⚠️ Ошибка при получении данных с календаря ForexFactory."
+        return "⚠️ Ошибка при получении данных с экономического календаря."
 
 # ==========================================
 # 4. СИСТЕМНЫЙ ПРОМПТ И ИИ-ЧАТ
@@ -256,7 +257,6 @@ async def check_stream_schedule():
 
     for stream in upcoming_streams:
         if not stream["notified"]:
-            # Проверяем, осталось ли до стрима 30 минут или меньше
             time_diff = (stream["time"] - now).total_seconds()
             if 0 <= time_diff <= 1800:
                 await channel.send(
@@ -286,7 +286,6 @@ async def on_ready():
     print(f"📺 Streams Channel/Thread: {STREAMS_CHANNEL_ID}")
     print(f"📰 News Channel/Thread: {NEWS_CHANNEL_ID}")
     
-    # Запуск фоновых задач
     if not check_stream_schedule.is_running():
         check_stream_schedule.start()
     if not auto_daily_news.is_running():
@@ -305,7 +304,7 @@ async def add_daily_task(ctx, *, new_task: str):
     daily_tasks_db.append(f"📌 **Задание дня:** {new_task}")
     await ctx.send("✅ Новое задание успешно добавлено в базу!")
 
-# --- КОМАНДА: НОВОСТИ (РУЧНОЙ ВЫЗОВ В ВЕТКУ НОВОСТЕЙ) ---
+# --- КОМАНДА: НОВОСТИ (РУЧНОЙ ВЫЗОВ) ---
 @bot.command(name="news")
 async def get_news_cmd(ctx):
     async with ctx.typing():
@@ -317,10 +316,6 @@ async def get_news_cmd(ctx):
 @bot.command(name="add_stream")
 @commands.has_permissions(administrator=True)
 async def add_stream_cmd(ctx, time_str: str, *, title: str):
-    """
-    Добавить стрим. Формат времени: YYYY-MM-DD_HH:MM (в UTC)
-    Пример: !add_stream 2026-07-28_19:00 Разбор дневной сессии
-    """
     try:
         dt = datetime.strptime(time_str, "%Y-%m-%d_%H:%M").replace(tzinfo=pytz.utc)
         upcoming_streams.append({"title": title, "time": dt, "notified": False})
@@ -357,8 +352,10 @@ async def on_message(message: discord.Message):
     if message.author == bot.user or message.author.bot:
         return
 
-    # Обработка команд бота (!task, !news, !add_stream и т.д.)
-    await bot.process_commands(message)
+    # Если текстовое сообщение начинается с префикса '!', это команда — обрабатываем и выходим
+    if message.content.startswith("!"):
+        await bot.process_commands(message)
+        return
 
     # ИИ отвечает ТОЛЬКО в заданном канале ИИ-чата
     if message.channel.id != AI_CHAT_CHANNEL_ID:
