@@ -335,7 +335,7 @@ async def schedule_checker():
                 embed = build_30m_news_embed(ev)
                 await news_channel.send(content="@everyone", embed=embed)
 
-    # 4. За 30 минут до мероприятий Discord -> С @everyone
+    # 4. За 30 минут до мероприятий Discord -> С @everyone и прямой ссылкой
     for guild in bot.guilds:
         try:
             scheduled_events = await guild.fetch_scheduled_events()
@@ -354,7 +354,11 @@ async def schedule_checker():
                                 description=ev.description,
                                 location=loc_name
                             )
-                            await events_channel.send(content="@everyone", embed=embed)
+                            # Динамическая ссылка на мероприятие Discord
+                            event_url = f"https://discord.com/events/{guild.id}/{ev.id}"
+                            content_text = f"@everyone\n\nСсылка на брифинг 👇\n{event_url}"
+                            
+                            await events_channel.send(content=content_text, embed=embed)
         except Exception as e:
             logger.error(f"Ошибка проверки мероприятий сервера: {e}")
 
@@ -395,7 +399,7 @@ async def test_daily(ctx):
 @bot.command(name="test_event30m")
 async def test_event30m(ctx, event_name: str = "Morning Briefing by Castro", *, description: str = None):
     """
-    Тест анонса мероприятия за 30 минут
+    Тест анонса мероприятия за 30 минут со ссылкой.
     Пример: !test_event30m "Morning Briefing by Castro" Разбор лондонской сессии
     """
     target_channel = await get_channel_by_id(EVENTS_CHANNEL_ID)
@@ -409,7 +413,11 @@ async def test_event30m(ctx, event_name: str = "Morning Briefing by Castro", *, 
         location="OPEN HALL!"
     )
 
-    await target_channel.send(content="@everyone", embed=embed)
+    # Тестовая ссылка на ивент
+    fake_event_url = f"https://discord.com/events/{ctx.guild.id}/123456789012345678"
+    content_text = f"@everyone\n\nСсылка на брифинг 👇\n{fake_event_url}"
+
+    await target_channel.send(content=content_text, embed=embed)
 
 # ==========================================
 # ТОЧКА ВХОДА
