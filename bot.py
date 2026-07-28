@@ -12,7 +12,7 @@ logger = logging.getLogger("LegacyBot")
 
 TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_DISCORD_BOT_TOKEN")
 
-# ID веток Discord
+# ID каналов Discord
 NEWS_CHANNEL_ID = 1528319066513604688      # Ветка для экономических новостей
 EVENTS_CHANNEL_ID = 1528506824687485118    # Ветка для мероприятий / стримов
 
@@ -28,6 +28,9 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 sent_30m_alerts = set()
 sent_30m_events = set()
+
+# Надежный источник календаря ForexFactory (через зеркало FairEconomy)
+NEWS_API_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
 # Валюты и связанные активы (каждый актив обернут в **жирный** шрифт)
 CURRENCY_MAP = {
@@ -110,33 +113,27 @@ def parse_event_date(event: dict) -> datetime | None:
     return None
 
 async def fetch_economic_news() -> list:
-    urls = [
-        "https://nss.forexfactory.com/calendar/monthly.json",
-        "https://forexfactory.com/calendar/monthly.json",
-        "https://raw.githubusercontent.com/man-c/forex_factory_calendar/main/calendar.json"
-    ]
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
     async with aiohttp.ClientSession() as session:
-        for url in urls:
-            try:
-                async with session.get(url, headers=headers, timeout=10) as response:
-                    if response.status == 200:
-                        data = await response.json(content_type=None)
-                        if isinstance(data, list):
-                            return data
-            except Exception as e:
-                logger.warning(f"[NEWS API] Ошибка получения новостей с {url}: {e}")
-                continue
-    logger.error("[NEWS API] Все источники новостей недоступны")
+        try:
+            async with session.get(NEWS_API_URL, headers=headers, timeout=10) as response:
+                if response.status == 200:
+                    data = await response.json(content_type=None)
+                    if isinstance(data, list):
+                        logger.info(f"[NEWS API] Успешно получено {len(data)} событий.")
+                        return data
+        except Exception as e:
+            logger.error(f"[NEWS API] Ошибка получения новостей: {e}")
     return []
 
 def process_and_filter_news(raw_events: list, start_dt: datetime, end_dt: datetime) -> list:
     filtered_events = []
     for event in raw_events:
         impact = event.get("impact") or event.get("importance") or ""
-        currency = (event.get("currency") or event.get("country") or "GLOBAL").strip().upper()
+        # FairEconomy использует поле 'country' для обозначения валюты/страны
+        currency = (event.get("country") or event.get("currency") or "GLOBAL").strip().upper()
         title = event.get("title") or event.get("name") or "Экономическое событие"
 
         if is_high_impact(impact):
@@ -202,6 +199,7 @@ def build_weekly_embed(events: list) -> discord.Embed:
             current_day = day_key
 
         time_str = ev_msk.strftime("%H:%M")
+        # Актив выделен жирным шрифтом: **USD**
         block_text = (
             f"{ev['flag']} **{ev['currency']}** | 🕘 **{time_str} МСК** — {ev['title']} ({ev['impact']})\n"
             f"└ 🎯 Активы: {ev['assets']}\n"
@@ -239,6 +237,7 @@ def build_daily_embed(events: list) -> discord.Embed:
     for ev in events:
         ev_msk = ev["date"].astimezone(MSK_TZ)
         time_str = ev_msk.strftime("%H:%M")
+        # Валюта/актив выделена жирным шрифтом: **EUR**
         field_name = f"{ev['flag']} **{ev['currency']}** | 🕘 {time_str} МСК — {ev['title']}"
         field_value = (
             f"🎯 Активы: {ev['assets']}\n"
@@ -275,7 +274,7 @@ def build_event_30m_embed(event_name: str, event_time_msk: datetime, description
     date_str = event_time_msk.strftime("%d.%m")
     time_str = event_time_msk.strftime("%H:%M")
 
-    # Жирным выделяется только название самого мероприятия: **EVENT_NAME**
+    # НАЗВАНИЕ МЕРОПРИЯТИЯ — ЖИРНЫМ ШРИФТОМ, ВСЁ ОСТАЛЬНОЕ — ОБЫЧНЫМ
     embed = discord.Embed(
         title=f"🎙️ Напоминание о **{event_name.upper()}** | До старта 30 минут!",
         color=discord.Color.gold(),
