@@ -62,8 +62,8 @@ async def handle_ping(request):
 
 async def start_web_server():
     app = web.Application()
+    # add_get в актуальных версиях aiohttp автоматически обрабатывает и HEAD запросы
     app.router.add_get("/", handle_ping)
-    app.router.add_head("/", handle_ping)
     
     runner = web.AppRunner(app)
     await runner.setup()
@@ -88,7 +88,6 @@ def parse_ff_xml_feed(xml_content: str) -> list:
             forecast = item.findtext("forecast", "")
             previous = item.findtext("previous", "")
 
-            # Нормализация уровня важности
             impact_level = "LOW"
             if impact in ["High", "High Impact Expected", "Red"]:
                 impact_level = "HIGH"
@@ -108,7 +107,7 @@ def parse_ff_xml_feed(xml_content: str) -> list:
     return events
 
 async def fetch_economic_news(force_refresh: bool = False) -> list:
-    """Умное получение новостей с обходом Cloudflare через curl_cffi"""
+    """Получение новостей с обходом Cloudflare через curl_cffi"""
     now = time.time()
     
     if not force_refresh and NEWS_CACHE["data"] and (now - NEWS_CACHE["last_fetch"] < CACHE_TTL_SECONDS):
@@ -116,11 +115,8 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
         return NEWS_CACHE["data"]
 
     sources = [
-        # 1. FairEconomy JSON через Chrome Impersonate
         {"url": "https://nfs.faireconomy.media/ff_calendar_thisweek.json", "type": "json_impersonate"},
-        # 2. ForexFactory XML через Chrome Impersonate
         {"url": "https://www.forexfactory.com/ffcalendar.xml", "type": "xml_impersonate"},
-        # 3. Резервный источник JSON
         {"url": "https://raw.githubusercontent.com/martinventer/forexfactory-calendar/main/calendar.json", "type": "json_direct"}
     ]
 
@@ -129,7 +125,6 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
         stype = src["type"]
         try:
             if "impersonate" in stype:
-                # Внедряем TLS/JA3 отпечаток браузера Chrome 120
                 r = await asyncio.to_thread(
                     async_requests.get, 
                     url, 
@@ -141,7 +136,6 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
                     if "json" in stype:
                         data = r.json()
                         if isinstance(data, list) and len(data) > 0:
-                            # Нормализация названий полей при необходимости
                             parsed = []
                             for item in data:
                                 parsed.append({
@@ -229,12 +223,8 @@ async def cmd_news(ctx):
         news = await fetch_economic_news()
         
         high_impact = [n for n in news if "HIGH" in str(n.get("impact", "")).upper() or "RED" in str(n.get("impact", "")).upper()]
-        
-        logger.info(f"[DEBUG] Всего получено сырых событий: {len(news)}")
-        logger.info(f"[DEBUG] Отфильтровано важных (🔴 HIGH) событий: {len(high_impact)}")
 
         if not high_impact and news:
-            # Если нет событий категории High, покажем первые 5 из имеющихся
             high_impact = news[:5]
 
         if not high_impact:
@@ -273,7 +263,6 @@ async def cmd_ai(ctx, *, query: str):
         )
         response = await ask_groq(query, system_prompt=system_instructions)
         
-        # Разбиваем длинный ответ, если он превышает лимит Discord (2000 символов)
         if len(response) > 1900:
             for chunk in [response[i:i+1900] for i in range(0, len(response), 1900)]:
                 await ctx.send(chunk)
@@ -284,7 +273,6 @@ async def cmd_ai(ctx, *, query: str):
 # MAIN EXECUTION
 # ---------------------------------------------------------------------------
 async def main():
-    # Запускаем веб-сервер и бота одновременно
     await start_web_server()
     await bot.start(DISCORD_TOKEN)
 
