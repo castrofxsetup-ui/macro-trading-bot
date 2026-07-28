@@ -1,536 +1,295 @@
+import os
+import sys
 import asyncio
 import logging
-import os
 import time
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta, timezone
-import aiohttp
-import discord
-from discord.ext import commands, tasks
-from aiohttp import web
+from datetime import datetime, timezone
 
-logging.basicConfig(level=logging.INFO)
+import aiohttp
+from aiohttp import web
+import discord
+from discord.ext import commands
+from curl_cffi import requests as async_requests
+from groq import Groq
+
+# ---------------------------------------------------------------------------
+# LOGGING SETUP
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
 logger = logging.getLogger("LegacyBot")
 
-TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_DISCORD_BOT_TOKEN")
+# ---------------------------------------------------------------------------
+# CONFIGURATION & ENVIRONMENT
+# ---------------------------------------------------------------------------
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+PORT = int(os.getenv("PORT", 10000))
 
-# ID каналов Discord
-NEWS_CHANNEL_ID = 1528319066513604688      # Ветка для экономических новостей
-EVENTS_CHANNEL_ID = 1528506824687485118    # Ветка для мероприятий / стримов
+if not DISCORD_TOKEN:
+    logger.critical("❌ Ошибка: Переменная окружения DISCORD_TOKEN не найдена!")
+    sys.exit(1)
 
-# Московское время (UTC+3)
-MSK_TZ = timezone(timedelta(hours=3))
+if not GROQ_API_KEY:
+    logger.warning("⚠️ Внимание: GROQ_API_KEY не установлен. Функции ИИ будут недоступны.")
 
-intents = discord.Intents.default()
-intents.message_content = True
-intents.guilds = True
-intents.guild_scheduled_events = True  # Чтение мероприятий Discord
+# Инициализация клиента Groq
+groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-sent_30m_alerts = set()
-sent_30m_events = set()
-
-# Глобальный кэш новостей (обновление раз в 30 минут)
+# Кэш новостей
 NEWS_CACHE = {
     "data": [],
     "last_fetch": 0
 }
 CACHE_TTL_SECONDS = 1800  # 30 минут
 
-CURRENCY_MAP = {
-    "USD": {"flag": "🇺🇸", "assets": "**EUR/USD**, **GBP/USD**, **USD/JPY**, **XAU/USD**, **DXY**, **NAS100**"},
-    "EUR": {"flag": "🇪🇺", "assets": "**EUR/USD**, **EUR/GBP**, **EUR/JPY**, **DAX40**"},
-    "GBP": {"flag": "🇬🇧", "assets": "**GBP/USD**, **EUR/GBP**, **GBP/JPY**"},
-    "JPY": {"flag": "🇯🇵", "assets": "**USD/JPY**, **EUR/JPY**, **GBP/JPY**"},
-    "CAD": {"flag": "🇨🇦", "assets": "**USD/CAD**, **CAD/JPY**, **WTI Oil**"},
-    "AUD": {"flag": "🇦🇺", "assets": "**AUD/USD**, **AUD/JPY**, **Gold**"},
-    "NZD": {"flag": "🇳🇿", "assets": "**NZD/USD**, **NZD/JPY**"},
-    "CHF": {"flag": "🇨🇭", "assets": "**USD/CHF**, **EUR/CHF**"},
-    "CNY": {"flag": "🇨🇳", "assets": "**USD/CNH**, **Commodities**"},
-}
+# ---------------------------------------------------------------------------
+# DISCORD BOT SETUP
+# ---------------------------------------------------------------------------
+intents = discord.Intents.default()
+intents.message_content = True
 
-DAYS_RU = {
-    0: "Понедельник", 1: "Вторник", 2: "Среда",
-    3: "Четверг", 4: "Пятница", 5: "Суббота", 6: "Воскресенье"
-}
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ==========================================
-# ВЕБ-СЕРВЕР ДЛЯ RENDER (PORT BINDING)
-# ==========================================
-
+# ---------------------------------------------------------------------------
+# WEB SERVER FOR RENDER KEEP-ALIVE
+# ---------------------------------------------------------------------------
 async def handle_ping(request):
-    return web.Response(text="Bot is running and healthy!")
+    return web.Response(text="Bot is online and running!", status=200)
 
-async def start_dummy_server():
+async def start_web_server():
     app = web.Application()
     app.router.add_get("/", handle_ping)
-    app.router.add_get("/health", handle_ping)
-
+    app.router.add_head("/", handle_ping)
+    
     runner = web.AppRunner(app)
     await runner.setup()
-
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info(f"🌐 Веб-сервер запущен на порту {port}")
+    logger.info(f"🌐 Веб-сервер запущен на порту {PORT}")
 
-# ==========================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ & ПАРСЕРЫ
-# ==========================================
-
-def get_currency_info(currency_code: str) -> dict:
-    code = str(currency_code).strip().upper()
-    return CURRENCY_MAP.get(code, {"flag": "🌐", "assets": f"**{code}**"})
-
-def is_high_impact(impact_value) -> bool:
-    if not impact_value:
-        return False
-    val = str(impact_value).strip().lower()
-    return val in ["high", "red", "3", "high impact", "красный", "высокая", "3.0"]
-
-def parse_event_date(raw_date) -> datetime | None:
-    if not raw_date:
-        return None
-
-    if isinstance(raw_date, (int, float)):
-        return datetime.fromtimestamp(raw_date, tz=timezone.utc)
-
-    if isinstance(raw_date, str):
-        raw_date = raw_date.strip()
-        if raw_date.endswith("Z"):
-            raw_date = raw_date[:-1] + "+00:00"
-
-        formats = [
-            "%Y-%m-%dT%H:%M:%S%z",
-            "%Y-%m-%dT%H:%M:%S.%f%z",
-            "%Y-%m-%d %H:%M:%S%z",
-            "%m-%d-%Y %I:%M%p",      # Для FF XML/RSS (например, 07-28-2026 1:30pm)
-            "%Y-%m-%d %H:%M:%S",
-            "%Y-%m-%dT%H:%M:%S",
-            "%Y-%m-%d",
-        ]
-        
-        for fmt in formats:
-            try:
-                dt = datetime.strptime(raw_date, fmt)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt
-            except ValueError:
-                continue
-                
-        try:
-            dt = datetime.fromisoformat(raw_date)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
-        except Exception:
-            pass
-
-    return None
-
-def parse_ff_xml_feed(xml_text: str) -> list:
-    """Парсер официального ForexFactory XML/RSS Календаря"""
+# ---------------------------------------------------------------------------
+# NEWS PARSER & FETCHING (WITH CLOUDFLARE BYPASS)
+# ---------------------------------------------------------------------------
+def parse_ff_xml_feed(xml_content: str) -> list:
+    """Парсинг XML-ленты Forex Factory"""
     events = []
     try:
-        root = ET.fromstring(xml_text)
-        for event in root.findall("event"):
-            title = event.findtext("title", default="Экономическое событие")
-            country = event.findtext("country", default="GLOBAL")
-            date_str = event.findtext("date", default="")
-            time_str = event.findtext("time", default="")
-            impact = event.findtext("impact", default="")
-            forecast = event.findtext("forecast", default="-")
-            previous = event.findtext("previous", default="-")
+        root = ET.fromstring(xml_content)
+        for item in root.findall("event"):
+            title = item.findtext("title", "No Title")
+            country = item.findtext("country", "Global")
+            date_str = item.findtext("date", "")
+            time_str = item.findtext("time", "")
+            impact = item.findtext("impact", "Low")
+            forecast = item.findtext("forecast", "")
+            previous = item.findtext("previous", "")
 
-            # Формируем дату из отдельных полей XML
-            full_date_str = f"{date_str} {time_str}".strip() if time_str else date_str
-            event_dt = parse_event_date(full_date_str)
+            # Нормализация уровня важности
+            impact_level = "LOW"
+            if impact in ["High", "High Impact Expected", "Red"]:
+                impact_level = "HIGH"
+            elif impact in ["Medium", "Medium Impact Expected", "Orange"]:
+                impact_level = "MEDIUM"
 
             events.append({
                 "title": title,
                 "country": country,
-                "impact": impact,
-                "date": full_date_str,
-                "parsed_dt": event_dt,
-                "forecast": forecast if forecast else "-",
-                "previous": previous if previous else "-"
+                "date": f"{date_str} {time_str}".strip(),
+                "impact": impact_level,
+                "forecast": forecast,
+                "previous": previous
             })
     except Exception as e:
-        logger.error(f"[XML PARSER] Ошибка разбора XML: {e}")
+        logger.error(f"[NEWS PARSER] Ошибка парсинга XML: {e}")
     return events
 
 async def fetch_economic_news(force_refresh: bool = False) -> list:
-    """Умное получение новостей с каскадным переключением источников и 30-мин кэшем"""
+    """Умное получение новостей с обходом Cloudflare через curl_cffi"""
     now = time.time()
     
     if not force_refresh and NEWS_CACHE["data"] and (now - NEWS_CACHE["last_fetch"] < CACHE_TTL_SECONDS):
-        logger.info("[NEWS API] Данные взяты из кэша (кэш обновляется раз в 30 мин)")
+        logger.info("[NEWS API] Данные взяты из кэша")
         return NEWS_CACHE["data"]
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        "Accept": "application/json, application/xml, text/xml, */*"
-    }
-    
-    # Резервные источники (JSON, XML/RSS, Mirrors)
     sources = [
-        {"url": "https://www.forexfactory.com/ff_calendar_thisweek.json", "type": "json"},
-        {"url": "https://www.forexfactory.com/ffcalendar.xml", "type": "xml"},
-        {"url": "https://nfs.faireconomy.media/ff_calendar_thisweek.json", "type": "json"},
-        {"url": "https://raw.githubusercontent.com/fawazahmed0/currency-api/1/latest/currencies.json", "type": "json_dummy"} # fallback test
+        # 1. FairEconomy JSON через Chrome Impersonate
+        {"url": "https://nfs.faireconomy.media/ff_calendar_thisweek.json", "type": "json_impersonate"},
+        # 2. ForexFactory XML через Chrome Impersonate
+        {"url": "https://www.forexfactory.com/ffcalendar.xml", "type": "xml_impersonate"},
+        # 3. Резервный источник JSON
+        {"url": "https://raw.githubusercontent.com/martinventer/forexfactory-calendar/main/calendar.json", "type": "json_direct"}
     ]
 
-    async with aiohttp.ClientSession() as session:
-        for src in sources:
-            url = src["url"]
-            stype = src["type"]
-            try:
-                async with session.get(url, headers=headers, timeout=12) as response:
-                    if response.status == 200:
-                        if stype == "json":
+    for src in sources:
+        url = src["url"]
+        stype = src["type"]
+        try:
+            if "impersonate" in stype:
+                # Внедряем TLS/JA3 отпечаток браузера Chrome 120
+                r = await asyncio.to_thread(
+                    async_requests.get, 
+                    url, 
+                    impersonate="chrome120", 
+                    timeout=12,
+                    headers={"Accept": "application/json, text/xml"}
+                )
+                if r.status_code == 200:
+                    if "json" in stype:
+                        data = r.json()
+                        if isinstance(data, list) and len(data) > 0:
+                            # Нормализация названий полей при необходимости
+                            parsed = []
+                            for item in data:
+                                parsed.append({
+                                    "title": item.get("title", item.get("name", "N/A")),
+                                    "country": item.get("country", "Global"),
+                                    "date": item.get("date", "Today"),
+                                    "impact": str(item.get("impact", "Low")).upper(),
+                                    "forecast": item.get("forecast", ""),
+                                    "previous": item.get("previous", "")
+                                })
+                            logger.info(f"[NEWS API] ✅ Получено {len(parsed)} событий ({url})")
+                            NEWS_CACHE["data"] = parsed
+                            NEWS_CACHE["last_fetch"] = now
+                            return parsed
+                    elif "xml" in stype:
+                        data = parse_ff_xml_feed(r.text)
+                        if data:
+                            logger.info(f"[NEWS API] ✅ Спарен XML ({len(data)} событий)")
+                            NEWS_CACHE["data"] = data
+                            NEWS_CACHE["last_fetch"] = now
+                            return data
+                else:
+                    logger.warning(f"[NEWS API] {url} вернул статус {r.status_code}")
+            
+            else:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=10) as response:
+                        if response.status == 200:
                             data = await response.json(content_type=None)
                             if isinstance(data, list) and len(data) > 0:
-                                logger.info(f"[NEWS API] Успешно получено {len(data)} событий из JSON ({url})")
+                                logger.info(f"[NEWS API] ✅ Получено {len(data)} событий из открытого зеркала")
                                 NEWS_CACHE["data"] = data
                                 NEWS_CACHE["last_fetch"] = now
                                 return data
-                        elif stype == "xml":
-                            xml_text = await response.text()
-                            data = parse_ff_xml_feed(xml_text)
-                            if data:
-                                logger.info(f"[NEWS API] Успешно спарсено {len(data)} событий из XML RSS ({url})")
-                                NEWS_CACHE["data"] = data
-                                NEWS_CACHE["last_fetch"] = now
-                                return data
-                    else:
-                        logger.warning(f"[NEWS API] Источник {url} вернул статус {response.status}")
-            except Exception as e:
-                logger.error(f"[NEWS API] Ошибка запроса к {url}: {e}")
-                
+                        else:
+                            logger.warning(f"[NEWS API] {url} вернул статус {response.status}")
+
+        except Exception as e:
+            logger.error(f"[NEWS API] Ошибка запроса к {url}: {e}")
+
     if NEWS_CACHE["data"]:
-        logger.warning("[NEWS API] Все API недоступны. Использование сохранённого ранее кэша.")
+        logger.warning("[NEWS API] Ошибка всех источников. Возврат сохранённого кэша.")
         return NEWS_CACHE["data"]
 
     return []
 
-def process_and_filter_news(raw_events: list, start_dt: datetime, end_dt: datetime) -> list:
-    filtered_events = []
-    logger.info(f"[DEBUG] Всего получено сырых событий: {len(raw_events)}")
+# ---------------------------------------------------------------------------
+# GROQ AI INTEGRATION
+# ---------------------------------------------------------------------------
+async def ask_groq(prompt: str, system_prompt: str = "") -> str:
+    """Запрос к модели Llama 3 через Groq API"""
+    if not groq_client:
+        return "❌ Ошибка: GROQ_API_KEY не передан в настройках сервера."
 
-    for event in raw_events:
-        impact = str(event.get("impact") or event.get("importance") or "").strip().lower()
-        currency = str(event.get("country") or event.get("currency") or "GLOBAL").strip().upper()
-        title = event.get("title") or event.get("name") or "Экономическое событие"
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
 
-        is_high = is_high_impact(impact)
-        
-        # Берем заранее спарсенную дату или парсим заново
-        event_date = event.get("parsed_dt") or parse_event_date(event)
-        
-        if is_high and event_date:
-            if start_dt <= event_date <= end_dt:
-                c_info = get_currency_info(currency)
-                filtered_events.append({
-                    "id": f"{currency}_{title}_{event_date.timestamp()}",
-                    "title": title,
-                    "currency": currency,
-                    "flag": c_info["flag"],
-                    "assets": c_info["assets"],
-                    "impact": "🔴 HIGH",
-                    "date": event_date,
-                    "forecast": event.get("forecast", "-"),
-                    "previous": event.get("previous", "-")
-                })
-
-    logger.info(f"[DEBUG] Отфильтровано важных (🔴 HIGH) событий: {len(filtered_events)}")
-    filtered_events.sort(key=lambda x: x["date"])
-    return filtered_events
-
-async def get_channel_by_id(channel_id: int):
     try:
-        return await bot.fetch_channel(channel_id)
+        completion = await asyncio.to_thread(
+            groq_client.chat.completions.create,
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            temperature=0.5,
+            max_tokens=1000
+        )
+        return completion.choices[0].message.content
     except Exception as e:
-        logger.warning(f"Ошибка получения канала {channel_id}: {e}")
-        return bot.get_channel(channel_id)
+        logger.error(f"[GROQ ERROR] {e}")
+        return f"❌ Ошибка генерации ИИ: {e}"
 
-# ==========================================
-# ПОСТРОЕНИЕ EMBED-СООБЩЕНИЙ
-# ==========================================
-
-def build_weekly_embed(events: list, start_msk: datetime, end_msk: datetime) -> discord.Embed:
-    embed = discord.Embed(
-        title="📊 ЕЖЕНЕДЕЛЬНЫЙ ЭКОНОМИЧЕСКИЙ КАЛЕНДАРЬ FOREX",
-        description=f"📅 **Неделя с {start_msk.strftime('%d.%m.%Y')} по {end_msk.strftime('%d.%m.%Y')}**",
-        color=discord.Color.blue(),
-        timestamp=start_msk
-    )
-
-    if not events:
-        embed.add_field(name="Информация", value="На этой неделе важных новостей (🔴 HIGH) не ожидается.", inline=False)
-        embed.set_footer(text="Legacy Community | Weekly Analytics", icon_url=bot.user.display_avatar.url)
-        return embed
-
-    current_day = None
-    day_blocks = []
-
-    for ev in events:
-        ev_msk = ev["date"].astimezone(MSK_TZ)
-        day_key = ev_msk.weekday()
-
-        if day_key != current_day:
-            if day_blocks:
-                embed.add_field(
-                    name=f"📅 {DAYS_RU[current_day]} ({day_blocks[0]['date_str']})",
-                    value="\n".join([b["text"] for b in day_blocks]),
-                    inline=False
-                )
-                day_blocks = []
-            current_day = day_key
-
-        time_str = ev_msk.strftime("%H:%M")
-        block_text = (
-            f"{ev['flag']} **{ev['currency']}** | 🕘 **{time_str} МСК** — {ev['title']} ({ev['impact']})\n"
-            f"└ 🎯 Активы: {ev['assets']}\n"
-            f"└ 📊 Прогноз: `{ev['forecast']}` | Пред: `{ev['previous']}`"
-        )
-        day_blocks.append({"date_str": ev_msk.strftime("%d.%m"), "text": block_text})
-
-    if day_blocks:
-        embed.add_field(
-            name=f"📅 {DAYS_RU[current_day]} ({day_blocks[0]['date_str']})",
-            value="\n".join([b["text"] for b in day_blocks]),
-            inline=False
-        )
-
-    embed.set_footer(text="Legacy Community | Weekly Analytics", icon_url=bot.user.display_avatar.url)
-    return embed
-
-def build_daily_embed(events: list) -> discord.Embed:
-    now_msk = datetime.now(MSK_TZ)
-    day_name = DAYS_RU[now_msk.weekday()]
-    date_str = now_msk.strftime("%d.%m.%Y")
-
-    embed = discord.Embed(
-        title="📊 ЕЖЕДНЕВНЫЙ ЭКОНОМИЧЕСКИЙ КАЛЕНДАРЬ FOREX",
-        description=f"📅 **{day_name} ({date_str})**",
-        color=discord.Color.gold(),
-        timestamp=now_msk
-    )
-
-    if not events:
-        embed.add_field(name="Информация", value="На сегодня важных новостей (🔴 HIGH) не найдено.", inline=False)
-        embed.set_footer(text="Legacy Community | Daily Analytics", icon_url=bot.user.display_avatar.url)
-        return embed
-
-    for ev in events:
-        ev_msk = ev["date"].astimezone(MSK_TZ)
-        time_str = ev_msk.strftime("%H:%M")
-        field_name = f"{ev['flag']} **{ev['currency']}** | 🕘 {time_str} МСК — {ev['title']}"
-        field_value = (
-            f"🎯 Активы: {ev['assets']}\n"
-            f"📊 Прогноз: `{ev['forecast']}` | Пред: `{ev['previous']}`"
-        )
-        embed.add_field(name=field_name, value=field_value, inline=False)
-
-    embed.set_footer(text="Legacy Community | Daily Analytics", icon_url=bot.user.display_avatar.url)
-    return embed
-
-def build_30m_news_embed(ev: dict) -> discord.Embed:
-    now_msk = datetime.now(MSK_TZ)
-    ev_msk = ev["date"].astimezone(MSK_TZ)
-    time_str = ev_msk.strftime("%H:%M")
-
-    embed = discord.Embed(
-        title="🚨 ВНИМАНИЕ: ВАЖНАЯ НОВОСТЬ ЧЕРЕЗ 30 МИНУТ!",
-        description=f"⚠️ High Impact Event. Ожидается высокая волатильность!",
-        color=discord.Color.red(),
-        timestamp=now_msk
-    )
-
-    field_name = f"{ev['flag']} **{ev['currency']}** | 🕘 {time_str} МСК — {ev['title']}"
-    field_value = (
-        f"🎯 Активы: {ev['assets']}\n"
-        f"📊 Прогноз: `{ev['forecast']}` | Пред: `{ev['previous']}`"
-    )
-    embed.add_field(name=field_name, value=field_value, inline=False)
-    embed.set_footer(text="Legacy Community | Macro Alerts", icon_url=bot.user.display_avatar.url)
-    return embed
-
-def build_event_30m_embed(event_name: str, event_time_msk: datetime, description: str = None, location: str = "OPEN HALL!", event_url: str = None) -> discord.Embed:
-    day_name = DAYS_RU[event_time_msk.weekday()]
-    date_str = event_time_msk.strftime("%d.%m")
-    time_str = event_time_msk.strftime("%H:%M")
-
-    embed = discord.Embed(
-        title=f"🎙️ Напоминание о **{event_name.upper()}** | До старта 30 минут!",
-        color=discord.Color.gold(),
-        timestamp=event_time_msk
-    )
-
-    info_text = f"📅 {day_name} ({date_str}) | 🕘 {time_str} МСК"
-    if description and description.strip():
-        info_text += f"\n\n📌 Тема: {description.strip()}"
-
-    embed.description = info_text
-    loc_text = location.strip() if location and location.strip() else "OPEN HALL!"
-    
-    embed_content = f"🎧 Локация — {loc_text}"
-    if event_url:
-        embed_content += f"\n\nСсылка на брифинг 👇\n{event_url}"
-
-    embed.add_field(name="", value=embed_content, inline=False)
-    embed.set_footer(text=f"Legacy Community | Stream Alert {event_time_msk.strftime('%d.%m.%Y')}", icon_url=bot.user.display_avatar.url)
-    return embed
-
-# ==========================================
-# ФОНОВЫЙ ТАЙМЕР (SCHEDULED TASKS)
-# ==========================================
-
-@tasks.loop(minutes=1)
-async def schedule_checker():
-    now_utc = datetime.now(timezone.utc)
-    now_msk = now_utc.astimezone(MSK_TZ)
-
-    # 1. Понедельник 08:00 МСК -> Еженедельный календарь
-    if now_msk.weekday() == 0 and now_msk.hour == 8 and now_msk.minute == 0:
-        news_channel = await get_channel_by_id(NEWS_CHANNEL_ID)
-        if news_channel:
-            start_week_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
-            end_week_msk = start_week_msk + timedelta(days=6, hours=23, minutes=59)
-            raw = await fetch_economic_news()
-            events = process_and_filter_news(raw, start_week_msk.astimezone(timezone.utc), end_week_msk.astimezone(timezone.utc))
-            embed = build_weekly_embed(events, start_week_msk, end_week_msk)
-            await news_channel.send(embed=embed)
-
-    # 2. Каждый день 09:00 МСК -> Ежедневный календарь
-    if now_msk.hour == 9 and now_msk.minute == 0:
-        news_channel = await get_channel_by_id(NEWS_CHANNEL_ID)
-        if news_channel:
-            start_day = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-            end_day = now_utc.replace(hour=23, minute=59, second=59)
-            raw = await fetch_economic_news()
-            events = process_and_filter_news(raw, start_day, end_day)
-            embed = build_daily_embed(events)
-            await news_channel.send(embed=embed)
-
-    # 3. За 30 минут до HIGH новостей -> С @everyone
-    news_channel = await get_channel_by_id(NEWS_CHANNEL_ID)
-    if news_channel:
-        look_start = now_utc + timedelta(minutes=28)
-        look_end = now_utc + timedelta(minutes=32)
-        raw = await fetch_economic_news()
-        upcoming = process_and_filter_news(raw, look_start, look_end)
-
-        for ev in upcoming:
-            if ev["id"] not in sent_30m_alerts:
-                sent_30m_alerts.add(ev["id"])
-                embed = build_30m_news_embed(ev)
-                await news_channel.send(content="@everyone", embed=embed)
-
-    # 4. За 30 минут до мероприятий Discord -> С @everyone и ссылкой внутри Embed
-    for guild in bot.guilds:
-        try:
-            scheduled_events = await guild.fetch_scheduled_events()
-            for ev in scheduled_events:
-                if ev.start_time:
-                    time_diff = (ev.start_time - now_utc).total_seconds()
-                    if 1680 <= time_diff <= 1920 and ev.id not in sent_30m_events:
-                        sent_30m_events.add(ev.id)
-                        events_channel = await get_channel_by_id(EVENTS_CHANNEL_ID)
-                        if events_channel:
-                            ev_msk = ev.start_time.astimezone(MSK_TZ)
-                            loc_name = ev.location if ev.location else "OPEN HALL!"
-                            event_url = f"https://discord.com/events/{guild.id}/{ev.id}"
-                            
-                            embed = build_event_30m_embed(
-                                event_name=ev.name,
-                                event_time_msk=ev_msk,
-                                description=ev.description,
-                                location=loc_name,
-                                event_url=event_url
-                            )
-                            
-                            await events_channel.send(content="@everyone", embed=embed)
-        except Exception as e:
-            logger.error(f"Ошибка проверки мероприятий сервера: {e}")
-
-# ==========================================
-# КОМАНДЫ ДЛЯ ТЕСТИРОВАНИЯ
-# ==========================================
-
+# ---------------------------------------------------------------------------
+# BOT COMMANDS & EVENTS
+# ---------------------------------------------------------------------------
 @bot.event
 async def on_ready():
-    logger.info(f"✅ Бот {bot.user} запущен!")
-    if not schedule_checker.is_running():
-        schedule_checker.start()
+    logger.info(f"✅ Бот {bot.user} успешно запущен!")
+    await fetch_economic_news(force_refresh=True)
 
-@bot.command(name="test_weekly")
-async def test_weekly(ctx):
-    """Тест еженедельного календаря"""
-    news_channel = await get_channel_by_id(NEWS_CHANNEL_ID)
-    target_channel = news_channel if news_channel else ctx.channel
+@bot.command(name="news")
+async def cmd_news(ctx):
+    """Вывести важные макроэкономические новости (🔴 High Impact)"""
+    async with ctx.typing():
+        news = await fetch_economic_news()
+        
+        high_impact = [n for n in news if "HIGH" in str(n.get("impact", "")).upper() or "RED" in str(n.get("impact", "")).upper()]
+        
+        logger.info(f"[DEBUG] Всего получено сырых событий: {len(news)}")
+        logger.info(f"[DEBUG] Отфильтровано важных (🔴 HIGH) событий: {len(high_impact)}")
 
-    now_msk = datetime.now(MSK_TZ)
-    start_week_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=now_msk.weekday())
-    end_week_msk = start_week_msk + timedelta(days=6, hours=23, minutes=59, seconds=59)
+        if not high_impact and news:
+            # Если нет событий категории High, покажем первые 5 из имеющихся
+            high_impact = news[:5]
 
-    raw = await fetch_economic_news(force_refresh=True)
-    events = process_and_filter_news(
-        raw, 
-        start_week_msk.astimezone(timezone.utc), 
-        end_week_msk.astimezone(timezone.utc)
-    )
-    
-    embed = build_weekly_embed(events, start_week_msk, end_week_msk)
-    await target_channel.send(embed=embed)
+        if not high_impact:
+            await ctx.send("📅 На ближайшее время важных макроэкономических новостей не найдено.")
+            return
 
-@bot.command(name="test_daily")
-async def test_daily(ctx):
-    """Тест ежедневного календаря"""
-    news_channel = await get_channel_by_id(NEWS_CHANNEL_ID)
-    target_channel = news_channel if news_channel else ctx.channel
+        embed = discord.Embed(
+            title="📊 Экономический календарь (Forex Factory)",
+            color=discord.Color.red(),
+            timestamp=datetime.now(timezone.utc)
+        )
 
-    now_utc = datetime.now(timezone.utc)
-    start_day = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_day = now_utc.replace(hour=23, minute=59, second=59)
-    raw = await fetch_economic_news()
-    events = process_and_filter_news(raw, start_day, end_day)
-    embed = build_daily_embed(events)
-    await target_channel.send(embed=embed)
+        for event in high_impact[:10]:
+            country = event.get("country", "USD")
+            title = event.get("title", "Без названия")
+            date_val = event.get("date", "Сегодня")
+            forecast = event.get("forecast", "-")
+            previous = event.get("previous", "-")
 
-@bot.command(name="test_event30m")
-async def test_event30m(ctx, event_name: str = "Morning Briefing by Castro", *, description: str = None):
-    """Тест анонса мероприятия со ссылкой внутри Embed."""
-    target_channel = await get_channel_by_id(EVENTS_CHANNEL_ID)
-    if not target_channel:
-        target_channel = ctx.channel
+            embed.add_field(
+                name=f"🔴 [{country}] {title}",
+                value=f"⏰ **Время:** {date_val}\n📈 **Прогноз:** {forecast} | **Пред:** {previous}",
+                inline=False
+            )
 
-    now_msk = datetime.now(MSK_TZ)
-    event_time_msk = now_msk + timedelta(minutes=30)
-    fake_event_url = f"https://discord.com/events/{ctx.guild.id}/123456789012345678"
+        embed.set_footer(text="Macro & SMC Bot • Data via FF")
+        await ctx.send(embed=embed)
 
-    embed = build_event_30m_embed(
-        event_name=event_name,
-        event_time_msk=event_time_msk,
-        description=description,
-        location="OPEN HALL!",
-        event_url=fake_event_url
-    )
+@bot.command(name="ai")
+async def cmd_ai(ctx, *, query: str):
+    """Задать вопрос ИИ с акцентом на trading / Smart Money Concepts"""
+    async with ctx.typing():
+        system_instructions = (
+            "Ты — профессиональный аналитик и трейдер по методологиям Smart Money Concepts (SMC), ICT и MSNR. "
+            "Отвечай структурированно, профессионально и по делу."
+        )
+        response = await ask_groq(query, system_prompt=system_instructions)
+        
+        # Разбиваем длинный ответ, если он превышает лимит Discord (2000 символов)
+        if len(response) > 1900:
+            for chunk in [response[i:i+1900] for i in range(0, len(response), 1900)]:
+                await ctx.send(chunk)
+        else:
+            await ctx.send(response)
 
-    await target_channel.send(content="@everyone", embed=embed)
-
-# ==========================================
-# ТОЧКА ВХОДА
-# ==========================================
-
+# ---------------------------------------------------------------------------
+# MAIN EXECUTION
+# ---------------------------------------------------------------------------
 async def main():
-    await start_dummy_server()
-    if TOKEN == "YOUR_DISCORD_BOT_TOKEN" or not TOKEN:
-        logger.error("❌ ОШИБКА: Укажите токен бота в переменной DISCORD_TOKEN!")
-        return
-    await bot.start(TOKEN)
+    # Запускаем веб-сервер и бота одновременно
+    await start_web_server()
+    await bot.start(DISCORD_TOKEN)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен вручную.")
