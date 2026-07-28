@@ -11,10 +11,8 @@ from aiohttp import web
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LegacyBot")
 
-# Конфигурация токена и префикса
-# Токен забирается из переменных окружения Render (DISCORD_TOKEN) или указывается вручную
 TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_DISCORD_BOT_TOKEN")
-NEWS_CHANNEL_ID = 1528319066513604688  # ID канала/треда для новостей
+NEWS_CHANNEL_ID = 1528319066513604688  # ID вашей ветки/канала для новостей
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -22,17 +20,15 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ==========================================
-# ВЕБ-СЕРВЕР ДЛЯ ЗАГЛУШКИ PORT SCAN RENDER
+# ВЕБ-СЕРВЕР ДЛЯ PORT BINDING (RENDER)
 # ==========================================
 
 
 async def handle_ping(request):
-    """Возвращает статус 200 OK для проверок Render."""
     return web.Response(text="Bot is running and healthy!")
 
 
 async def start_dummy_server():
-    """Запускает фоновое веб-приложение, чтобы Render не отключал бота по таймауту порта."""
     app = web.Application()
     app.router.add_get("/", handle_ping)
     app.router.add_get("/health", handle_ping)
@@ -40,71 +36,47 @@ async def start_dummy_server():
     runner = web.AppRunner(app)
     await runner.setup()
 
-    # Render автоматически передает PORT в переменные окружения
     port = int(os.environ.get("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(
-        f"🌐 Веб-сервер успешно запущен на порту {port} (Render Port Binding Pass)"
-    )
+    logger.info(f"🌐 Веб-сервер запущен на порту {port}")
 
 
 # ==========================================
-# УНИВЕРСАЛЬНЫЕ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==========================================
 
 
 def is_high_impact(impact_value) -> bool:
-    """Проверяет, относится ли новость к высокой (красной) важности.
-
-    Поддерживает абсолютно любые регистры и варианты написания.
-    """
     if not impact_value:
         return False
-
     val = str(impact_value).strip().lower()
-
-    high_keywords = [
-        "high",
-        "red",
-        "3",
-        "high impact",
-        "красный",
-        "высокая",
-        "heavy",
-        "critical",
-    ]
-
-    return any(keyword in val for keyword in high_keywords)
+    high_keywords = ["high", "red", "3", "high impact", "красный", "высокая"]
+    return any(k in val for k in high_keywords)
 
 
 def normalize_currency(currency_value) -> str:
-    """Приводит код валюты к стандарту (например, USD, EUR, GBP)."""
     if not currency_value:
         return "GLOBAL"
     return str(currency_value).strip().upper()
 
 
 def parse_event_date(event: dict) -> datetime | None:
-    """Универсально извлекает и парсит дату из ответа API."""
     raw_date = (
         event.get("date")
         or event.get("time")
         or event.get("datetime")
         or event.get("timestamp")
     )
-
     if not raw_date:
         return None
 
-    # Если дата уже в формате timestamp (число)
     if isinstance(raw_date, (int, float)):
         return datetime.fromtimestamp(raw_date, tz=timezone.utc)
 
-    # Если дата представлена строкой
     if isinstance(raw_date, str):
         raw_date = raw_date.replace("Z", "+00:00")
-        formats_to_try = [
+        formats = [
             "%Y-%m-%d%z",
             "%Y-%m-%dT%H:%M:%S%z",
             "%Y-%m-%dT%H:%M:%S.%f%z",
@@ -112,7 +84,7 @@ def parse_event_date(event: dict) -> datetime | None:
             "%Y-%m-%d",
             "%m/%d/%Y %H:%M:%S",
         ]
-        for fmt in formats_to_try:
+        for fmt in formats:
             try:
                 dt = datetime.strptime(raw_date, fmt)
                 if dt.tzinfo is None:
@@ -120,31 +92,29 @@ def parse_event_date(event: dict) -> datetime | None:
                 return dt
             except ValueError:
                 continue
-
     return None
 
 
 async def fetch_economic_news() -> list:
-    """Получает новости из внешнего источника/API."""
-    url = "https://nsl.forexfactory.com/news.json"
+    """Запрашивает календарь с рабочего эндпоинта ForexFactory."""
+    # Исправлен адрес API на корректный
+    url = "https://nss.forexfactory.com/calendar/monthly.json"
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=10) as response:
+            async with session.get(url, headers=headers, timeout=15) as response:
                 if response.status == 200:
                     data = await response.json()
                     logger.info(
-                        f"[NEWS API] Успешно получено элементов: {len(data) if isinstance(data, list) else 'Словарь'}"
+                        f"[NEWS API] Успешно получено элементов: {len(data) if isinstance(data, list) else 0}"
                     )
                     return data if isinstance(data, list) else []
                 else:
-                    logger.error(
-                        f"[NEWS API] Ошибка получения данных: Статус {response.status}"
-                    )
+                    logger.error(f"[NEWS API] Ошибка сервера: HTTP {response.status}")
                     return []
     except Exception as e:
         logger.error(f"[NEWS API] Исключение при запросе: {e}")
@@ -154,7 +124,6 @@ async def fetch_economic_news() -> list:
 def process_and_filter_news(
     raw_events: list, start_dt: datetime, end_dt: datetime
 ) -> list:
-    """Фильтрует список новостей по диапазону дат и по красной важности."""
     filtered_events = []
 
     for event in raw_events:
@@ -162,18 +131,14 @@ def process_and_filter_news(
             event.get("impact")
             or event.get("importance")
             or event.get("severity")
-            or event.get("flag")
             or ""
         )
-
         currency = (
             event.get("currency")
             or event.get("country")
             or event.get("symbol")
-            or event.get("pair")
             or ""
         )
-
         title = (
             event.get("title")
             or event.get("name")
@@ -200,8 +165,22 @@ def process_and_filter_news(
     return filtered_events
 
 
+async def get_target_channel(ctx):
+    """Возвращает канал для публикаций: пытается найти NEWS_CHANNEL_ID,
+
+    иначе использует текущий канал отправки.
+    """
+    channel = bot.get_channel(NEWS_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(NEWS_CHANNEL_ID)
+        except Exception:
+            channel = ctx.channel
+    return channel
+
+
 # ==========================================
-# ИВЕНТЫ БОТА И КОМАНДЫ ДЛЯ ТЕСТИРОВАНИЯ
+# КОМАНДЫ БОТА
 # ==========================================
 
 
@@ -213,28 +192,21 @@ async def on_ready():
 
 @bot.command(name="test_weekly")
 async def test_weekly(ctx):
-    """Тестирование вывода недельных новостей."""
-    now = datetime.now(timezone.utc)
+    target_channel = await get_target_channel(ctx)
+    if ctx.channel.id != target_channel.id:
+        await ctx.send(f"🔄 Отправляю недельный отчёт в целевой канал <#{target_channel.id}>...")
 
-    # Понедельник 00:00:00 -> Воскресенье 23:59:59
+    now = datetime.now(timezone.utc)
     start_of_week = (now - timedelta(days=now.weekday())).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
-    end_of_week = start_of_week + timedelta(
-        days=6, hours=23, minutes=59, seconds=59
-    )
-
-    await ctx.send(
-        f"🔍 *Запрос новостей на неделю ({start_of_week.strftime('%d.%m')} - {end_of_week.strftime('%d.%m')})...*"
-    )
+    end_of_week = start_of_week + timedelta(days=6, hours=23, minutes=59, seconds=59)
 
     raw_events = await fetch_economic_news()
     events = process_and_filter_news(raw_events, start_of_week, end_of_week)
 
     if not events:
-        await ctx.send(
-            "📊 На эту неделю важных (красных) новостей не найдено."
-        )
+        await target_channel.send("📊 На эту неделю важных (красных) новостей не найдено.")
         return
 
     embed = discord.Embed(
@@ -251,30 +223,28 @@ async def test_weekly(ctx):
             inline=False,
         )
 
-    await ctx.send(embed=embed)
+    await target_channel.send(embed=embed)
 
 
 @bot.command(name="test_daily")
 async def test_daily(ctx):
-    """Тестирование вывода дневных новостей."""
-    now = datetime.now(timezone.utc)
+    target_channel = await get_target_channel(ctx)
+    if ctx.channel.id != target_channel.id:
+        await ctx.send(f"🔄 Отправляю дневной отчёт в целевой канал <#{target_channel.id}>...")
 
+    now = datetime.now(timezone.utc)
     start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
     end_of_day = now.replace(hour=23, minute=59, second=59, microsecond=0)
-
-    await ctx.send(
-        f"🔍 *Запрос важных новостей на сегодня ({start_of_day.strftime('%d.%m.%Y')})...*"
-    )
 
     raw_events = await fetch_economic_news()
     events = process_and_filter_news(raw_events, start_of_day, end_of_day)
 
     if not events:
-        await ctx.send("📊 На сегодня важных (красных) новостей не найдено.")
+        await target_channel.send("📊 На сегодня важных (красных) новостей не найдено.")
         return
 
     embed = discord.Embed(
-        title=f"🔴 Важные экономические новости на {start_of_day.strftime('%d.%m.%Y')}",
+        title=f"🔴 Важные новости на {start_of_day.strftime('%d.%m.%Y')}",
         color=discord.Color.red(),
         timestamp=now,
     )
@@ -287,12 +257,15 @@ async def test_daily(ctx):
             inline=False,
         )
 
-    await ctx.send(embed=embed)
+    await target_channel.send(embed=embed)
 
 
 @bot.command(name="test_30min")
 async def test_30min(ctx):
-    """Тестирование анонсов новостей, выходящих в ближайшие 30-40 минут."""
+    target_channel = await get_target_channel(ctx)
+    if ctx.channel.id != target_channel.id:
+        await ctx.send(f"🔄 Отправляю анонс в целевой канал <#{target_channel.id}>...")
+
     now = datetime.now(timezone.utc)
     future_window = now + timedelta(minutes=40)
 
@@ -300,9 +273,7 @@ async def test_30min(ctx):
     events = process_and_filter_news(raw_events, now, future_window)
 
     if not events:
-        await ctx.send(
-            "⏳ В ближайшие 30–40 минут важных (красных) новостей не ожидается."
-        )
+        await target_channel.send("⏳ В ближайшие 30–40 минут важных новостей не ожидается.")
         return
 
     for ev in events:
@@ -322,23 +293,19 @@ async def test_30min(ctx):
             value=f"{ev['forecast']} / {ev['previous']}",
             inline=True,
         )
-        await ctx.send(embed=embed)
+        await target_channel.send(embed=embed)
 
 
 # ==========================================
-# ТОЧКА ВХОДА (ОДНОВРЕМЕННЫЙ ЗАПУСК БОТА И ВЕБ-СЕРВЕРА)
+# ТОЧКА ВХОДА
 # ==========================================
 
 
 async def main():
-    # 1. Запускаем заглушку веб-сервера для Render
     await start_dummy_server()
 
-    # 2. Запускаем самого Discord-бота
     if TOKEN == "YOUR_DISCORD_BOT_TOKEN" or not TOKEN:
-        logger.error(
-            "❌ ОШИБКА: Укажите токен бота в переменной DISCORD_TOKEN на Render!"
-        )
+        logger.error("❌ ОШИБКА: Укажите токен бота в переменной DISCORD_TOKEN!")
         return
 
     await bot.start(TOKEN)
