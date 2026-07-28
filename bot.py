@@ -22,7 +22,7 @@ MSK_TZ = timezone(timedelta(hours=3))
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
-intents.scheduled_events = True  # Чтение мероприятий Discord
+intents.guild_scheduled_events = True  # Исправлено: чтение мероприятий Discord
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
