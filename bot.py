@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 import aiohttp
 import discord
@@ -29,10 +30,17 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 sent_30m_alerts = set()
 sent_30m_events = set()
 
-# Список зеркал на случай блокировки IP хостинга
+# Глобальный кэш для защиты от Rate Limit (429)
+NEWS_CACHE = {
+    "data": [],
+    "last_fetch": 0
+}
+CACHE_TTL_SECONDS = 1800  # Обновлять новости из API не чаще чем раз в 30 минут
+
+# Список рабочих источников новостей
 NEWS_API_URLS = [
     "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-    "https://cdn-public.forexfactory.com/ff_calendar_thisweek.json"
+    "https://raw.githubusercontent.com/man-c/forex_factory_calendar/main/calendar.json"
 ]
 
 CURRENCY_MAP = {
@@ -127,19 +135,30 @@ def parse_event_date(event: dict) -> datetime | None:
 
     return None
 
-async def fetch_economic_news() -> list:
+async def fetch_economic_news(force_refresh: bool = False) -> list:
+    """Получает новости с использованием кэша, чтобы избежать HTTP 429."""
+    now = time.time()
+    
+    # Если кэш ещё свежий и не запрошен принудительный сброс
+    if not force_refresh and NEWS_CACHE["data"] and (now - NEWS_CACHE["last_fetch"] < CACHE_TTL_SECONDS):
+        logger.info("[NEWS API] Использование данных из кэша")
+        return NEWS_CACHE["data"]
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*"
     }
+    
     async with aiohttp.ClientSession() as session:
         for url in NEWS_API_URLS:
             try:
-                async with session.get(url, headers=headers, timeout=10) as response:
+                async with session.get(url, headers=headers, timeout=12) as response:
                     if response.status == 200:
                         data = await response.json(content_type=None)
                         if isinstance(data, list) and len(data) > 0:
                             logger.info(f"[NEWS API] Успешно получено {len(data)} событий из {url}")
+                            NEWS_CACHE["data"] = data
+                            NEWS_CACHE["last_fetch"] = now
                             return data
                         else:
                             logger.warning(f"[NEWS API] Источник {url} вернул пустой список.")
@@ -147,14 +166,17 @@ async def fetch_economic_news() -> list:
                         logger.warning(f"[NEWS API] Источник {url} вернул статус {response.status}")
             except Exception as e:
                 logger.error(f"[NEWS API] Ошибка запроса к {url}: {e}")
+                
+    # Если все API упали, но в кэше хоть что-то есть — отдаём старый кэш
+    if NEWS_CACHE["data"]:
+        logger.warning("[NEWS API] Не удалось обновить данные, возвращаем устаревший кэш.")
+        return NEWS_CACHE["data"]
+
     return []
 
 def process_and_filter_news(raw_events: list, start_dt: datetime, end_dt: datetime) -> list:
     filtered_events = []
     logger.info(f"[DEBUG] Всего получено сырых событий от API: {len(raw_events)}")
-    
-    if raw_events:
-        logger.info(f"[DEBUG SAMPLE] Пример структуры первого события: {raw_events[0]}")
 
     for event in raw_events:
         impact = str(event.get("impact") or event.get("importance") or event.get("level") or "").strip().lower()
@@ -164,23 +186,22 @@ def process_and_filter_news(raw_events: list, start_dt: datetime, end_dt: dateti
         is_high = is_high_impact(impact)
         event_date = parse_event_date(event)
         
-        if is_high:
-            if event_date:
-                if start_dt <= event_date <= end_dt:
-                    c_info = get_currency_info(currency)
-                    filtered_events.append({
-                        "id": f"{currency}_{title}_{event_date.timestamp()}",
-                        "title": title,
-                        "currency": currency,
-                        "flag": c_info["flag"],
-                        "assets": c_info["assets"],
-                        "impact": "🔴 HIGH",
-                        "date": event_date,
-                        "forecast": event.get("forecast", "-"),
-                        "previous": event.get("previous", "-")
-                    })
+        if is_high and event_date:
+            if start_dt <= event_date <= end_dt:
+                c_info = get_currency_info(currency)
+                filtered_events.append({
+                    "id": f"{currency}_{title}_{event_date.timestamp()}",
+                    "title": title,
+                    "currency": currency,
+                    "flag": c_info["flag"],
+                    "assets": c_info["assets"],
+                    "impact": "🔴 HIGH",
+                    "date": event_date,
+                    "forecast": event.get("forecast", "-"),
+                    "previous": event.get("previous", "-")
+                })
 
-    logger.info(f"[DEBUG] Успешно отфильтровано High-событий на эту неделю: {len(filtered_events)}")
+    logger.info(f"[DEBUG] Успешно отфильтровано High-событий: {len(filtered_events)}")
     filtered_events.sort(key=lambda x: x["date"])
     return filtered_events
 
@@ -306,24 +327,17 @@ def build_event_30m_embed(event_name: str, event_time_msk: datetime, description
     )
 
     info_text = f"📅 {day_name} ({date_str}) | 🕘 {time_str} МСК"
-    
     if description and description.strip():
         info_text += f"\n\n📌 Тема: {description.strip()}"
 
     embed.description = info_text
-
     loc_text = location.strip() if location and location.strip() else "OPEN HALL!"
     
     embed_content = f"🎧 Локация — {loc_text}"
     if event_url:
         embed_content += f"\n\nСсылка на брифинг 👇\n{event_url}"
 
-    embed.add_field(
-        name="",
-        value=embed_content,
-        inline=False
-    )
-    
+    embed.add_field(name="", value=embed_content, inline=False)
     embed.set_footer(text=f"Legacy Community | Stream Alert {event_time_msk.strftime('%d.%m.%Y')}", icon_url=bot.user.display_avatar.url)
     return embed
 
@@ -411,7 +425,7 @@ async def on_ready():
 
 @bot.command(name="test_weekly")
 async def test_weekly(ctx):
-    """Тест еженедельного календаря (с захватом текущей недели по МСК)"""
+    """Тест еженедельного календаря"""
     news_channel = await get_channel_by_id(NEWS_CHANNEL_ID)
     target_channel = news_channel if news_channel else ctx.channel
 
@@ -419,7 +433,7 @@ async def test_weekly(ctx):
     start_week_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=now_msk.weekday())
     end_week_msk = start_week_msk + timedelta(days=6, hours=23, minutes=59, seconds=59)
 
-    raw = await fetch_economic_news()
+    raw = await fetch_economic_news(force_refresh=True)
     events = process_and_filter_news(
         raw, 
         start_week_msk.astimezone(timezone.utc), 
@@ -445,10 +459,7 @@ async def test_daily(ctx):
 
 @bot.command(name="test_event30m")
 async def test_event30m(ctx, event_name: str = "Morning Briefing by Castro", *, description: str = None):
-    """
-    Тест анонса мероприятия со ссылкой внутри Embed.
-    Пример: !test_event30m "Morning Briefing by Castro" Разбор лондонской сессии
-    """
+    """Тест анонса мероприятия со ссылкой внутри Embed."""
     target_channel = await get_channel_by_id(EVENTS_CHANNEL_ID)
     if not target_channel:
         target_channel = ctx.channel
