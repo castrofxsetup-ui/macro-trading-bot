@@ -29,10 +29,8 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 sent_30m_alerts = set()
 sent_30m_events = set()
 
-# ИСПРАВЛЕННЫЙ НАДЕЖНЫЙ ИСТОЧНИК НОВОСТЕЙ (FairEconomy зеркало)
 NEWS_API_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
-# Валюты и связанные активы (каждый актив обернут в **жирный** шрифт)
 CURRENCY_MAP = {
     "USD": {"flag": "🇺🇸", "assets": "**EUR/USD**, **GBP/USD**, **USD/JPY**, **XAU/USD**, **DXY**, **NAS100**"},
     "EUR": {"flag": "🇪🇺", "assets": "**EUR/USD**, **EUR/GBP**, **EUR/JPY**, **DAX40**"},
@@ -82,8 +80,7 @@ def is_high_impact(impact_value) -> bool:
     if not impact_value:
         return False
     val = str(impact_value).strip().lower()
-    high_keywords = ["high", "red", "3", "high impact", "красный", "высокая"]
-    return any(k in val for k in high_keywords)
+    return val in ["high", "red", "3", "high impact", "красный", "высокая", "3.0"]
 
 def parse_event_date(event: dict) -> datetime | None:
     raw_date = event.get("date") or event.get("time") or event.get("datetime") or event.get("timestamp")
@@ -94,14 +91,19 @@ def parse_event_date(event: dict) -> datetime | None:
         return datetime.fromtimestamp(raw_date, tz=timezone.utc)
 
     if isinstance(raw_date, str):
-        raw_date = raw_date.replace("Z", "+00:00")
+        raw_date = raw_date.strip()
+        if raw_date.endswith("Z"):
+            raw_date = raw_date[:-1] + "+00:00"
+
         formats = [
             "%Y-%m-%dT%H:%M:%S%z",
-            "%Y-%m-%d%z",
             "%Y-%m-%dT%H:%M:%S.%f%z",
+            "%Y-%m-%d %H:%M:%S%z",
             "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S",
             "%Y-%m-%d",
         ]
+        
         for fmt in formats:
             try:
                 dt = datetime.strptime(raw_date, fmt)
@@ -110,6 +112,15 @@ def parse_event_date(event: dict) -> datetime | None:
                 return dt
             except ValueError:
                 continue
+                
+        try:
+            dt = datetime.fromisoformat(raw_date)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except Exception:
+            pass
+
     return None
 
 async def fetch_economic_news() -> list:
@@ -130,26 +141,36 @@ async def fetch_economic_news() -> list:
 
 def process_and_filter_news(raw_events: list, start_dt: datetime, end_dt: datetime) -> list:
     filtered_events = []
-    for event in raw_events:
-        impact = event.get("impact") or event.get("importance") or ""
-        currency = (event.get("country") or event.get("currency") or "GLOBAL").strip().upper()
-        title = event.get("title") or event.get("name") or "Экономическое событие"
+    logger.info(f"[DEBUG] Всего получено сырых событий от API: {len(raw_events)}")
+    
+    if raw_events:
+        logger.info(f"[DEBUG SAMPLE] Пример структуры первого события: {raw_events[0]}")
 
-        if is_high_impact(impact):
-            event_date = parse_event_date(event)
-            if event_date and (start_dt <= event_date <= end_dt):
-                c_info = get_currency_info(currency)
-                filtered_events.append({
-                    "id": f"{currency}_{title}_{event_date.timestamp()}",
-                    "title": title,
-                    "currency": currency,
-                    "flag": c_info["flag"],
-                    "assets": c_info["assets"],
-                    "impact": "🔴 HIGH",
-                    "date": event_date,
-                    "forecast": event.get("forecast", "-"),
-                    "previous": event.get("previous", "-")
-                })
+    for event in raw_events:
+        impact = str(event.get("impact") or event.get("importance") or event.get("level") or "").strip().lower()
+        currency = str(event.get("country") or event.get("currency") or event.get("symbol") or "GLOBAL").strip().upper()
+        title = event.get("title") or event.get("name") or event.get("event") or "Экономическое событие"
+
+        is_high = is_high_impact(impact)
+        event_date = parse_event_date(event)
+        
+        if is_high:
+            if event_date:
+                if start_dt <= event_date <= end_dt:
+                    c_info = get_currency_info(currency)
+                    filtered_events.append({
+                        "id": f"{currency}_{title}_{event_date.timestamp()}",
+                        "title": title,
+                        "currency": currency,
+                        "flag": c_info["flag"],
+                        "assets": c_info["assets"],
+                        "impact": "🔴 HIGH",
+                        "date": event_date,
+                        "forecast": event.get("forecast", "-"),
+                        "previous": event.get("previous", "-")
+                    })
+
+    logger.info(f"[DEBUG] Успешно отфильтровано High-событий на эту неделю: {len(filtered_events)}")
     filtered_events.sort(key=lambda x: x["date"])
     return filtered_events
 
@@ -164,15 +185,12 @@ async def get_channel_by_id(channel_id: int):
 # ПОСТРОЕНИЕ EMBED-СООБЩЕНИЙ
 # ==========================================
 
-def build_weekly_embed(events: list) -> discord.Embed:
-    now_msk = datetime.now(MSK_TZ)
-    end_msk = now_msk + timedelta(days=6)
-
+def build_weekly_embed(events: list, start_msk: datetime, end_msk: datetime) -> discord.Embed:
     embed = discord.Embed(
         title="📊 ЕЖЕНЕДЕЛЬНЫЙ ЭКОНОМИЧЕСКИЙ КАЛЕНДАРЬ FOREX",
-        description=f"📅 **Неделя с {now_msk.strftime('%d.%m.%Y')} по {end_msk.strftime('%d.%m.%Y')}**",
+        description=f"📅 **Неделя с {start_msk.strftime('%d.%m.%Y')} по {end_msk.strftime('%d.%m.%Y')}**",
         color=discord.Color.blue(),
-        timestamp=now_msk
+        timestamp=start_msk
     )
 
     if not events:
@@ -312,11 +330,11 @@ async def schedule_checker():
     if now_msk.weekday() == 0 and now_msk.hour == 8 and now_msk.minute == 0:
         news_channel = await get_channel_by_id(NEWS_CHANNEL_ID)
         if news_channel:
-            start_week = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-            end_week = start_week + timedelta(days=6, hours=23, minutes=59)
+            start_week_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0)
+            end_week_msk = start_week_msk + timedelta(days=6, hours=23, minutes=59)
             raw = await fetch_economic_news()
-            events = process_and_filter_news(raw, start_week, end_week)
-            embed = build_weekly_embed(events)
+            events = process_and_filter_news(raw, start_week_msk.astimezone(timezone.utc), end_week_msk.astimezone(timezone.utc))
+            embed = build_weekly_embed(events, start_week_msk, end_week_msk)
             await news_channel.send(embed=embed)
 
     # 2. Каждый день 09:00 МСК -> Ежедневный календарь
@@ -383,27 +401,37 @@ async def on_ready():
 
 @bot.command(name="test_weekly")
 async def test_weekly(ctx):
-    """Тест еженедельного календаря"""
+    """Тест еженедельного календаря (с захватом текущей недели по МСК)"""
     news_channel = await get_channel_by_id(NEWS_CHANNEL_ID)
-    now_utc = datetime.now(timezone.utc)
-    start_week = now_utc - timedelta(days=now_utc.weekday())
-    end_week = start_week + timedelta(days=6, hours=23, minutes=59)
+    target_channel = news_channel if news_channel else ctx.channel
+
+    now_msk = datetime.now(MSK_TZ)
+    start_week_msk = now_msk.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=now_msk.weekday())
+    end_week_msk = start_week_msk + timedelta(days=6, hours=23, minutes=59, seconds=59)
+
     raw = await fetch_economic_news()
-    events = process_and_filter_news(raw, start_week, end_week)
-    embed = build_weekly_embed(events)
-    await news_channel.send(embed=embed)
+    events = process_and_filter_news(
+        raw, 
+        start_week_msk.astimezone(timezone.utc), 
+        end_week_msk.astimezone(timezone.utc)
+    )
+    
+    embed = build_weekly_embed(events, start_week_msk, end_week_msk)
+    await target_channel.send(embed=embed)
 
 @bot.command(name="test_daily")
 async def test_daily(ctx):
     """Тест ежедневного календаря"""
     news_channel = await get_channel_by_id(NEWS_CHANNEL_ID)
+    target_channel = news_channel if news_channel else ctx.channel
+
     now_utc = datetime.now(timezone.utc)
     start_day = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
     end_day = now_utc.replace(hour=23, minute=59, second=59)
     raw = await fetch_economic_news()
     events = process_and_filter_news(raw, start_day, end_day)
     embed = build_daily_embed(events)
-    await news_channel.send(embed=embed)
+    await target_channel.send(embed=embed)
 
 @bot.command(name="test_event30m")
 async def test_event30m(ctx, event_name: str = "Morning Briefing by Castro", *, description: str = None):
@@ -412,6 +440,9 @@ async def test_event30m(ctx, event_name: str = "Morning Briefing by Castro", *, 
     Пример: !test_event30m "Morning Briefing by Castro" Разбор лондонской сессии
     """
     target_channel = await get_channel_by_id(EVENTS_CHANNEL_ID)
+    if not target_channel:
+        target_channel = ctx.channel
+
     now_msk = datetime.now(MSK_TZ)
     event_time_msk = now_msk + timedelta(minutes=30)
     fake_event_url = f"https://discord.com/events/{ctx.guild.id}/123456789012345678"
