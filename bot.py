@@ -31,8 +31,8 @@ sent_30m_events = set()
 
 # Список зеркал на случай блокировки IP хостинга
 NEWS_API_URLS = [
-    "https://cdn-public.forexfactory.com/ff_calendar_thisweek.json",
-    "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+    "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+    "https://cdn-public.forexfactory.com/ff_calendar_thisweek.json"
 ]
 
 CURRENCY_MAP = {
@@ -143,6 +143,8 @@ async def fetch_economic_news() -> list:
                             return data
                         else:
                             logger.warning(f"[NEWS API] Источник {url} вернул пустой список.")
+                    else:
+                        logger.warning(f"[NEWS API] Источник {url} вернул статус {response.status}")
             except Exception as e:
                 logger.error(f"[NEWS API] Ошибка запроса к {url}: {e}")
     return []
