@@ -7,12 +7,11 @@ import discord
 from discord.ext import commands
 from aiohttp import web
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("LegacyBot")
 
 TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_DISCORD_BOT_TOKEN")
-NEWS_CHANNEL_ID = 1528319066513604688  # ID вашей ветки/канала для новостей
+NEWS_CHANNEL_ID = 1528319066513604688  # ID вашей ветки / канала новостей
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -20,13 +19,11 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ==========================================
-# ВЕБ-СЕРВЕР ДЛЯ PORT BINDING (RENDER)
+# ВЕБ-СЕРВЕР ДЛЯ RENDER (PORT BINDING)
 # ==========================================
-
 
 async def handle_ping(request):
     return web.Response(text="Bot is running and healthy!")
-
 
 async def start_dummy_server():
     app = web.Application()
@@ -41,11 +38,9 @@ async def start_dummy_server():
     await site.start()
     logger.info(f"🌐 Веб-сервер запущен на порту {port}")
 
-
 # ==========================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ==========================================
-
 
 def is_high_impact(impact_value) -> bool:
     if not impact_value:
@@ -54,20 +49,13 @@ def is_high_impact(impact_value) -> bool:
     high_keywords = ["high", "red", "3", "high impact", "красный", "высокая"]
     return any(k in val for k in high_keywords)
 
-
 def normalize_currency(currency_value) -> str:
     if not currency_value:
         return "GLOBAL"
     return str(currency_value).strip().upper()
 
-
 def parse_event_date(event: dict) -> datetime | None:
-    raw_date = (
-        event.get("date")
-        or event.get("time")
-        or event.get("datetime")
-        or event.get("timestamp")
-    )
+    raw_date = event.get("date") or event.get("time") or event.get("datetime") or event.get("timestamp")
     if not raw_date:
         return None
 
@@ -94,12 +82,9 @@ def parse_event_date(event: dict) -> datetime | None:
                 continue
     return None
 
-
 async def fetch_economic_news() -> list:
-    """Запрашивает календарь с рабочего эндпоинта ForexFactory."""
-    # Исправлен адрес API на корректный
+    """Запрашивает экономический календарь."""
     url = "https://nss.forexfactory.com/calendar/monthly.json"
-
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
@@ -109,9 +94,7 @@ async def fetch_economic_news() -> list:
             async with session.get(url, headers=headers, timeout=15) as response:
                 if response.status == 200:
                     data = await response.json()
-                    logger.info(
-                        f"[NEWS API] Успешно получено элементов: {len(data) if isinstance(data, list) else 0}"
-                    )
+                    logger.info(f"[NEWS API] Успешно получено элементов: {len(data) if isinstance(data, list) else 0}")
                     return data if isinstance(data, list) else []
                 else:
                     logger.error(f"[NEWS API] Ошибка сервера: HTTP {response.status}")
@@ -120,75 +103,48 @@ async def fetch_economic_news() -> list:
         logger.error(f"[NEWS API] Исключение при запросе: {e}")
         return []
 
-
-def process_and_filter_news(
-    raw_events: list, start_dt: datetime, end_dt: datetime
-) -> list:
+def process_and_filter_news(raw_events: list, start_dt: datetime, end_dt: datetime) -> list:
     filtered_events = []
 
     for event in raw_events:
-        impact = (
-            event.get("impact")
-            or event.get("importance")
-            or event.get("severity")
-            or ""
-        )
-        currency = (
-            event.get("currency")
-            or event.get("country")
-            or event.get("symbol")
-            or ""
-        )
-        title = (
-            event.get("title")
-            or event.get("name")
-            or event.get("event")
-            or "Экономическое событие"
-        )
+        impact = event.get("impact") or event.get("importance") or event.get("severity") or ""
+        currency = event.get("currency") or event.get("country") or event.get("symbol") or ""
+        title = event.get("title") or event.get("name") or event.get("event") or "Экономическое событие"
 
         if is_high_impact(impact):
             event_date = parse_event_date(event)
-
             if event_date and (start_dt <= event_date <= end_dt):
-                filtered_events.append(
-                    {
-                        "title": title,
-                        "currency": normalize_currency(currency),
-                        "impact": "High",
-                        "date": event_date,
-                        "forecast": event.get("forecast", "-"),
-                        "previous": event.get("previous", "-"),
-                    }
-                )
+                filtered_events.append({
+                    "title": title,
+                    "currency": normalize_currency(currency),
+                    "impact": "High",
+                    "date": event_date,
+                    "forecast": event.get("forecast", "-"),
+                    "previous": event.get("previous", "-")
+                })
 
     filtered_events.sort(key=lambda x: x["date"])
     return filtered_events
 
-
 async def get_target_channel(ctx):
-    """Возвращает канал для публикаций: пытается найти NEWS_CHANNEL_ID,
-
-    иначе использует текущий канал отправки.
-    """
-    channel = bot.get_channel(NEWS_CHANNEL_ID)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(NEWS_CHANNEL_ID)
-        except Exception:
-            channel = ctx.channel
-    return channel
-
+    """Гарантированно находит целевой канал или ветку по NEWS_CHANNEL_ID."""
+    try:
+        # Сначала пробуем получить из API напрямую (надежно для веток)
+        channel = await bot.fetch_channel(NEWS_CHANNEL_ID)
+        return channel
+    except Exception as e:
+        logger.warning(f"Не удалось получить канал {NEWS_CHANNEL_ID} через fetch_channel: {e}")
+        channel = bot.get_channel(NEWS_CHANNEL_ID)
+        return channel if channel else ctx.channel
 
 # ==========================================
 # КОМАНДЫ БОТА
 # ==========================================
 
-
 @bot.event
 async def on_ready():
     logger.info(f"✅ Бот {bot.user} успешно запущен!")
     logger.info(f"📢 Канал новостей ID: {NEWS_CHANNEL_ID}")
-
 
 @bot.command(name="test_weekly")
 async def test_weekly(ctx):
@@ -197,9 +153,7 @@ async def test_weekly(ctx):
         await ctx.send(f"🔄 Отправляю недельный отчёт в целевой канал <#{target_channel.id}>...")
 
     now = datetime.now(timezone.utc)
-    start_of_week = (now - timedelta(days=now.weekday())).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
+    start_of_week = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
     end_of_week = start_of_week + timedelta(days=6, hours=23, minutes=59, seconds=59)
 
     raw_events = await fetch_economic_news()
@@ -212,7 +166,7 @@ async def test_weekly(ctx):
     embed = discord.Embed(
         title="📅 Важные (High Impact) новости на эту неделю",
         color=discord.Color.red(),
-        timestamp=now,
+        timestamp=now
     )
 
     for ev in events:
@@ -220,11 +174,10 @@ async def test_weekly(ctx):
         embed.add_field(
             name=f"🔴 [{ev['currency']}] {ev['title']}",
             value=f"⏰ **Время:** {time_str}\n📊 **Прогноз:** {ev['forecast']} | **Пред:** {ev['previous']}",
-            inline=False,
+            inline=False
         )
 
     await target_channel.send(embed=embed)
-
 
 @bot.command(name="test_daily")
 async def test_daily(ctx):
@@ -246,7 +199,7 @@ async def test_daily(ctx):
     embed = discord.Embed(
         title=f"🔴 Важные новости на {start_of_day.strftime('%d.%m.%Y')}",
         color=discord.Color.red(),
-        timestamp=now,
+        timestamp=now
     )
 
     for ev in events:
@@ -254,11 +207,10 @@ async def test_daily(ctx):
         embed.add_field(
             name=f"🔴 [{ev['currency']}] {ev['title']}",
             value=f"⏰ **Время:** {time_str}\n📊 **Прогноз:** {ev['forecast']} | **Пред:** {ev['previous']}",
-            inline=False,
+            inline=False
         )
 
     await target_channel.send(embed=embed)
-
 
 @bot.command(name="test_30min")
 async def test_30min(ctx):
@@ -281,35 +233,22 @@ async def test_30min(ctx):
             title="🚨 ВНИМАНИЕ: Новость через 30 минут!",
             description=f"**[{ev['currency']}] {ev['title']}**",
             color=discord.Color.gold(),
-            timestamp=now,
+            timestamp=now
         )
-        embed.add_field(
-            name="Время выхода",
-            value=f"⏰ {ev['date'].strftime('%H:%M UTC')}",
-            inline=True,
-        )
-        embed.add_field(
-            name="Прогноз / Пред",
-            value=f"{ev['forecast']} / {ev['previous']}",
-            inline=True,
-        )
+        embed.add_field(name="Время выхода", value=f"⏰ {ev['date'].strftime('%H:%M UTC')}", inline=True)
+        embed.add_field(name="Прогноз / Пред", value=f"{ev['forecast']} / {ev['previous']}", inline=True)
         await target_channel.send(embed=embed)
-
 
 # ==========================================
 # ТОЧКА ВХОДА
 # ==========================================
 
-
 async def main():
     await start_dummy_server()
-
     if TOKEN == "YOUR_DISCORD_BOT_TOKEN" or not TOKEN:
         logger.error("❌ ОШИБКА: Укажите токен бота в переменной DISCORD_TOKEN!")
         return
-
     await bot.start(TOKEN)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
