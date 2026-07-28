@@ -9,7 +9,6 @@ import pytz
 # НАСТРОЙКИ БОТА И КОНСТАНТЫ
 # ==========================================
 
-# Токен Discord (рекомендуется передавать через переменную окружения RENDER/ENV)
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
 # ID канала для публикации новостей
@@ -18,7 +17,9 @@ NEWS_CHANNEL_ID = 1528319066513604688
 # Часовой пояс МСК
 MSK_TZ = pytz.timezone("Europe/Moscow")
 
-# Словари для форматирования дат на русском
+# Множество для отслеживания уже отправленных анонсов за 30 мин
+notified_events = set()
+
 DAYS_RU = {
     0: "понедельник",
     1: "вторник",
@@ -39,7 +40,6 @@ COUNTRY_FLAGS = {
     "AUD": "🇦🇺", "CAD": "🇨🇦", "CHF": "🇨🇭", "NZD": "🇳🇿", "CNY": "🇨🇳"
 }
 
-# Инициализация бота
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
@@ -49,7 +49,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ==========================================
 
 async def get_raw_calendar_data():
-    """Получает данные экономического календаря из стабильного JSON API"""
+    """Получает данные экономического календаря из открытого API"""
     url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -65,7 +65,7 @@ async def get_raw_calendar_data():
     return []
 
 def convert_to_msk(utc_date_str: str) -> tuple[datetime, str]:
-    """Конвертирует UTC строку в объект datetime МСК и форматированное время HH:MM"""
+    """Конвертирует UTC строку в объект datetime МСК и строку времени HH:MM"""
     if not utc_date_str:
         now = datetime.now(MSK_TZ)
         return now, now.strftime("%H:%M")
@@ -164,78 +164,111 @@ async def generate_weekly_news_embed() -> discord.Embed:
 
     return embed
 
-async def generate_breaking_news_embed(country: str, title: str, dt_msk: datetime) -> discord.Embed:
-    """Генерация внепланового анонса"""
-    day_en = dt_msk.strftime("%A")
-    time_msk = dt_msk.strftime("%H:%M")
+def generate_30min_warning_embed(country: str, title: str, time_msk: str) -> discord.Embed:
+    """Генерация карточки-предупреждения за 30 минут до HIGH новости"""
     flag = COUNTRY_FLAGS.get(country.upper(), "🌐")
 
     embed = discord.Embed(
-        title="⚠️ Внимание! Внеплановый анонс!",
-        description=f"🕘 {day_en} {time_msk} МСК\n",
+        title="⚠️ Будьте осторожны!",
         color=discord.Color.red()
     )
 
     embed.add_field(
         name=f"{flag} {country.upper()} — {title}",
-        value="🔴 HIGH",
+        value=f"🕘 {time_msk} МСК\n🔴 HIGH",
         inline=False
     )
-    
-    embed.set_footer(text="⚠️ Будьте аккуратны!")
+
+    embed.set_footer(text="⌛ Публикация через 30 минут!")
     return embed
 
 # ==========================================
-# ФОНОВЫЕ ЗАДАЧИ АВТООТПРАВКИ (CRON/TASKS)
+# ФОНОВЫЕ ЗАДАЧИ (TASKS)
 # ==========================================
 
-# 1. Еженедельный календарь (Каждый Понедельник в 08:00 МСК)
+# 1. Еженедельный календарь (Понедельник в 08:00 МСК)
 @tasks.loop(time=time(hour=8, minute=0, tzinfo=MSK_TZ))
 async def weekly_news_task():
     now_msk = datetime.now(MSK_TZ)
-    if now_msk.weekday() == 0:  # 0 = Понедельник
+    if now_msk.weekday() == 0:
         channel = bot.get_channel(NEWS_CHANNEL_ID)
         if channel:
             embed = await generate_weekly_news_embed()
             await channel.send(embed=embed)
 
-# 2. Ежедневный календарь (Понедельник - Пятница в 09:00 МСК)
+# 2. Ежедневный календарь (ПН - ПТ в 09:00 МСК)
 @tasks.loop(time=time(hour=9, minute=0, tzinfo=MSK_TZ))
 async def daily_news_task():
     now_msk = datetime.now(MSK_TZ)
-    if now_msk.weekday() < 5:  # 0..4 = Понедельник..Пятница
+    if now_msk.weekday() < 5:
         channel = bot.get_channel(NEWS_CHANNEL_ID)
         if channel:
             embed = await generate_daily_news_embed()
             await channel.send(embed=embed)
 
+# 3. Мониторинг новостей за 30 минут (Каждую минуту)
+@tasks.loop(minutes=1)
+async def news_30min_notifier_task():
+    data = await get_raw_calendar_data()
+    now_msk = datetime.now(MSK_TZ)
+
+    for item in data:
+        if item.get("impact") == "High":
+            utc_date = item.get("date", "")
+            dt_msk, time_msk = convert_to_msk(utc_date)
+
+            # Вычисляем разницу во времени до новости
+            time_diff = (dt_msk - now_msk).total_seconds() / 60.0
+
+            # Уникальный ключ события (чтобы не отправлять дубли)
+            event_id = f"{dt_msk.strftime('%Y%m%d_%H%M')}_{item.get('country')}_{item.get('title')}"
+
+            # Если до новости осталось от 29 до 30 минут
+            if 29.0 <= time_diff <= 30.5 and event_id not in notified_events:
+                channel = bot.get_channel(NEWS_CHANNEL_ID)
+                if channel:
+                    country = item.get("country", "USD").upper()
+                    title = item.get("title", "Event")
+                    
+                    embed = generate_30min_warning_embed(country, title, time_msk)
+                    # Отправка с тегом @everyone
+                    await channel.send(content="@everyone", embed=embed)
+                    notified_events.add(event_id)
+
 # ==========================================
-# КОМАНДЫ БОТА И ИНИЦИАЛИЗАЦИЯ
+# КОМАНДЫ БОТА
 # ==========================================
 
 @bot.command(name="test_daily")
 @commands.has_permissions(administrator=True)
 async def test_daily(ctx):
-    """Команда для ручной проверки дневного календаря"""
-    embed = await generate_daily_news_embed()
-    await ctx.send(embed=embed)
+    """Тест дневного календаря строго в канал новостей"""
+    channel = bot.get_channel(NEWS_CHANNEL_ID)
+    if channel:
+        embed = await generate_daily_news_embed()
+        await channel.send(embed=embed)
+        await ctx.message.add_reaction("✅")
 
 @bot.command(name="test_weekly")
 @commands.has_permissions(administrator=True)
 async def test_weekly(ctx):
-    """Команда для ручной проверки недельного календаря"""
-    embed = await generate_weekly_news_embed()
-    await ctx.send(embed=embed)
-
-@bot.command(name="breaking_news")
-@commands.has_permissions(administrator=True)
-async def breaking_news(ctx, country: str, *, title: str):
-    """Команда экстренной новости: !breaking_news USD Неплановое заседание ФРС"""
-    now_msk = datetime.now(MSK_TZ)
-    embed = await generate_breaking_news_embed(country, title, now_msk)
+    """Тест еженедельного календаря строго в канал новостей"""
     channel = bot.get_channel(NEWS_CHANNEL_ID)
     if channel:
+        embed = await generate_weekly_news_embed()
         await channel.send(embed=embed)
+        await ctx.message.add_reaction("✅")
+
+@bot.command(name="test_30min")
+@commands.has_permissions(administrator=True)
+async def test_30min(ctx):
+    """Тест анонса за 30 минут с пингом @everyone строго в канал новостей"""
+    channel = bot.get_channel(NEWS_CHANNEL_ID)
+    if channel:
+        now_msk = datetime.now(MSK_TZ)
+        time_str = now_msk.strftime("%H:%M")
+        embed = generate_30min_warning_embed("USD", "Базовый индекс потребительских цен (ИПЦ)", time_str)
+        await channel.send(content="@everyone", embed=embed)
         await ctx.message.add_reaction("✅")
 
 @bot.event
@@ -243,11 +276,12 @@ async def on_ready():
     print(f"✅ Бот {bot.user} успешно запущен!")
     print(f"📢 Канал новостей ID: {NEWS_CHANNEL_ID}")
     
-    # Запуск фоновых задач
     if not weekly_news_task.is_running():
         weekly_news_task.start()
     if not daily_news_task.is_running():
         daily_news_task.start()
+    if not news_30min_notifier_task.is_running():
+        news_30min_notifier_task.start()
 
 if __name__ == "__main__":
     bot.run(DISCORD_TOKEN)
