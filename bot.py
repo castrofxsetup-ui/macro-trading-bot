@@ -29,7 +29,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 sent_30m_alerts = set()
 sent_30m_events = set()
 
-# Надежный источник календаря ForexFactory (через зеркало FairEconomy)
+# ИСПРАВЛЕННЫЙ НАДЕЖНЫЙ ИСТОЧНИК НОВОСТЕЙ (FairEconomy зеркало)
 NEWS_API_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
 # Валюты и связанные активы (каждый актив обернут в **жирный** шрифт)
@@ -132,7 +132,6 @@ def process_and_filter_news(raw_events: list, start_dt: datetime, end_dt: dateti
     filtered_events = []
     for event in raw_events:
         impact = event.get("impact") or event.get("importance") or ""
-        # FairEconomy использует поле 'country' для обозначения валюты/страны
         currency = (event.get("country") or event.get("currency") or "GLOBAL").strip().upper()
         title = event.get("title") or event.get("name") or "Экономическое событие"
 
@@ -199,7 +198,6 @@ def build_weekly_embed(events: list) -> discord.Embed:
             current_day = day_key
 
         time_str = ev_msk.strftime("%H:%M")
-        # Актив выделен жирным шрифтом: **USD**
         block_text = (
             f"{ev['flag']} **{ev['currency']}** | 🕘 **{time_str} МСК** — {ev['title']} ({ev['impact']})\n"
             f"└ 🎯 Активы: {ev['assets']}\n"
@@ -237,7 +235,6 @@ def build_daily_embed(events: list) -> discord.Embed:
     for ev in events:
         ev_msk = ev["date"].astimezone(MSK_TZ)
         time_str = ev_msk.strftime("%H:%M")
-        # Валюта/актив выделена жирным шрифтом: **EUR**
         field_name = f"{ev['flag']} **{ev['currency']}** | 🕘 {time_str} МСК — {ev['title']}"
         field_value = (
             f"🎯 Активы: {ev['assets']}\n"
@@ -274,7 +271,6 @@ def build_event_30m_embed(event_name: str, event_time_msk: datetime, description
     date_str = event_time_msk.strftime("%d.%m")
     time_str = event_time_msk.strftime("%H:%M")
 
-    # НАЗВАНИЕ МЕРОПРИЯТИЯ — ЖИРНЫМ ШРИФТОМ, ВСЁ ОСТАЛЬНОЕ — ОБЫЧНЫМ
     embed = discord.Embed(
         title=f"🎙️ Напоминание о **{event_name.upper()}** | До старта 30 минут!",
         color=discord.Color.gold(),
