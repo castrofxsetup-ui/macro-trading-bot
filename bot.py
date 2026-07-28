@@ -142,7 +142,7 @@ async def fetch_economic_news() -> list:
                             logger.info(f"[NEWS API] Успешно получено {len(data)} событий из {url}")
                             return data
                         else:
-                            logger.warning(f"[NEWS API] Источник {url вернул пустой список.")
+                            logger.warning(f"[NEWS API] Источник {url} вернул пустой список.")
             except Exception as e:
                 logger.error(f"[NEWS API] Ошибка запроса к {url}: {e}")
     return []
