@@ -22,23 +22,24 @@ MSK_TZ = timezone(timedelta(hours=3))
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guilds = True
-intents.guild_scheduled_events = True  # Исправлено: чтение мероприятий Discord
+intents.guild_scheduled_events = True  # Чтение мероприятий Discord
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 sent_30m_alerts = set()
 sent_30m_events = set()
 
+# Валюты и связанные активы (каждый актив обернут в **жирный** шрифт)
 CURRENCY_MAP = {
-    "USD": {"flag": "🇺🇸", "assets": "EUR/USD, GBP/USD, USD/JPY, XAU/USD, DXY, NAS100"},
-    "EUR": {"flag": "🇪🇺", "assets": "EUR/USD, EUR/GBP, EUR/JPY, DAX40"},
-    "GBP": {"flag": "🇬🇧", "assets": "GBP/USD, EUR/GBP, GBP/JPY"},
-    "JPY": {"flag": "🇯🇵", "assets": "USD/JPY, EUR/JPY, GBP/JPY"},
-    "CAD": {"flag": "🇨🇦", "assets": "USD/CAD, CAD/JPY, WTI Oil"},
-    "AUD": {"flag": "🇦🇺", "assets": "AUD/USD, AUD/JPY, Gold"},
-    "NZD": {"flag": "🇳🇿", "assets": "NZD/USD, NZD/JPY"},
-    "CHF": {"flag": "🇨🇭", "assets": "USD/CHF, EUR/CHF"},
-    "CNY": {"flag": "🇨🇳", "assets": "USD/CNH, Commodities"},
+    "USD": {"flag": "🇺🇸", "assets": "**EUR/USD**, **GBP/USD**, **USD/JPY**, **XAU/USD**, **DXY**, **NAS100**"},
+    "EUR": {"flag": "🇪🇺", "assets": "**EUR/USD**, **EUR/GBP**, **EUR/JPY**, **DAX40**"},
+    "GBP": {"flag": "🇬🇧", "assets": "**GBP/USD**, **EUR/GBP**, **GBP/JPY**"},
+    "JPY": {"flag": "🇯🇵", "assets": "**USD/JPY**, **EUR/JPY**, **GBP/JPY**"},
+    "CAD": {"flag": "🇨🇦", "assets": "**USD/CAD**, **CAD/JPY**, **WTI Oil**"},
+    "AUD": {"flag": "🇦🇺", "assets": "**AUD/USD**, **AUD/JPY**, **Gold**"},
+    "NZD": {"flag": "🇳🇿", "assets": "**NZD/USD**, **NZD/JPY**"},
+    "CHF": {"flag": "🇨🇭", "assets": "**USD/CHF**, **EUR/CHF**"},
+    "CNY": {"flag": "🇨🇳", "assets": "**USD/CNH**, **Commodities**"},
 }
 
 DAYS_RU = {
@@ -72,7 +73,7 @@ async def start_dummy_server():
 
 def get_currency_info(currency_code: str) -> dict:
     code = str(currency_code).strip().upper()
-    return CURRENCY_MAP.get(code, {"flag": "🌐", "assets": "Основные активы"})
+    return CURRENCY_MAP.get(code, {"flag": "🌐", "assets": f"**{code}**"})
 
 def is_high_impact(impact_value) -> bool:
     if not impact_value:
@@ -109,20 +110,27 @@ def parse_event_date(event: dict) -> datetime | None:
     return None
 
 async def fetch_economic_news() -> list:
-    url = "https://nss.forexfactory.com/calendar/monthly.json"
+    urls = [
+        "https://nss.forexfactory.com/calendar/monthly.json",
+        "https://forexfactory.com/calendar/monthly.json",
+        "https://raw.githubusercontent.com/man-c/forex_factory_calendar/main/calendar.json"
+    ]
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, timeout=15) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return data if isinstance(data, list) else []
-                return []
-    except Exception as e:
-        logger.error(f"[NEWS API] Ошибка получения новостей: {e}")
-        return []
+    async with aiohttp.ClientSession() as session:
+        for url in urls:
+            try:
+                async with session.get(url, headers=headers, timeout=10) as response:
+                    if response.status == 200:
+                        data = await response.json(content_type=None)
+                        if isinstance(data, list):
+                            return data
+            except Exception as e:
+                logger.warning(f"[NEWS API] Ошибка получения новостей с {url}: {e}")
+                continue
+    logger.error("[NEWS API] Все источники новостей недоступны")
+    return []
 
 def process_and_filter_news(raw_events: list, start_dt: datetime, end_dt: datetime) -> list:
     filtered_events = []
@@ -196,8 +204,8 @@ def build_weekly_embed(events: list) -> discord.Embed:
         time_str = ev_msk.strftime("%H:%M")
         block_text = (
             f"{ev['flag']} **{ev['currency']}** | 🕘 **{time_str} МСК** — {ev['title']} ({ev['impact']})\n"
-            f"└ 🎯 *Активы:* `{ev['assets']}`\n"
-            f"└ 📊 *Прогноз:* `{ev['forecast']}` | *Пред:* `{ev['previous']}`"
+            f"└ 🎯 Активы: {ev['assets']}\n"
+            f"└ 📊 Прогноз: `{ev['forecast']}` | Пред: `{ev['previous']}`"
         )
         day_blocks.append({"date_str": ev_msk.strftime("%d.%m"), "text": block_text})
 
@@ -231,10 +239,10 @@ def build_daily_embed(events: list) -> discord.Embed:
     for ev in events:
         ev_msk = ev["date"].astimezone(MSK_TZ)
         time_str = ev_msk.strftime("%H:%M")
-        field_name = f"{ev['flag']} {ev['currency']} | 🕘 {time_str} МСК — {ev['title']}"
+        field_name = f"{ev['flag']} **{ev['currency']}** | 🕘 {time_str} МСК — {ev['title']}"
         field_value = (
-            f"🎯 **Активы:** `{ev['assets']}`\n"
-            f"📊 **Прогноз:** `{ev['forecast']}` | **Пред:** `{ev['previous']}`"
+            f"🎯 Активы: {ev['assets']}\n"
+            f"📊 Прогноз: `{ev['forecast']}` | Пред: `{ev['previous']}`"
         )
         embed.add_field(name=field_name, value=field_value, inline=False)
 
@@ -248,42 +256,48 @@ def build_30m_news_embed(ev: dict) -> discord.Embed:
 
     embed = discord.Embed(
         title="🚨 ВНИМАНИЕ: ВАЖНАЯ НОВОСТЬ ЧЕРЕЗ 30 МИНУТ!",
-        description=f"⚠️ **High Impact Event.** Ожидается высокая волатильность!",
+        description=f"⚠️ High Impact Event. Ожидается высокая волатильность!",
         color=discord.Color.red(),
         timestamp=now_msk
     )
 
-    field_name = f"{ev['flag']} {ev['currency']} | 🕘 {time_str} МСК — {ev['title']}"
+    field_name = f"{ev['flag']} **{ev['currency']}** | 🕘 {time_str} МСК — {ev['title']}"
     field_value = (
-        f"🎯 **Активы:** `{ev['assets']}`\n"
-        f"📊 **Прогноз:** `{ev['forecast']}` | **Пред:** `{ev['previous']}`"
+        f"🎯 Активы: {ev['assets']}\n"
+        f"📊 Прогноз: `{ev['forecast']}` | Пред: `{ev['previous']}`"
     )
     embed.add_field(name=field_name, value=field_value, inline=False)
     embed.set_footer(text="Legacy Community | Macro Alerts", icon_url=bot.user.display_avatar.url)
     return embed
 
-def build_event_30m_embed(event_name: str, event_time_msk: datetime, description: str = None, location: str = "OPEN HALL!") -> discord.Embed:
+def build_event_30m_embed(event_name: str, event_time_msk: datetime, description: str = None, location: str = "OPEN HALL!", event_url: str = None) -> discord.Embed:
     day_name = DAYS_RU[event_time_msk.weekday()]
     date_str = event_time_msk.strftime("%d.%m")
     time_str = event_time_msk.strftime("%H:%M")
 
+    # Жирным выделяется только название самого мероприятия: **EVENT_NAME**
     embed = discord.Embed(
-        title=f"🎙️ НАПОМИНАНИЕ О {event_name.upper()} | До старта 30 минут!",
+        title=f"🎙️ Напоминание о **{event_name.upper()}** | До старта 30 минут!",
         color=discord.Color.gold(),
         timestamp=event_time_msk
     )
 
-    info_text = f"📅 **{day_name} ({date_str})** | 🕘 **{time_str} МСК**"
+    info_text = f"📅 {day_name} ({date_str}) | 🕘 {time_str} МСК"
     
     if description and description.strip():
-        info_text += f"\n\n📌 **Тема:** {description.strip()}"
+        info_text += f"\n\n📌 Тема: {description.strip()}"
 
     embed.description = info_text
 
     loc_text = location.strip() if location and location.strip() else "OPEN HALL!"
+    
+    embed_content = f"🎧 Локация — {loc_text}"
+    if event_url:
+        embed_content += f"\n\nСсылка на брифинг 👇\n{event_url}"
+
     embed.add_field(
         name="",
-        value=f"🎧 **Локация — {loc_text}**",
+        value=embed_content,
         inline=False
     )
     
@@ -299,7 +313,7 @@ async def schedule_checker():
     now_utc = datetime.now(timezone.utc)
     now_msk = now_utc.astimezone(MSK_TZ)
 
-    # 1. Понедельник 08:00 МСК -> Еженедельный календарь (без @everyone)
+    # 1. Понедельник 08:00 МСК -> Еженедельный календарь
     if now_msk.weekday() == 0 and now_msk.hour == 8 and now_msk.minute == 0:
         news_channel = await get_channel_by_id(NEWS_CHANNEL_ID)
         if news_channel:
@@ -310,7 +324,7 @@ async def schedule_checker():
             embed = build_weekly_embed(events)
             await news_channel.send(embed=embed)
 
-    # 2. Каждый день 09:00 МСК -> Ежедневный календарь (без @everyone)
+    # 2. Каждый день 09:00 МСК -> Ежедневный календарь
     if now_msk.hour == 9 and now_msk.minute == 0:
         news_channel = await get_channel_by_id(NEWS_CHANNEL_ID)
         if news_channel:
@@ -335,7 +349,7 @@ async def schedule_checker():
                 embed = build_30m_news_embed(ev)
                 await news_channel.send(content="@everyone", embed=embed)
 
-    # 4. За 30 минут до мероприятий Discord -> С @everyone и прямой ссылкой
+    # 4. За 30 минут до мероприятий Discord -> С @everyone и ссылкой внутри Embed
     for guild in bot.guilds:
         try:
             scheduled_events = await guild.fetch_scheduled_events()
@@ -348,17 +362,17 @@ async def schedule_checker():
                         if events_channel:
                             ev_msk = ev.start_time.astimezone(MSK_TZ)
                             loc_name = ev.location if ev.location else "OPEN HALL!"
+                            event_url = f"https://discord.com/events/{guild.id}/{ev.id}"
+                            
                             embed = build_event_30m_embed(
                                 event_name=ev.name,
                                 event_time_msk=ev_msk,
                                 description=ev.description,
-                                location=loc_name
+                                location=loc_name,
+                                event_url=event_url
                             )
-                            # Динамическая ссылка на мероприятие Discord
-                            event_url = f"https://discord.com/events/{guild.id}/{ev.id}"
-                            content_text = f"@everyone\n\nСсылка на брифинг 👇\n{event_url}"
                             
-                            await events_channel.send(content=content_text, embed=embed)
+                            await events_channel.send(content="@everyone", embed=embed)
         except Exception as e:
             logger.error(f"Ошибка проверки мероприятий сервера: {e}")
 
@@ -399,25 +413,23 @@ async def test_daily(ctx):
 @bot.command(name="test_event30m")
 async def test_event30m(ctx, event_name: str = "Morning Briefing by Castro", *, description: str = None):
     """
-    Тест анонса мероприятия за 30 минут со ссылкой.
+    Тест анонса мероприятия со ссылкой внутри Embed.
     Пример: !test_event30m "Morning Briefing by Castro" Разбор лондонской сессии
     """
     target_channel = await get_channel_by_id(EVENTS_CHANNEL_ID)
     now_msk = datetime.now(MSK_TZ)
     event_time_msk = now_msk + timedelta(minutes=30)
+    fake_event_url = f"https://discord.com/events/{ctx.guild.id}/123456789012345678"
 
     embed = build_event_30m_embed(
         event_name=event_name,
         event_time_msk=event_time_msk,
         description=description,
-        location="OPEN HALL!"
+        location="OPEN HALL!",
+        event_url=fake_event_url
     )
 
-    # Тестовая ссылка на ивент
-    fake_event_url = f"https://discord.com/events/{ctx.guild.id}/123456789012345678"
-    content_text = f"@everyone\n\nСсылка на брифинг 👇\n{fake_event_url}"
-
-    await target_channel.send(content=content_text, embed=embed)
+    await target_channel.send(content="@everyone", embed=embed)
 
 # ==========================================
 # ТОЧКА ВХОДА
