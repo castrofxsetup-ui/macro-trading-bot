@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 import aiohttp
 import discord
@@ -30,18 +31,12 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 sent_30m_alerts = set()
 sent_30m_events = set()
 
-# Глобальный кэш для защиты от Rate Limit (429)
+# Глобальный кэш новостей (обновление раз в 30 минут)
 NEWS_CACHE = {
     "data": [],
     "last_fetch": 0
 }
-CACHE_TTL_SECONDS = 1800  # Обновлять новости из API не чаще чем раз в 30 минут
-
-# Список рабочих источников новостей
-NEWS_API_URLS = [
-    "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-    "https://raw.githubusercontent.com/man-c/forex_factory_calendar/main/calendar.json"
-]
+CACHE_TTL_SECONDS = 1800  # 30 минут
 
 CURRENCY_MAP = {
     "USD": {"flag": "🇺🇸", "assets": "**EUR/USD**, **GBP/USD**, **USD/JPY**, **XAU/USD**, **DXY**, **NAS100**"},
@@ -81,7 +76,7 @@ async def start_dummy_server():
     logger.info(f"🌐 Веб-сервер запущен на порту {port}")
 
 # ==========================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ & ПАРСЕРЫ
 # ==========================================
 
 def get_currency_info(currency_code: str) -> dict:
@@ -94,8 +89,7 @@ def is_high_impact(impact_value) -> bool:
     val = str(impact_value).strip().lower()
     return val in ["high", "red", "3", "high impact", "красный", "высокая", "3.0"]
 
-def parse_event_date(event: dict) -> datetime | None:
-    raw_date = event.get("date") or event.get("time") or event.get("datetime") or event.get("timestamp")
+def parse_event_date(raw_date) -> datetime | None:
     if not raw_date:
         return None
 
@@ -111,6 +105,7 @@ def parse_event_date(event: dict) -> datetime | None:
             "%Y-%m-%dT%H:%M:%S%z",
             "%Y-%m-%dT%H:%M:%S.%f%z",
             "%Y-%m-%d %H:%M:%S%z",
+            "%m-%d-%Y %I:%M%p",      # Для FF XML/RSS (например, 07-28-2026 1:30pm)
             "%Y-%m-%d %H:%M:%S",
             "%Y-%m-%dT%H:%M:%S",
             "%Y-%m-%d",
@@ -135,56 +130,104 @@ def parse_event_date(event: dict) -> datetime | None:
 
     return None
 
+def parse_ff_xml_feed(xml_text: str) -> list:
+    """Парсер официального ForexFactory XML/RSS Календаря"""
+    events = []
+    try:
+        root = ET.fromstring(xml_text)
+        for event in root.findall("event"):
+            title = event.findtext("title", default="Экономическое событие")
+            country = event.findtext("country", default="GLOBAL")
+            date_str = event.findtext("date", default="")
+            time_str = event.findtext("time", default="")
+            impact = event.findtext("impact", default="")
+            forecast = event.findtext("forecast", default="-")
+            previous = event.findtext("previous", default="-")
+
+            # Формируем дату из отдельных полей XML
+            full_date_str = f"{date_str} {time_str}".strip() if time_str else date_str
+            event_dt = parse_event_date(full_date_str)
+
+            events.append({
+                "title": title,
+                "country": country,
+                "impact": impact,
+                "date": full_date_str,
+                "parsed_dt": event_dt,
+                "forecast": forecast if forecast else "-",
+                "previous": previous if previous else "-"
+            })
+    except Exception as e:
+        logger.error(f"[XML PARSER] Ошибка разбора XML: {e}")
+    return events
+
 async def fetch_economic_news(force_refresh: bool = False) -> list:
-    """Получает новости с использованием кэша, чтобы избежать HTTP 429."""
+    """Умное получение новостей с каскадным переключением источников и 30-мин кэшем"""
     now = time.time()
     
-    # Если кэш ещё свежий и не запрошен принудительный сброс
     if not force_refresh and NEWS_CACHE["data"] and (now - NEWS_CACHE["last_fetch"] < CACHE_TTL_SECONDS):
-        logger.info("[NEWS API] Использование данных из кэша")
+        logger.info("[NEWS API] Данные взяты из кэша (кэш обновляется раз в 30 мин)")
         return NEWS_CACHE["data"]
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "application/json, application/xml, text/xml, */*"
     }
     
+    # Резервные источники (JSON, XML/RSS, Mirrors)
+    sources = [
+        {"url": "https://www.forexfactory.com/ff_calendar_thisweek.json", "type": "json"},
+        {"url": "https://www.forexfactory.com/ffcalendar.xml", "type": "xml"},
+        {"url": "https://nfs.faireconomy.media/ff_calendar_thisweek.json", "type": "json"},
+        {"url": "https://raw.githubusercontent.com/fawazahmed0/currency-api/1/latest/currencies.json", "type": "json_dummy"} # fallback test
+    ]
+
     async with aiohttp.ClientSession() as session:
-        for url in NEWS_API_URLS:
+        for src in sources:
+            url = src["url"]
+            stype = src["type"]
             try:
                 async with session.get(url, headers=headers, timeout=12) as response:
                     if response.status == 200:
-                        data = await response.json(content_type=None)
-                        if isinstance(data, list) and len(data) > 0:
-                            logger.info(f"[NEWS API] Успешно получено {len(data)} событий из {url}")
-                            NEWS_CACHE["data"] = data
-                            NEWS_CACHE["last_fetch"] = now
-                            return data
-                        else:
-                            logger.warning(f"[NEWS API] Источник {url} вернул пустой список.")
+                        if stype == "json":
+                            data = await response.json(content_type=None)
+                            if isinstance(data, list) and len(data) > 0:
+                                logger.info(f"[NEWS API] Успешно получено {len(data)} событий из JSON ({url})")
+                                NEWS_CACHE["data"] = data
+                                NEWS_CACHE["last_fetch"] = now
+                                return data
+                        elif stype == "xml":
+                            xml_text = await response.text()
+                            data = parse_ff_xml_feed(xml_text)
+                            if data:
+                                logger.info(f"[NEWS API] Успешно спарсено {len(data)} событий из XML RSS ({url})")
+                                NEWS_CACHE["data"] = data
+                                NEWS_CACHE["last_fetch"] = now
+                                return data
                     else:
                         logger.warning(f"[NEWS API] Источник {url} вернул статус {response.status}")
             except Exception as e:
                 logger.error(f"[NEWS API] Ошибка запроса к {url}: {e}")
                 
-    # Если все API упали, но в кэше хоть что-то есть — отдаём старый кэш
     if NEWS_CACHE["data"]:
-        logger.warning("[NEWS API] Не удалось обновить данные, возвращаем устаревший кэш.")
+        logger.warning("[NEWS API] Все API недоступны. Использование сохранённого ранее кэша.")
         return NEWS_CACHE["data"]
 
     return []
 
 def process_and_filter_news(raw_events: list, start_dt: datetime, end_dt: datetime) -> list:
     filtered_events = []
-    logger.info(f"[DEBUG] Всего получено сырых событий от API: {len(raw_events)}")
+    logger.info(f"[DEBUG] Всего получено сырых событий: {len(raw_events)}")
 
     for event in raw_events:
-        impact = str(event.get("impact") or event.get("importance") or event.get("level") or "").strip().lower()
-        currency = str(event.get("country") or event.get("currency") or event.get("symbol") or "GLOBAL").strip().upper()
-        title = event.get("title") or event.get("name") or event.get("event") or "Экономическое событие"
+        impact = str(event.get("impact") or event.get("importance") or "").strip().lower()
+        currency = str(event.get("country") or event.get("currency") or "GLOBAL").strip().upper()
+        title = event.get("title") or event.get("name") or "Экономическое событие"
 
         is_high = is_high_impact(impact)
-        event_date = parse_event_date(event)
+        
+        # Берем заранее спарсенную дату или парсим заново
+        event_date = event.get("parsed_dt") or parse_event_date(event)
         
         if is_high and event_date:
             if start_dt <= event_date <= end_dt:
@@ -201,7 +244,7 @@ def process_and_filter_news(raw_events: list, start_dt: datetime, end_dt: dateti
                     "previous": event.get("previous", "-")
                 })
 
-    logger.info(f"[DEBUG] Успешно отфильтровано High-событий: {len(filtered_events)}")
+    logger.info(f"[DEBUG] Отфильтровано важных (🔴 HIGH) событий: {len(filtered_events)}")
     filtered_events.sort(key=lambda x: x["date"])
     return filtered_events
 
