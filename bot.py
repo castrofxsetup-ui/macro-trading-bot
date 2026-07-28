@@ -29,7 +29,11 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 sent_30m_alerts = set()
 sent_30m_events = set()
 
-NEWS_API_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+# Список зеркал на случай блокировки IP хостинга
+NEWS_API_URLS = [
+    "https://cdn-public.forexfactory.com/ff_calendar_thisweek.json",
+    "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+]
 
 CURRENCY_MAP = {
     "USD": {"flag": "🇺🇸", "assets": "**EUR/USD**, **GBP/USD**, **USD/JPY**, **XAU/USD**, **DXY**, **NAS100**"},
@@ -125,18 +129,22 @@ def parse_event_date(event: dict) -> datetime | None:
 
 async def fetch_economic_news() -> list:
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*"
     }
     async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(NEWS_API_URL, headers=headers, timeout=10) as response:
-                if response.status == 200:
-                    data = await response.json(content_type=None)
-                    if isinstance(data, list):
-                        logger.info(f"[NEWS API] Успешно получено {len(data)} событий.")
-                        return data
-        except Exception as e:
-            logger.error(f"[NEWS API] Ошибка получения новостей: {e}")
+        for url in NEWS_API_URLS:
+            try:
+                async with session.get(url, headers=headers, timeout=10) as response:
+                    if response.status == 200:
+                        data = await response.json(content_type=None)
+                        if isinstance(data, list) and len(data) > 0:
+                            logger.info(f"[NEWS API] Успешно получено {len(data)} событий из {url}")
+                            return data
+                        else:
+                            logger.warning(f"[NEWS API] Источник {url вернул пустой список.")
+            except Exception as e:
+                logger.error(f"[NEWS API] Ошибка запроса к {url}: {e}")
     return []
 
 def process_and_filter_news(raw_events: list, start_dt: datetime, end_dt: datetime) -> list:
