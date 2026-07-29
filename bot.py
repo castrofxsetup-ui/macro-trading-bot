@@ -32,6 +32,7 @@ PORT = int(os.getenv("PORT", 10000))
 # Фиксированные ID веток Discord
 TARGET_NEWS_THREAD_ID = 1528319066513604688
 TARGET_EVENTS_THREAD_ID = 1528506824687485118
+AI_ALLOWED_THREAD_ID = 1502292137889501235  # Целевая ветка для вопросов ИИ
 
 # Временная зона МСК (UTC+3)
 MSK_TZ = timezone(timedelta(hours=3))
@@ -378,7 +379,7 @@ async def ask_groq(prompt: str, system_prompt: str = "") -> str:
         return f"❌ Ошибка генерации ИИ: {e}"
 
 # ---------------------------------------------------------------------------
-# BOT COMMANDS & EVENTS
+# BOT EVENTS & COMMANDS
 # ---------------------------------------------------------------------------
 @bot.event
 async def on_ready():
@@ -391,6 +392,30 @@ async def on_ready():
         check_discord_events_alerts.start()
     if not scheduled_news_digests.is_running():
         scheduled_news_digests.start()
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Игнорируем сообщения от самого бота
+    if message.author == bot.user:
+        return
+
+    # Проверяем, упомянули ли бота (@Legacy Bot) и находится ли сообщение в целевой ветке ИИ
+    if bot.user in message.mentions and message.channel.id == AI_ALLOWED_THREAD_ID:
+        # Убираем упоминание бота из текста вопроса
+        clean_prompt = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
+        
+        if clean_prompt:
+            async with message.channel.typing():
+                system_instructions = (
+                    "Ты — аналитик Smart Money Concepts (SMC), ICT и MSNR. "
+                    "Отвечай кратко, профессионально и по делу."
+                )
+                response = await ask_groq(clean_prompt, system_prompt=system_instructions)
+                await message.reply(response[:1900], mention_author=True)
+        return
+
+    # Обеспечиваем работу обычных команд (например, !news, !ai)
+    await bot.process_commands(message)
 
 @bot.command(name="news")
 async def cmd_news(ctx):
