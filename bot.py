@@ -204,6 +204,10 @@ async def check_30min_news_alerts():
 
     news = await fetch_economic_news()
     now_utc = datetime.now(timezone.utc)
+    now_msk = now_utc.astimezone(MSK_TZ)
+
+    # Защита от ночных пингов: с 00:00 до 08:00 МСК без @everyone
+    is_night_time = (0 <= now_msk.hour < 8)
 
     for ev in news:
         if ev.get("impact") != "HIGH" or not ev.get("dt_utc"):
@@ -224,11 +228,13 @@ async def check_30min_news_alerts():
                 description=(
                     f"{flag} **{ev['country']}** — {ev['title']}\n"
                     f"🕘 {time_str}\n\n"
-                    f"⌛️ *Публикация через 30 минут*"
+                    f"-# ⌛️ Публикация через 30 минут"
                 ),
                 color=discord.Color.red()
             )
-            await thread.send(content="@everyone", embed=embed)
+            
+            content = "" if is_night_time else "@everyone"
+            await thread.send(content=content, embed=embed)
 
 @tasks.loop(minutes=2)
 async def check_discord_events_alerts():
