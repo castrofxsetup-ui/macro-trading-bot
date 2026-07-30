@@ -61,6 +61,27 @@ SENT_DISCORD_EVENTS = set()
 CACHE_TTL_SECONDS = 1800  # 30 минут
 
 # ---------------------------------------------------------------------------
+# AI SYSTEM PROMPT
+# ---------------------------------------------------------------------------
+SYSTEM_INSTRUCTIONS = (
+    "Ты — профессиональный аналитик и эксперт в области Smart Money Concepts (SMC), ICT, "
+    "а также концепций Malaysian Support & Resistance (MSNR / Alchemist MSNR).\n\n"
+    "КЛЮЧЕВАЯ ИНФОРМАЦИЯ О MSNR / ALCHEMIST:\n"
+    "- MSNR (Malaysian Support and Resistance / Малазийский SnR) — это графическая торговая концепция, "
+    "основанная на поиске ключевых уровней поддержки и сопротивления на младших и старших таймфреймах "
+    "с использованием специфических свечных формаций (Fresh levels, Overlap, Gap, Breakout, Major/Minor SnR).\n"
+    "- Alchemist MSNR — это авторская интерпретация и систематизированная торговая система на основе "
+    "малазийского SnR, сфокусированная на высокой точности входа (Sniper entries) и детальной "
+    "оценке реакций цены на свечные уровни.\n"
+    "- СТРОГОЕ ПРАВИЛО: MSNR в контексте трейдинга НЕ ИМЕЕТ НИКАКОГО ОТНОШЕНИЯ к Microsoft, Nasdaq или другим "
+    "корпорациям! Не пиши про акции или сторонние финансовые инструменты.\n\n"
+    "ПРАВИЛА ОТВЕТА:\n"
+    "1. Распознавай запросы про MSNR, Alchemist, Malaysian SnR в любом регистре и формате (капс, транслит, опечатки).\n"
+    "2. Отвечай кратко, структурировано, профессионально и по делу.\n"
+    "3. На вопросы о MSNR / Alchemist давай четкое объяснение сути концепции понятным языком."
+)
+
+# ---------------------------------------------------------------------------
 # DISCORD BOT SETUP
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
@@ -229,7 +250,6 @@ async def check_30min_news_alerts():
         if 28 <= time_diff <= 31 and event_id not in SENT_NEWS_ALERTS:
             upcoming_events.append((ev, event_id))
 
-    # Отправка единого анонса со всеми ближайшими новостями
     if upcoming_events:
         lines = []
         for ev, event_id in upcoming_events:
@@ -426,11 +446,7 @@ async def on_message(message: discord.Message):
         
         if clean_prompt:
             async with message.channel.typing():
-                system_instructions = (
-                    "Ты — аналитик Smart Money Concepts (SMC), ICT и MSNR. "
-                    "Отвечай кратко, профессионально и по делу."
-                )
-                response = await ask_groq(clean_prompt, system_prompt=system_instructions)
+                response = await ask_groq(clean_prompt, system_prompt=SYSTEM_INSTRUCTIONS)
                 await message.reply(response[:1900], mention_author=True)
         return
 
@@ -481,13 +497,9 @@ async def cmd_news(ctx):
 
 @bot.command(name="ai")
 async def cmd_ai(ctx, *, query: str):
-    """Задать вопрос ИИ по торговле и SMC"""
+    """Задать вопрос ИИ по торговле, SMC и MSNR"""
     async with ctx.typing():
-        system_instructions = (
-            "Ты — аналитик Smart Money Concepts (SMC), ICT и MSNR. "
-            "Отвечай кратко, профессионально и по делу."
-        )
-        response = await ask_groq(query, system_prompt=system_instructions)
+        response = await ask_groq(query, system_prompt=SYSTEM_INSTRUCTIONS)
         await ctx.send(response[:1900])
 
 # ---------------------------------------------------------------------------
