@@ -29,15 +29,12 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 PORT = int(os.getenv("PORT", 10000))
 
-# Фиксированные ID веток Discord
 TARGET_NEWS_THREAD_ID = 1528319066513604688
 TARGET_EVENTS_THREAD_ID = 1528506824687485118
 AI_ALLOWED_THREAD_ID = 1502292137889501235  # Целевая ветка для вопросов ИИ
 
-# Временная зона МСК (UTC+3)
 MSK_TZ = timezone(timedelta(hours=3))
 
-# Карта флагов для валют/стран
 COUNTRY_FLAGS = {
     "USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "JPY": "🇯🇵",
     "AUD": "🇦🇺", "CAD": "🇨🇦", "CHF": "🇨🇭", "NZD": "🇳🇿",
@@ -58,7 +55,6 @@ if not DISCORD_TOKEN:
 
 groq_client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-# Кэш и трекинг отправленных алертов
 NEWS_CACHE = {"data": [], "last_fetch": 0}
 SENT_NEWS_ALERTS = set()
 SENT_DISCORD_EVENTS = set()
@@ -69,7 +65,7 @@ CACHE_TTL_SECONDS = 1800  # 30 минут
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
-intents.guild_scheduled_events = True  # Для отслеживания Discord Events
+intents.guild_scheduled_events = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
@@ -92,6 +88,17 @@ async def start_web_server():
 # ---------------------------------------------------------------------------
 # HELPER FUNCTIONS
 # ---------------------------------------------------------------------------
+async def get_target_channel(channel_id: int):
+    """Надежный поиск канала или ветки (с асинхронной подгрузкой при отсутствии в кэше)"""
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(channel_id)
+        except Exception as e:
+            logger.error(f"[CHANNEL FETCH ERROR] Не удалось найти канал {channel_id}: {e}")
+            return None
+    return channel
+
 def get_flag(currency: str) -> str:
     return COUNTRY_FLAGS.get(str(currency).upper(), "🌐")
 
@@ -197,9 +204,9 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
 
 @tasks.loop(minutes=1)
 async def check_30min_news_alerts():
-    """Алерт за 30 минут до HIGH новостей в ветку 1528319066513604688"""
+    """Сгруппированный алерт за 30 минут до HIGH новостей в Embed"""
     await bot.wait_until_ready()
-    thread = bot.get_channel(TARGET_NEWS_THREAD_ID)
+    thread = await get_target_channel(TARGET_NEWS_THREAD_ID)
     if not thread:
         return
 
@@ -207,9 +214,10 @@ async def check_30min_news_alerts():
     now_utc = datetime.now(timezone.utc)
     now_msk = now_utc.astimezone(MSK_TZ)
 
-    # Защита от ночных пингов: с 00:00 до 08:00 МСК без @everyone
     is_night_time = (0 <= now_msk.hour < 8)
 
+    upcoming_events = []
+    
     for ev in news:
         if ev.get("impact") != "HIGH" or not ev.get("dt_utc"):
             continue
@@ -219,29 +227,36 @@ async def check_30min_news_alerts():
         event_id = f"{ev['title']}_{dt_utc.isoformat()}"
 
         if 28 <= time_diff <= 31 and event_id not in SENT_NEWS_ALERTS:
+            upcoming_events.append((ev, event_id))
+
+    # Отправка единого анонса со всеми ближайшими новостями
+    if upcoming_events:
+        lines = []
+        for ev, event_id in upcoming_events:
             SENT_NEWS_ALERTS.add(event_id)
-            dt_msk = dt_utc.astimezone(MSK_TZ)
+            
+            dt_msk = ev["dt_utc"].astimezone(MSK_TZ)
             time_str = dt_msk.strftime("%H:%M")
             flag = get_flag(ev["country"])
-
-            embed = discord.Embed(
-                title="**Запланированное событие:**",
-                description=(
-                    f"{flag} **{ev['country']}** — {ev['title']}\n"
-                    f"🕘 {time_str}\n\n"
-                    f"-# ⌛️ Публикация через 30 минут"
-                ),
-                color=discord.Color.red()
-            )
             
-            content = "" if is_night_time else "@everyone"
-            await thread.send(content=content, embed=embed)
+            lines.append(f"{flag} **{ev['country']}** — {ev['title']} | 🕘 {time_str}")
+
+        description_text = "\n".join(lines) + "\n\n-# ⌛️ Публикация через 30 минут"
+
+        embed = discord.Embed(
+            title="**Запланированное событие:**" if len(upcoming_events) == 1 else "**Запланированные события:**",
+            description=description_text,
+            color=discord.Color.red()
+        )
+
+        content = "" if is_night_time else "@everyone"
+        await thread.send(content=content, embed=embed)
 
 @tasks.loop(minutes=2)
 async def check_discord_events_alerts():
-    """Алерт за 30 минут до мероприятий Discord в ветку 1528506824687485118"""
+    """Алерт за 30 минут до мероприятий Discord"""
     await bot.wait_until_ready()
-    thread = bot.get_channel(TARGET_EVENTS_THREAD_ID)
+    thread = await get_target_channel(TARGET_EVENTS_THREAD_ID)
     if not thread:
         return
 
@@ -276,7 +291,7 @@ async def check_discord_events_alerts():
 async def scheduled_news_digests():
     """Ежедневные и еженедельные дайджесты по МСК"""
     await bot.wait_until_ready()
-    thread = bot.get_channel(TARGET_NEWS_THREAD_ID)
+    thread = await get_target_channel(TARGET_NEWS_THREAD_ID)
     if not thread:
         return
 
@@ -285,13 +300,8 @@ async def scheduled_news_digests():
     if now_msk.hour == 8:
         news = await fetch_economic_news(force_refresh=True)
 
-        # 1. ЕЖЕНЕДЕЛЬНЫЙ ОТЧЕТ (Каждый Понедельник в 08:00 МСК)
+        # 1. ЕЖЕНЕДЕЛЬНЫЙ ОТЧЕТ (Понедельник)
         if now_msk.weekday() == 0:
-            embed = discord.Embed(
-                title="**Экономический календарь Forex на неделю:**",
-                color=discord.Color.blue()
-            )
-            
             grouped = {}
             for ev in news:
                 if not ev.get("dt_utc"):
@@ -308,23 +318,36 @@ async def scheduled_news_digests():
                 day_name = DAYS_RU[first_ev_msk.weekday()]
                 month_name = MONTHS_RU[first_ev_msk.month]
                 
-                lines.append(f"**📅 {day_name}, {first_ev_msk.day}, {month_name}**")
+                lines.append(f"\n**📅 {day_name}, {first_ev_msk.day}, {month_name}**")
 
                 for ev, ev_msk in grouped[day_date]:
                     flag = get_flag(ev["country"])
                     time_str = ev_msk.strftime("%H:%M")
                     impact_str = "🔴 **HIGH**" if ev["impact"] == "HIGH" else "🟠 **MEDIUM**"
 
-                    lines.append(f"\n{flag} **{ev['country']}** — {ev['title']}")
-                    lines.append(f"🕘 {time_str}")
-                    lines.append(f"{impact_str}")
+                    lines.append(f"{flag} **{ev['country']}** — {ev['title']} | 🕘 {time_str} | {impact_str}")
 
-                lines.append("")
+            current_text = ""
+            embeds_to_send = []
 
-            embed.description = "\n".join(lines) if lines else "Нет важных новостей на неделю."
-            await thread.send(embed=embed)
+            for line in lines:
+                if len(current_text) + len(line) + 1 > 3900:
+                    embeds_to_send.append(discord.Embed(description=current_text, color=discord.Color.blue()))
+                    current_text = line
+                else:
+                    current_text += "\n" + line if current_text else line
 
-        # 2. ЕЖЕДНЕВНЫЙ ОТЧЕТ (Каждый день в 08:00 МСК)
+            if current_text:
+                embeds_to_send.append(discord.Embed(description=current_text, color=discord.Color.blue()))
+
+            if embeds_to_send:
+                embeds_to_send[0].title = "**Экономический календарь Forex на неделю:**"
+                for emb in embeds_to_send:
+                    await thread.send(embed=emb)
+            else:
+                await thread.send(embed=discord.Embed(title="**Экономический календарь Forex на неделю:**", description="Нет важных новостей на неделю.", color=discord.Color.blue()))
+
+        # 2. ЕЖЕДНЕВНЫЙ ОТЧЕТ (Каждый день)
         today_date = now_msk.date()
         today_events = []
         for ev in news:
@@ -395,13 +418,10 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Игнорируем сообщения от самого бота
     if message.author == bot.user:
         return
 
-    # Проверяем, упомянули ли бота (@Legacy Bot) и находится ли сообщение в целевой ветке ИИ
     if bot.user in message.mentions and message.channel.id == AI_ALLOWED_THREAD_ID:
-        # Убираем упоминание бота из текста вопроса
         clean_prompt = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
         
         if clean_prompt:
@@ -414,13 +434,12 @@ async def on_message(message: discord.Message):
                 await message.reply(response[:1900], mention_author=True)
         return
 
-    # Обеспечиваем работу обычных команд (например, !news, !ai)
     await bot.process_commands(message)
 
 @bot.command(name="news")
 async def cmd_news(ctx):
-    """Вызов новостей вручную — публикация строго в ветку 1528319066513604688"""
-    thread = bot.get_channel(TARGET_NEWS_THREAD_ID)
+    """Вызов новостей вручную на СЕГОДНЯ"""
+    thread = await get_target_channel(TARGET_NEWS_THREAD_ID)
     if not thread:
         await ctx.send("❌ Целевая ветка для новостей не найдена.")
         return
@@ -428,6 +447,15 @@ async def cmd_news(ctx):
     async with ctx.typing():
         news = await fetch_economic_news()
         now_msk = datetime.now(MSK_TZ)
+        today_date = now_msk.date()
+
+        today_events = []
+        for ev in news:
+            if not ev.get("dt_utc"):
+                continue
+            ev_msk = ev["dt_utc"].astimezone(MSK_TZ)
+            if ev_msk.date() == today_date:
+                today_events.append((ev, ev_msk))
 
         embed = discord.Embed(
             title="**Ежедневный экономический календарь Forex**",
@@ -437,10 +465,7 @@ async def cmd_news(ctx):
         day_name = DAYS_RU[now_msk.weekday()]
         lines = [f"📅 *Запланированные события: {day_name}, {now_msk.strftime('%d.%m')}*"]
 
-        for ev in news[:10]:
-            if not ev.get("dt_utc"):
-                continue
-            ev_msk = ev["dt_utc"].astimezone(MSK_TZ)
+        for ev, ev_msk in today_events:
             flag = get_flag(ev["country"])
             time_str = ev_msk.strftime("%H:%M")
             impact_str = "🔴 **HIGH**" if ev["impact"] == "HIGH" else "🟠 **MEDIUM**"
@@ -448,8 +473,9 @@ async def cmd_news(ctx):
             lines.append(f"\n🕘 {time_str} | {flag} **{ev['country']}** — {ev['title']}")
             lines.append(f"{impact_str}")
 
-        embed.description = "\n".join(lines)
+        embed.description = "\n".join(lines) if len(lines) > 1 else "На сегодня важных новостей больше нет."
         await thread.send(embed=embed)
+        
         if ctx.channel.id != TARGET_NEWS_THREAD_ID:
             await ctx.send(f"✅ Новости опубликованы в ветку <#{TARGET_NEWS_THREAD_ID}>")
 
