@@ -177,13 +177,26 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
                 async_requests.get, 
                 url, 
                 impersonate="chrome120", 
-                timeout=12,
-                headers={"Accept": "application/json, text/xml"}
+                timeout=15,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.8",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                }
             )
+            
             if r.status_code == 200:
+                if "<html" in r.text.lower() or "<!doctype html" in r.text.lower():
+                    logger.warning(f"[NEWS API] Cloudflare перехватил запрос к {url}. Пропускаем истоник.")
+                    continue
+
                 parsed = []
                 if "json" in stype:
-                    data = r.json()
+                    try:
+                        data = r.json()
+                    except Exception as json_err:
+                        logger.error(f"[NEWS API] Ошибка парсинга JSON с {url}: {json_err}")
+                        continue
+
                     for item in data:
                         imp = str(item.get("impact", "")).upper()
                         impact_level = None
