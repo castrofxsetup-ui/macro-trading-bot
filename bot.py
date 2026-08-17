@@ -27,6 +27,7 @@ logger = logging.getLogger("LegacyBot")
 # ---------------------------------------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 PROXY_URL = os.getenv("PROXY_URL")
 PORT = int(os.getenv("PORT", 10000))
 
@@ -438,7 +439,7 @@ async def on_message(message: discord.Message):
             async with message.channel.typing():
                 try:
                     completion = await groq_client.chat.completions.create(
-                        model="llama-3.1-8b-instant",
+                        model=GROQ_MODEL,
                         messages=[
                             {"role": "system", "content": SYSTEM_INSTRUCTIONS},
                             {"role": "user", "content": clean_prompt}
@@ -506,7 +507,7 @@ async def cmd_ai(ctx, *, query: str):
     async with ctx.typing():
         try:
             completion = await groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",
+                model=GROQ_MODEL,
                 messages=[
                     {"role": "system", "content": SYSTEM_INSTRUCTIONS},
                     {"role": "user", "content": query}
