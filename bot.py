@@ -31,6 +31,14 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 PROXY_URL = os.getenv("PROXY_URL")
 PORT = int(os.getenv("PORT", 10000))
 
+# Список запасных моделей, если основная возвращает 404/400
+FALLBACK_MODELS = [
+    GROQ_MODEL,
+    "llama-3.1-70b-versatile",
+    "llama3-8b-8192",
+    "mixtral-8x7b-32768"
+]
+
 # ID целевых веток Discord
 TARGET_NEWS_THREAD_ID = 1528319066513604688
 TARGET_EVENTS_THREAD_ID = 1528506824687485118
@@ -82,6 +90,39 @@ SYSTEM_INSTRUCTIONS = (
     "1. Распознавай запросы про MSNR, Alchemist, Malaysian SnR в любом регистре и формате.\n"
     "2. Отвечай кратко, структурировано, профессионально и по делу."
 )
+
+# ---------------------------------------------------------------------------
+# GROQ HELPER WITH FALLBACK
+# ---------------------------------------------------------------------------
+async def query_groq_ai(prompt: str) -> str:
+    if not groq_client:
+        return "⚠️ GROQ API ключ не настроен."
+
+    # Удаляем дубликаты сохраняя порядок
+    models_to_try = []
+    for m in FALLBACK_MODELS:
+        if m not in models_to_try:
+            models_to_try.append(m)
+
+    last_error = None
+    for model_name in models_to_try:
+        try:
+            completion = await groq_client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": SYSTEM_INSTRUCTIONS},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.5,
+                max_tokens=1000
+            )
+            return completion.choices[0].message.content[:1900]
+        except Exception as e:
+            last_error = e
+            logger.warning(f"[GROQ RETRY] Модель {model_name} недоступна: {e}. Пробуем следующую...")
+
+    logger.error(f"[GROQ ERROR] Все модели завершились ошибкой. Последняя: {last_error}")
+    return "❌ Ошибка генерации ответа ИИ. Все доступные модели Groq временно недоступны."
 
 # ---------------------------------------------------------------------------
 # INITIALIZE DISCORD BOT (WITH PROXY SUPPORT)
@@ -430,27 +471,11 @@ async def on_message(message: discord.Message):
 
     # Вопросы к ИИ в специальном канале
     if bot.user in message.mentions and message.channel.id == AI_ALLOWED_THREAD_ID:
-        if not groq_client:
-            await message.reply("⚠️ GROQ API ключ не настроен.")
-            return
-
         clean_prompt = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
         if clean_prompt:
             async with message.channel.typing():
-                try:
-                    completion = await groq_client.chat.completions.create(
-                        model=GROQ_MODEL,
-                        messages=[
-                            {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-                            {"role": "user", "content": clean_prompt}
-                        ],
-                        temperature=0.5,
-                        max_tokens=1000
-                    )
-                    await message.reply(completion.choices[0].message.content[:1900], mention_author=True)
-                except Exception as e:
-                    logger.error(f"Groq error: {e}")
-                    await message.reply("❌ Ошибка генерации ответа ИИ.")
+                response_text = await query_groq_ai(clean_prompt)
+                await message.reply(response_text, mention_author=True)
         return
 
     await bot.process_commands(message)
@@ -501,24 +526,9 @@ async def cmd_news(ctx):
 @bot.command(name="ai")
 async def cmd_ai(ctx, *, query: str):
     """Задать вопрос ИИ по торговле, SMC и MSNR"""
-    if not groq_client:
-        await ctx.send("⚠️ GROQ API ключ не настроен.")
-        return
     async with ctx.typing():
-        try:
-            completion = await groq_client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-                    {"role": "user", "content": query}
-                ],
-                temperature=0.5,
-                max_tokens=1000
-            )
-            await ctx.send(completion.choices[0].message.content[:1900])
-        except Exception as e:
-            logger.error(f"Groq error: {e}")
-            await ctx.send("❌ Ошибка генерации ответа ИИ.")
+        response_text = await query_groq_ai(query)
+        await ctx.send(response_text)
 
 # ---------------------------------------------------------------------------
 # MAIN EXECUTION WITH AUTO-RECONNECT
