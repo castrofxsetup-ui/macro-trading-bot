@@ -27,16 +27,17 @@ logger = logging.getLogger("LegacyBot")
 # ---------------------------------------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 PROXY_URL = os.getenv("PROXY_URL")
 PORT = int(os.getenv("PORT", 10000))
 
-# Список запасных моделей, если основная возвращает 404/400
+# Актуальный список рабочих моделей Groq на случай отвала основной
 FALLBACK_MODELS = [
     GROQ_MODEL,
-    "llama-3.1-70b-versatile",
-    "llama3-8b-8192",
-    "mixtral-8x7b-32768"
+    "llama-3.1-8b-instant",
+    "llama-3.3-70b-specdec",
+    "llama-3.2-3b-preview",
+    "qwen-2.5-coder-32b"
 ]
 
 # ID целевых веток Discord
@@ -418,7 +419,7 @@ async def scheduled_news_digests():
             if embeds_to_send:
                 embeds_to_send[0].title = "**Экономический календарь Forex на неделю:**"
                 for emb in embeds_to_send:
-                    await thread.send(embed=emb)
+                    await thread.send(emb=emb)
 
         # 2. ЕЖЕДНЕВНЫЙ ОТЧЕТ
         today_date = now_msk.date()
