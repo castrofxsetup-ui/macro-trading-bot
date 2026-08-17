@@ -438,7 +438,7 @@ async def on_message(message: discord.Message):
             async with message.channel.typing():
                 try:
                     completion = await groq_client.chat.completions.create(
-                        model="llama-3.3-70b-versatile",
+                        model="llama3-70b-8192",
                         messages=[
                             {"role": "system", "content": SYSTEM_INSTRUCTIONS},
                             {"role": "user", "content": clean_prompt}
@@ -506,7 +506,7 @@ async def cmd_ai(ctx, *, query: str):
     async with ctx.typing():
         try:
             completion = await groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model="llama3-70b-8192",
                 messages=[
                     {"role": "system", "content": SYSTEM_INSTRUCTIONS},
                     {"role": "user", "content": query}
