@@ -190,7 +190,7 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
             
             if r.status_code == 200:
                 if "<html" in r.text.lower() or "<!doctype html" in r.text.lower():
-                    logger.warning(f"[NEWS API] Cloudflare перехватил запрос к {url}. Пропускаем истоник.")
+                    logger.warning(f"[NEWS API] Cloudflare перехватил запрос к {url}. Пропускаем источник.")
                     continue
 
                 parsed = []
@@ -438,7 +438,7 @@ async def on_message(message: discord.Message):
             async with message.channel.typing():
                 try:
                     completion = await groq_client.chat.completions.create(
-                        model="llama3-70b-8192",
+                        model="llama-3.1-8b-instant",
                         messages=[
                             {"role": "system", "content": SYSTEM_INSTRUCTIONS},
                             {"role": "user", "content": clean_prompt}
@@ -506,7 +506,7 @@ async def cmd_ai(ctx, *, query: str):
     async with ctx.typing():
         try:
             completion = await groq_client.chat.completions.create(
-                model="llama3-70b-8192",
+                model="llama-3.1-8b-instant",
                 messages=[
                     {"role": "system", "content": SYSTEM_INSTRUCTIONS},
                     {"role": "user", "content": query}
