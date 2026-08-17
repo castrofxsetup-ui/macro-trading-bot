@@ -27,18 +27,9 @@ logger = logging.getLogger("LegacyBot")
 # ---------------------------------------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 PROXY_URL = os.getenv("PROXY_URL")
 PORT = int(os.getenv("PORT", 10000))
-
-# Актуальный список рабочих моделей Groq на случай отвала основной
-FALLBACK_MODELS = [
-    GROQ_MODEL,
-    "llama-3.1-8b-instant",
-    "llama-3.3-70b-specdec",
-    "llama-3.2-3b-preview",
-    "qwen-2.5-coder-32b"
-]
 
 # ID целевых веток Discord
 TARGET_NEWS_THREAD_ID = 1528319066513604688
@@ -93,17 +84,29 @@ SYSTEM_INSTRUCTIONS = (
 )
 
 # ---------------------------------------------------------------------------
-# GROQ HELPER WITH FALLBACK
+# GROQ HELPER WITH DYNAMIC MODEL FETCHING & FALLBACK
 # ---------------------------------------------------------------------------
 async def query_groq_ai(prompt: str) -> str:
     if not groq_client:
         return "⚠️ GROQ API ключ не настроен."
 
-    # Удаляем дубликаты сохраняя порядок
-    models_to_try = []
-    for m in FALLBACK_MODELS:
-        if m not in models_to_try:
-            models_to_try.append(m)
+    models_to_try = [GROQ_MODEL]
+
+    # Динамически получаем список реально доступных моделей аккаунта
+    try:
+        available_models_resp = await groq_client.models.list()
+        dynamic_models = [m.id for m in available_models_resp.data if getattr(m, 'active', True)]
+        for dm in dynamic_models:
+            if dm not in models_to_try:
+                models_to_try.append(dm)
+    except Exception as fetch_err:
+        logger.warning(f"[GROQ LIST] Не удалось автоматически получить список моделей: {fetch_err}")
+
+    # Запасной статический список
+    fallback_static = ["llama-3.3-70b-versatile", "llama3-70b-8192", "llama-3.1-8b-instant"]
+    for sm in fallback_static:
+        if sm not in models_to_try:
+            models_to_try.append(sm)
 
     last_error = None
     for model_name in models_to_try:
@@ -419,7 +422,7 @@ async def scheduled_news_digests():
             if embeds_to_send:
                 embeds_to_send[0].title = "**Экономический календарь Forex на неделю:**"
                 for emb in embeds_to_send:
-                    await thread.send(emb=emb)
+                    await thread.send(embed=emb)
 
         # 2. ЕЖЕДНЕВНЫЙ ОТЧЕТ
         today_date = now_msk.date()
