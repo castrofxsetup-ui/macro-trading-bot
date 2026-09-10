@@ -122,8 +122,8 @@ async def get_live_market_prices() -> str:
     if not prices:
         return "Текущие рыночные котировки временно недоступны. Используй имеющиеся ориентиры и попроси пользователя уточнить TF."
 
-    now_utc_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    return f"РЕАЛЬНЫЕ ТЕКУЩИЕ РЫНОЧНЫЕ КОТИРОВКИ ({now_utc_str}):\n" + "\n".join(prices)
+    now_msk_str = datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M:%S МСК")
+    return f"РЕАЛЬНЫЕ ТЕКУЩИЕ РЫНОЧНЫЕ КОТИРОВКИ ({now_msk_str}):\n" + "\n".join(prices)
 
 # ---------------------------------------------------------------------------
 # GROQ HELPER WITH DYNAMIC MODEL FETCHING & FALLBACK
