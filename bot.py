@@ -64,27 +64,66 @@ SENT_DISCORD_EVENTS = set()
 CACHE_TTL_SECONDS = 1800  # 30 минут
 
 # ---------------------------------------------------------------------------
-# SYSTEM PROMPT FOR AI (ALCHEMIST MSNR & SMC)
+# SYSTEM PROMPT FOR AI (PURE ALCHEMIST MSNR)
 # ---------------------------------------------------------------------------
 SYSTEM_INSTRUCTIONS = (
-    "Ты — главный аналитик и практикующий эксперт по торговой концепции Alchemist MSNR (Malaysian Support & Resistance) "
-    "и Smart Money Concepts (SMC/ICT).\n\n"
-    "ТВОЯ ЦЕЛЬ И ЗАДАЧА:\n"
-    "Давать полные, подробные, исчерпывающие и профессиональные разборы торговых активов (XAU/USD, BTC, ETH, Forex и др.) "
-    "по запросам пользователей. Никогда не отказывай в анализе уровней, сценариев или концепций.\n\n"
-    "ФУНДАМЕНТАЛЬНЫЕ ПРИНЦИПЫ ALCHEMIST MSNR & SMC:\n"
-    "1. FRESH LEVELS (Свежие уровни): Ключевые свечные уровни поддержки/сопротивления, которые ещё не тестировались телом или тенью. "
-    "Разбирай, когда Fresh Level валиден, а когда происходит его отмена (Breakout/Invalidation/Tested).\n"
-    "2. OVERLAP & GAP: Использование свечных разрывов (Gap) и перекрытий (Overlap) на младших/старших TF для точных точечных входов (Sniper Entries).\n"
-    "3. MAJOR / MINOR SnR: Отличие глобальных реакционных зон от локальных промежуточных уровней.\n"
-    "4. ВЗАИМОДЕЙСТВИЕ С SMC: Сочетание MSNR со структурой рынка (BOS, CHoCH), Order Block (OB), Fair Value Gap (FVG) и снятием ликвидности (Liquidity Sweep).\n"
-    "5. ОТМЕНА СЦЕНАРИЯ (Invalidation): Чёткое объяснение условий, при которых Fresh Level теряет силу или считается пробитым.\n\n"
-    "ПРАВИЛА ОТВЕТА:\n"
-    "- Если пользователь просит разбор (например, по Gold / XAUUSD, Bitcoin или другим активам), подробно распиши свечную логику MSNR, "
-    "работу с Fresh уровнями, возможные реакционные зоны, условия подтверждения и условия отмены сетапа.\n"
-    "- Общайся профессиональным языком трейдера, используй понятную терминологию MSNR / SMC.\n"
-    "- MSNR в этом контексте — это исключительно Malaysian SnR, а не какие-либо сторонние корпорации."
+    "Ты — ведущий аналитик и эксперт, работающий ИСКЛЮЧИТЕЛЬНО по авторской торговой концепции Alchemist MSNR (Malaysian Support & Resistance).\n\n"
+    "СТРОГИЕ ПРАВИЛА И ОГРАНИЧЕНИЯ:\n"
+    "1. ТОЛЬКО ЧИСТЫЙ ALCHEMIST MSNR: Запрещено использовать или подмешивать любые сторонние концепции (Smart Money Concepts/SMC, ICT, классический тех. анализ, индикаторы и т.д.). Твой анализ базируется ТОЛЬКО на свечной логике Malaysian SnR.\n"
+    "2. АКТУАЛЬНЫЕ РЫНОЧНЫЕ ДАННЫЕ: Тебе передаются СВЕЖИЕ РЕАЛЬНЫЕ КОТИРОВКИ АКТИВОВ в блоке контекста. Ты ОБЯЗАН строить весь анализ, разбор уровней, сценарии и текущую цену строго на основе предоставленных свежих данных. Не выдумывай случайные старые цены.\n"
+    "3. КЛЮЧЕВЫЕ ЭЛЕМЕНТЫ ALCHEMIST MSNR:\n"
+    "   - Fresh Levels (Свежие уровни): Уровни поддержки/сопротивления, сформированные свечной моделью, которые ещё не тестировались ни телом, ни тенью.\n"
+    "   - Invalidation (Отмена уровня/сетапа): Четкое объяснение, когда уровень считается проверенным (Tested), пробитым (Breakout) или недействительным.\n"
+    "   - Gap & Overlap: Свечные разрывы и перекрытия для поиска точечных реакционных зон (Sniper Entries).\n"
+    "   - Major vs Minor SnR: Разграничение глобальных институциональных зон и локальных промежуточных уровней.\n"
+    "4. ФОРМАТ ОТВЕТА: Давай исчерпывающий, профессиональный разбор. Указывай текущую реальную цену актива, выделяй ключевые Fresh Levels выше и ниже текущей цены, прописывай сценарий работы и четкие условия отмены (Invalidation) сетапа."
 )
+
+# ---------------------------------------------------------------------------
+# LIVE MARKET PRICES FETCHING
+# ---------------------------------------------------------------------------
+async def get_live_market_prices() -> str:
+    """Получение актуальных рыночных цен (Crypto + Gold/Forex) для передачи в ИИ"""
+    prices = []
+    
+    # 1. Запрос криптовалют (BTC, ETH)
+    try:
+        r_crypto = await asyncio.to_thread(
+            async_requests.get,
+            "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd",
+            timeout=5
+        )
+        if r_crypto.status_code == 200:
+            c_data = r_crypto.json()
+            if "bitcoin" in c_data:
+                prices.append(f"Bitcoin (BTC/USD): ${c_data['bitcoin']['usd']:,.2f}")
+            if "ethereum" in c_data:
+                prices.append(f"Ethereum (ETH/USD): ${c_data['ethereum']['usd']:,.2f}")
+    except Exception as e:
+        logger.warning(f"[PRICE FETCH] Ошибка получения крипто-цен: {e}")
+
+    # 2. Запрос Золота (XAU/USD) через Yahoo Finance
+    try:
+        r_forex = await asyncio.to_thread(
+            async_requests.get,
+            "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1m",
+            timeout=5,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        if r_forex.status_code == 200:
+            f_data = r_forex.json()
+            meta = f_data.get("chart", {}).get("result", [{}])[0].get("meta", {})
+            gold_price = meta.get("regularMarketPrice")
+            if gold_price:
+                prices.append(f"Gold (XAU/USD): ${gold_price:,.2f}")
+    except Exception as e:
+        logger.warning(f"[PRICE FETCH] Ошибка получения цены на золото: {e}")
+
+    if not prices:
+        return "Текущие рыночные котировки временно недоступны. Используй имеющиеся ориентиры и попроси пользователя уточнить TF."
+
+    now_utc_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return f"РЕАЛЬНЫЕ ТЕКУЩИЕ РЫНОЧНЫЕ КОТИРОВКИ ({now_utc_str}):\n" + "\n".join(prices)
 
 # ---------------------------------------------------------------------------
 # GROQ HELPER WITH DYNAMIC MODEL FETCHING & FALLBACK
@@ -92,6 +131,10 @@ SYSTEM_INSTRUCTIONS = (
 async def query_groq_ai(prompt: str) -> str:
     if not groq_client:
         return "⚠️ GROQ API ключ не настроен."
+
+    # Получаем актуальные котировки рынка
+    live_prices_context = await get_live_market_prices()
+    full_prompt = f"{live_prices_context}\n\nЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{prompt}"
 
     models_to_try = [GROQ_MODEL]
 
@@ -118,9 +161,9 @@ async def query_groq_ai(prompt: str) -> str:
                 model=model_name,
                 messages=[
                     {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-                    {"role": "user", "content": prompt}
+                    {"role": "user", "content": full_prompt}
                 ],
-                temperature=0.6,
+                temperature=0.5,
                 max_tokens=1800
             )
             return completion.choices[0].message.content[:1900]
@@ -532,7 +575,7 @@ async def cmd_news(ctx):
 
 @bot.command(name="ai")
 async def cmd_ai(ctx, *, query: str):
-    """Задать вопрос ИИ по торговле, SMC и MSNR"""
+    """Задать вопрос ИИ по торговле и MSNR Alchemist"""
     async with ctx.typing():
         response_text = await query_groq_ai(query)
         await ctx.send(response_text)
