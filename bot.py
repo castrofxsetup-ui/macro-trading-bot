@@ -64,23 +64,29 @@ USER_XP = {}
 # Отслеживание топ-3 лидеров и параметров антиспама обгонов
 LAST_TOP_THREE = []
 LAST_OVERTAKE_TIME = 0
-GLOBAL_OVERTAKE_COOLDOWN = 180  # Общий кулдаун между любыми анонсами обгона (3 минуты)
+GLOBAL_OVERTAKE_COOLDOWN = 180  # Общий кулдаун (3 минуты)
 
 LAST_OVERTAKE_PAIR = (None, None)  # (Кто обогнал, Кого обогнали)
 PAIR_OVERTAKE_TIME = 0
-PAIR_OVERTAKE_COOLDOWN = 300  # Кулдаун для конкретной пары участников (5 минут)
+PAIR_OVERTAKE_COOLDOWN = 300  # Кулдаун для конкретной пары (5 минут)
 
 # ---------------------------------------------------------------------------
-# INITIALIZE DISCORD BOT
+# INITIALIZE DISCORD BOT (WITH PROXY CONNECTOR)
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guild_scheduled_events = True
 intents.members = True
 
+# Создаем SOCKS5 коннектор прокси для бота сразу на старте
+connector = ProxyConnector.from_url(PROXY_URL) if PROXY_URL else None
+if PROXY_URL:
+    logger.info("🔒 SOCKS5 прокси успешно привязан к коннектору бота.")
+
 bot = commands.Bot(
     command_prefix="!",
-    intents=intents
+    intents=intents,
+    connector=connector
 )
 
 # ---------------------------------------------------------------------------
@@ -421,7 +427,7 @@ async def on_message(message: discord.Message):
     if LAST_TOP_THREE and current_top_three != LAST_TOP_THREE:
         now = time.time()
         
-        # 1. Общий кулдаун уведомлений (не чаще чем раз в 3 минуты)
+        # 1. Общий кулдаун уведомлений (не чаще чем раз в 3 минуты / 180 сек)
         if now - LAST_OVERTAKE_TIME >= GLOBAL_OVERTAKE_COOLDOWN:
             overtaker_id = author_id
             if overtaker_id in current_top_three:
@@ -438,7 +444,7 @@ async def on_message(message: discord.Message):
                 if overtaken_id and overtaken_id != overtaker_id:
                     current_pair = (overtaker_id, overtaken_id)
 
-                    # 2. Проверка антиспама для той же пары (не чаще чем раз в 5 минут для одних и тех же людей)
+                    # 2. Антиспам для конкретной пары (не чаще чем раз в 5 минут / 300 сек между одними и теми же людьми)
                     if current_pair != LAST_OVERTAKE_PAIR or (now - PAIR_OVERTAKE_TIME >= PAIR_OVERTAKE_COOLDOWN):
                         overtaker_member = message.guild.get_member(overtaker_id)
                         overtaken_member = message.guild.get_member(overtaken_id)
@@ -461,7 +467,6 @@ async def on_message(message: discord.Message):
                         
                         await message.channel.send(embed=embed)
                         
-                        # Обновляем временные метки и текущую пару
                         LAST_OVERTAKE_TIME = now
                         LAST_OVERTAKE_PAIR = current_pair
                         PAIR_OVERTAKE_TIME = now
@@ -601,14 +606,9 @@ async def cmd_news(ctx):
 async def main():
     await start_web_server()
     
-    if PROXY_URL:
-        connector = ProxyConnector.from_url(PROXY_URL)
-        bot._connection.connector = connector
-        logger.info("🔒 SOCKS5 прокси успешно подключен к коннектору бота.")
-
     while True:
         try:
-            logger.info("⚡️ Попытка подключения к Discord...")
+            logger.info("⚡️ Попытка подключения к Discord через SOCKS5 прокси...")
             await bot.start(DISCORD_TOKEN)
         except discord.errors.HTTPException as e:
             if e.status == 429 or "1015" in str(e):
