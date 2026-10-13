@@ -11,7 +11,6 @@ from aiohttp import web
 import discord
 from discord.ext import commands, tasks
 from curl_cffi import requests as async_requests
-from groq import AsyncGroq
 from aiohttp_socks import ProxyConnector
 
 # ---------------------------------------------------------------------------
@@ -27,15 +26,12 @@ logger = logging.getLogger("LegacyBot")
 # CONFIGURATION & ENVIRONMENT VARIABLES
 # ---------------------------------------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 PROXY_URL = os.getenv("PROXY_URL")
 PORT = int(os.getenv("PORT", 10000))
 
 # ID целевых веток Discord
 TARGET_NEWS_THREAD_ID = 1528319066513604688
 TARGET_EVENTS_THREAD_ID = 1528506824687485118
-AI_ALLOWED_THREAD_ID = 1502292137889501235
 
 MSK_TZ = timezone(timedelta(hours=3))
 
@@ -57,8 +53,6 @@ if not DISCORD_TOKEN:
     logger.critical("❌ Ошибка: Переменная окружения DISCORD_TOKEN не найдена!")
     sys.exit(1)
 
-groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-
 NEWS_CACHE = {"data": [], "last_fetch": 0}
 SENT_NEWS_ALERTS = set()
 SENT_DISCORD_EVENTS = set()
@@ -67,91 +61,10 @@ CACHE_TTL_SECONDS = 1800  # 30 минут
 # База данных активности в памяти (User ID -> XP)
 USER_XP = {}
 
-# ---------------------------------------------------------------------------
-# SYSTEM PROMPT FOR AI (PURE ALCHEMIST MSNR)
-# ---------------------------------------------------------------------------
-SYSTEM_INSTRUCTIONS = (
-    "Ты — профессиональный эксперт и аналитик рынка, работающий ИСКЛЮЧИТЕЛЬНО по авторской торговой концепции Alchemist MSNR (Malaysian Support & Resistance).\n\n"
-    "ПРАВИЛА И ОГРАНИЧЕНИЯ ОТВЕТА:\n"
-    "1. ВСЕГДА ОТВЕЧАЙ ПО СУЩЕСТВУ: Общайся вежливо, грамотно, аргументированно и конструктивно. Избегай бессмысленных повторений слов и сломанных терминов (только XAU/USD, Золото, BTC, ETH).\n"
-    "2. ТОЛЬКО ALCHEMIST MSNR: Запрещено использовать SMC, ICT, индикаторы и классический тех.анализ. Используй строго терминологию Malaysian SnR (Fresh Levels, Tested Levels, Gap & Overlap, Breakout, Major/Minor SnR).\n"
-    "3. ИСПОЛЬЗУЙ АКТУАЛЬНЫЕ ДАННЫЕ: В каждом запросе тебе передаются свежие котировки. Строишь анализ и даешь ответы только на их основе.\n"
-    "4. ЛОГИКА И АРГУМЕНТАЦИЯ: На любой вопрос пользователя делай четкий разбор: указывай текущую цену, реакционные зоны, условия входа и отмены (Invalidation) сетапа."
-)
-
-# ---------------------------------------------------------------------------
-# LIVE MARKET PRICES FETCHING
-# ---------------------------------------------------------------------------
-async def get_live_market_prices() -> str:
-    prices = []
-    try:
-        r_crypto = await asyncio.to_thread(
-            async_requests.get,
-            "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum&vs_currencies=usd",
-            timeout=5
-        )
-        if r_crypto.status_code == 200:
-            c_data = r_crypto.json()
-            if "bitcoin" in c_data:
-                prices.append(f"Bitcoin (BTC/USD): ${c_data['bitcoin']['usd']:,.2f}")
-            if "ethereum" in c_data:
-                prices.append(f"Ethereum (ETH/USD): ${c_data['ethereum']['usd']:,.2f}")
-    except Exception as e:
-        logger.warning(f"[PRICE FETCH] Ошибка получения крипто-цен: {e}")
-
-    try:
-        r_forex = await asyncio.to_thread(
-            async_requests.get,
-            "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1m",
-            timeout=5,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-        if r_forex.status_code == 200:
-            f_data = r_forex.json()
-            meta = f_data.get("chart", {}).get("result", [{}])[0].get("meta", {})
-            gold_price = meta.get("regularMarketPrice")
-            if gold_price:
-                prices.append(f"Gold (XAU/USD): ${gold_price:,.2f}")
-    except Exception as e:
-        logger.warning(f"[PRICE FETCH] Ошибка получения цены на золото: {e}")
-
-    if not prices:
-        return "Текущие рыночные котировки временно недоступны."
-
-    now_msk_str = datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M:%S МСК")
-    return f"РЕАЛЬНЫЕ ТЕКУЩИЕ РЫНОЧНЫЕ КОТИРОВКИ ({now_msk_str}):\n" + "\n".join(prices)
-
-# ---------------------------------------------------------------------------
-# GROQ HELPER
-# ---------------------------------------------------------------------------
-async def query_groq_ai(prompt: str) -> str:
-    if not groq_client:
-        return "⚠️ GROQ API ключ не настроен."
-
-    live_prices_context = await get_live_market_prices()
-    full_prompt = f"{live_prices_context}\n\nВопрос пользователя: {prompt}\n\nДай конструктивный и аргументированный ответ по Alchemist MSNR:"
-
-    models_to_try = [GROQ_MODEL, "llama-3.3-70b-versatile", "llama3-70b-8192", "llama-3.1-8b-instant"]
-
-    for model_name in models_to_try:
-        try:
-            completion = await groq_client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": SYSTEM_INSTRUCTIONS},
-                    {"role": "user", "content": full_prompt}
-                ],
-                temperature=0.3,
-                max_tokens=1500,
-                stop=["УРОСТАТЕЛЫ", "УРОСТАТЕ"]
-            )
-            res_text = completion.choices[0].message.content.strip()
-            if res_text:
-                return res_text[:1900]
-        except Exception as e:
-            logger.warning(f"[GROQ RETRY] Модель {model_name} ошибка: {e}")
-
-    return "❌ Ошибка генерации ответа ИИ. Попробуйте сформулировать вопрос иначе."
+# Отслеживание топ-3 лидеров и кулдауна уведомлений об обгоне
+LAST_TOP_THREE = []  # Список ID участников [1-е место, 2-е место, 3-е место]
+LAST_OVERTAKE_TIME = 0  # Timestamp последнего анонса обгона
+OVERTAKE_COOLDOWN_SECONDS = 3600  # 1 час между уведомлениями
 
 # ---------------------------------------------------------------------------
 # INITIALIZE DISCORD BOT
@@ -472,7 +385,7 @@ async def scheduled_news_digests():
         await thread.send(embed=embed)
 
 # ---------------------------------------------------------------------------
-# AUTO-ROLE & ACTIVITY & LEADERBOARD SYSTEM
+# AUTO-ROLE & ACTIVITY (JUNIPER-LIKE) & LEADERBOARD SYSTEM
 # ---------------------------------------------------------------------------
 
 @bot.event
@@ -488,185 +401,52 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_message(message: discord.Message):
+    global LAST_TOP_THREE, LAST_OVERTAKE_TIME
+
     if message.author.bot or not message.guild:
         return
 
-    # Начисление XP за каждое сообщение
+    # Подсчет активности (XP за сообщения)
     author_id = message.author.id
     USER_XP[author_id] = USER_XP.get(author_id, 0) + 5
 
-    # Вопросы к ИИ в специальном канале
-    if bot.user in message.mentions and message.channel.id == AI_ALLOWED_THREAD_ID:
-        clean_prompt = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
-        if clean_prompt:
-            async with message.channel.typing():
-                response_text = await query_groq_ai(clean_prompt)
-                await message.reply(response_text, mention_author=True)
-        return
-
-    await bot.process_commands(message)
-
-# Команда проверки личного ранга
-@bot.command(name="rank", aliases=["level", "активность"])
-async def cmd_rank(ctx):
-    xp = USER_XP.get(ctx.author.id, 0)
-    embed = discord.Embed(
-        title="📊 Статистика активности",
-        description=f"Участник: {ctx.author.mention}\n⚡️ Накоплено опыта (XP): **{xp}**",
-        color=discord.Color.blue()
-    )
-    await ctx.send(embed=embed)
-
-# Команда вывода таблицы лидеров (рейтинг всех активных участников)
-@bot.command(name="leaderboard", aliases=["top", "топ", "рейтинг"])
-async def cmd_leaderboard(ctx):
-    """Показывает рейтинг самых активных участников сервера по XP"""
-    if not USER_XP:
-        await ctx.send("📉 База активности пока пуста. Участники еще не отправляли сообщения.")
-        return
-
-    # Сортируем пользователей по убыванию опыта (XP)
+    # Проверка изменения позиций в топ-3
     sorted_users = sorted(USER_XP.items(), key=lambda item: item[1], reverse=True)
+    current_top_three = [u_id for u_id, _ in sorted_users[:3]]
 
-    lines = []
-    medals = ["🥇", "🥈", "🥉"]
+    # Если прошлый топ был заполнен и произошла смена позиций среди первых 3 мест
+    if LAST_TOP_THREE and current_top_three != LAST_TOP_THREE:
+        now = time.time()
+        # Проверяем, прошел ли 1 час с прошлого анонса
+        if now - LAST_OVERTAKE_TIME >= OVERTAKE_COOLDOWN_SECONDS:
+            # Находим пользователя, который поднялся выше
+            overtaker_id = author_id
+            if overtaker_id in current_top_three:
+                new_pos = current_top_three.index(overtaker_id) + 1
+                
+                # Проверяем, кто потерял позицию
+                overtaken_id = None
+                if overtaker_id in LAST_TOP_THREE:
+                    old_pos = LAST_TOP_THREE.index(overtaker_id)
+                    if new_pos - 1 < old_pos:
+                        overtaken_id = LAST_TOP_THREE[new_pos - 1]
+                else:
+                    overtaken_id = LAST_TOP_THREE[-1]
 
-    for idx, (user_id, xp) in enumerate(sorted_users[:10], start=1):  # Топ-10 участников
-        user = ctx.guild.get_member(user_id)
-        name = user.mention if user else f"Пользователь (ID: {user_id})"
-        prefix = medals[idx - 1] if idx <= 3 else f"**{idx}.**"
-        lines.append(f"{prefix} {name} — **{xp} XP**")
+                if overtaken_id and overtaken_id != overtaker_id:
+                    overtaker_member = message.guild.get_member(overtaker_id)
+                    overtaken_member = message.guild.get_member(overtaken_id)
 
-    embed = discord.Embed(
-        title="🏆 Рейтинг активности участников",
-        description="\n".join(lines),
-        color=discord.Color.gold()
-    )
-    embed.set_footer(text="Активность начисляется за сообщения в чатах сервера.")
-    await ctx.send(embed=embed)
+                    overtaker_name = overtaker_member.mention if overtaker_member else f"<@{overtaker_id}>"
+                    overtaken_name = overtaken_member.mention if overtaken_member else f"<@{overtaken_id}>"
 
-# --- Модерационные команды ---
+                    medals = {1: "🥇 1-е место", 2: "🥈 2-е место", 3: "🥉 3-е место"}
+                    pos_str = medals.get(new_pos, f"**{new_pos}-е место**")
 
-@bot.command(name="clear", aliases=["purge", "очистить"])
-@commands.has_permissions(manage_messages=True)
-async def cmd_clear(ctx, amount: int = 10):
-    await ctx.channel.purge(limit=amount + 1)
-    msg = await ctx.send(f"🧹 Успешно удалено сообщений: {amount}")
-    await asyncio.sleep(3)
-    await msg.delete()
-
-@bot.command(name="kick", aliases=["кик"])
-@commands.has_permissions(kick_members=True)
-async def cmd_kick(ctx, member: discord.Member, *, reason: str = "Не указана"):
-    await member.kick(reason=reason)
-    await ctx.send(f"👢 Участник {member.mention} исключен. Причина: {reason}")
-
-@bot.command(name="ban", aliases=["бан"])
-@commands.has_permissions(ban_members=True)
-async def cmd_ban(ctx, member: discord.Member, *, reason: str = "Не указана"):
-    await member.ban(reason=reason)
-    await ctx.send(f"🔨 Участник {member.mention} заблокирован. Причина: {reason}")
-
-@cmd_clear.error
-@cmd_kick.error
-@cmd_ban.error
-async def mod_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("❌ У недостаточно прав для выполнения этой команды.")
-    else:
-        await ctx.send("❌ Ошибка при выполнении модерационной команды.")
-
-# ---------------------------------------------------------------------------
-# BOT EVENTS & COMMANDS (TRADING / NEWS)
-# ---------------------------------------------------------------------------
-@bot.event
-async def on_ready():
-    logger.info(f"✅ Успешный вход: {bot.user} (ID: {bot.user.id})")
-    await fetch_economic_news(force_refresh=True)
-
-    if not check_30min_news_alerts.is_running():
-        check_30min_news_alerts.start()
-    if not check_discord_events_alerts.is_running():
-        check_discord_events_alerts.start()
-    if not scheduled_news_digests.is_running():
-        scheduled_news_digests.start()
-
-@bot.command(name="news")
-async def cmd_news(ctx):
-    thread = await get_target_channel(TARGET_NEWS_THREAD_ID)
-    if not thread:
-        await ctx.send("❌ Целевая ветка для новостей не найдена.")
-        return
-
-    async with ctx.typing():
-        news = await fetch_economic_news()
-        now_msk = datetime.now(MSK_TZ)
-        today_date = now_msk.date()
-
-        today_events = []
-        for ev in news:
-            if not ev.get("dt_utc"):
-                continue
-            ev_msk = ev["dt_utc"].astimezone(MSK_TZ)
-            if ev_msk.date() == today_date:
-                today_events.append((ev, ev_msk))
-
-        embed = discord.Embed(
-            title="**Ежедневный экономический календарь Forex**",
-            color=discord.Color.gold()
-        )
-
-        day_name = DAYS_RU[now_msk.weekday()]
-        lines = [f"📅 *Запланированные события: {day_name}, {now_msk.strftime('%d.%m')}*"]
-
-        for ev, ev_msk in today_events:
-            flag = get_flag(ev["country"])
-            time_str = ev_msk.strftime("%H:%M")
-            impact_str = "🔴 **HIGH**" if ev["impact"] == "HIGH" else "🟠 **MEDIUM**"
-
-            lines.append(f"\n🕘 {time_str} | {flag} **{ev['country']}** — {ev['title']}")
-            lines.append(f"{impact_str}")
-
-        embed.description = "\n".join(lines) if len(lines) > 1 else "На сегодня важных новостей больше нет."
-        await thread.send(embed=embed)
-        
-        if ctx.channel.id != TARGET_NEWS_THREAD_ID:
-            await ctx.send(f"✅ Новости опубликованы в ветку <#{TARGET_NEWS_THREAD_ID}>")
-
-@bot.command(name="ai")
-async def cmd_ai(ctx, *, query: str):
-    async with ctx.typing():
-        response_text = await query_groq_ai(query)
-        await ctx.send(response_text)
-
-# ---------------------------------------------------------------------------
-# MAIN EXECUTION WITH AUTO-RECONNECT
-# ---------------------------------------------------------------------------
-async def main():
-    await start_web_server()
-    
-    if PROXY_URL:
-        connector = ProxyConnector.from_url(PROXY_URL)
-        bot._connection.connector = connector
-        logger.info("🔒 SOCKS5 прокси успешно подключен к коннектору бота.")
-
-    while True:
-        try:
-            logger.info("⚡️ Попытка подключения к Discord...")
-            await bot.start(DISCORD_TOKEN)
-        except discord.errors.HTTPException as e:
-            if e.status == 429 or "1015" in str(e):
-                logger.warning("⚠️ Cloudflare/Discord заблокировал IP. Ожидание 90 секунд...")
-                await asyncio.sleep(90)
-            else:
-                logger.error(f"❌ Ошибка Discord HTTP ({e.status}): {e}")
-                await asyncio.sleep(30)
-        except Exception as e:
-            logger.error(f"❌ Непредвиденный сбой сети/подключения: {e}")
-            await asyncio.sleep(20)
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Бот остановлен вручную.")
+                    embed = discord.Embed(
+                        title="⚡️ Смена лидера в Топе Активности!",
+                        description=(
+                            f"🔥 {overtaker_name} вырывается вперед и забирает {pos_str}, обгоняя {overtaken_name}!\n\n"
+                            f"👀 {overtaken_name}, самое время поднапрячься и вернуть свою позицию!"
+                        ),
+                        color=discord.Color.gold()
