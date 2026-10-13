@@ -921,4 +921,61 @@ async def scheduled_news_digests():
 
             embed = discord.Embed(
                 title="**Ежедневный экономический календарь Forex**",
-                color
+                color=discord.Color.gold()
+            )
+
+            lines = [f"📅 *Запланированные события: {date_str_formatted}*"]
+            for ev, ev_msk in today_events:
+                flag = get_flag(ev["country"])
+                time_str = ev_msk.strftime("%H:%M")
+                impact_str = "🔴 **HIGH**" if ev["impact"] == "HIGH" else "🟠 **MEDIUM**"
+                lines.append(f"\n🕘 {time_str} | {flag} **{ev['country']}** — {ev['title']}\n{impact_str}")
+
+            embed.description = "\n".join(lines) if len(lines) > 1 else "На сегодня важных новостей нет."
+            await thread.send(embed=embed)
+    except Exception as e:
+        logger.error(f"[DIGEST TASK] {e}")
+
+# ---------------------------------------------------------------------------
+# MAIN EXECUTION
+# ---------------------------------------------------------------------------
+async def main():
+    global bot
+    await start_web_server()
+    
+    while True:
+        try:
+            bot = create_bot()
+            logger.info("⚡️ Инициализация подключения к Discord API...")
+            await bot.start(DISCORD_TOKEN)
+        except discord.errors.HTTPException as e:
+            if e.status in (429, 1015) or "1015" in str(e):
+                logger.warning("⚠️ Временная блокировка IP / Cloudflare (HTTP 429/1015). Ожидание 5 минут для сброса...")
+                try:
+                    if bot:
+                        await bot.close()
+                except Exception:
+                    pass
+                await asyncio.sleep(300)
+            else:
+                logger.error(f"❌ Ошибка Discord HTTP ({e.status}): {e}")
+                try:
+                    if bot:
+                        await bot.close()
+                except Exception:
+                    pass
+                await asyncio.sleep(30)
+        except Exception as e:
+            logger.error(f"❌ Сбой сети/прокси. Переподключение через 30 секунд...")
+            try:
+                if bot:
+                    await bot.close()
+            except Exception:
+                pass
+            await asyncio.sleep(30)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен вручную.")
