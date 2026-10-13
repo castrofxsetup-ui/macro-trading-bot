@@ -547,4 +547,45 @@ async def cmd_sub(ctx, member: discord.Member, days: int):
         await ctx.send(embed=embed)
         
         try:
-            await member.send(f"🎉 Вам на сервере **{ctx.guild
+            await member.send(f"🎉 Вам на сервере **{ctx.guild.name}** оформлена/продлена подписка **Legacy** на {days} дней! Она активна до {expires_str} (МСК).")
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.error(f"[SUB COMMAND ERROR] {e}")
+        await ctx.send("❌ Произошла ошибка при выдаче подписки.")
+
+@bot.command(name="subinfo", aliases=["mysub", "мояподписка"])
+async def cmd_subinfo(ctx):
+    """Проверить статус своей подписки Legacy"""
+    try:
+        subs = load_subs()
+        user_id_str = str(ctx.author.id)
+
+        if user_id_str not in subs:
+            await ctx.send("📉 У вас нет активной подписки **Legacy**.")
+            return
+
+        data = subs[user_id_str]
+        expires_at = datetime.fromisoformat(data["expires_at"])
+        now = datetime.now(timezone.utc)
+
+        if expires_at <= now:
+            await ctx.send("⌛️ Ваша подписка **Legacy** истекла.")
+            return
+
+        remaining = expires_at - now
+        days_left = remaining.days
+        hours_left = remaining.seconds // 3600
+        expires_str = expires_at.astimezone(MSK_TZ).strftime("%d.%m.%Y в %H:%M")
+
+        embed = discord.Embed(
+            title="💎 Статус вашей подписки Legacy",
+            description=(
+                f"Статус: **Активна** ✅\n"
+                f"Осталось времени: **{days_left} дн. {hours_left} ч.**\n"
+                f"Истекает: **{expires_str} (МСК)**\n\n"
+                f"💬 Для продления подписки обратитесь к **Castro**."
+            ),
+            color=discord.Color.gold()
+        )
