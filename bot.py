@@ -12,6 +12,7 @@ import discord
 from discord.ext import commands, tasks
 from curl_cffi import requests as async_requests
 from groq import AsyncGroq
+from aiohttp_socks import ProxyConnector
 
 # ---------------------------------------------------------------------------
 # LOGGING SETUP
@@ -175,16 +176,19 @@ async def query_groq_ai(prompt: str) -> str:
     return "❌ Ошибка генерации ответа ИИ. Все доступные модели Groq временно недоступны."
 
 # ---------------------------------------------------------------------------
-# INITIALIZE DISCORD BOT (WITH PROXY & TIMEOUT SUPPORT)
+# INITIALIZE DISCORD BOT (WITH SOCKS5 PROXY SUPPORT)
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guild_scheduled_events = True
 
+# Подключаем прокси через ProxyConnector (для работы с SOCKS5)
+connector = ProxyConnector.from_url(PROXY_URL) if PROXY_URL else None
+
 bot = commands.Bot(
     command_prefix="!",
     intents=intents,
-    proxy=PROXY_URL if PROXY_URL else None
+    connector=connector
 )
 
 # ---------------------------------------------------------------------------
