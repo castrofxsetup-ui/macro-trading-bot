@@ -8,3 +8,4 @@ beautifulsoup4
 pytz
 aiohttp-socks
 curl_cffi
+asyncpg
