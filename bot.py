@@ -64,13 +64,16 @@ SENT_NEWS_ALERTS = set()
 SENT_DISCORD_EVENTS = set()
 CACHE_TTL_SECONDS = 1800  # 30 минут
 
+# База данных активности в памяти (User ID -> XP)
+USER_XP = {}
+
 # ---------------------------------------------------------------------------
 # SYSTEM PROMPT FOR AI (PURE ALCHEMIST MSNR)
 # ---------------------------------------------------------------------------
 SYSTEM_INSTRUCTIONS = (
     "Ты — профессиональный эксперт и аналитик рынка, работающий ИСКЛЮЧИТЕЛЬНО по авторской торговой концепции Alchemist MSNR (Malaysian Support & Resistance).\n\n"
     "ПРАВИЛА И ОГРАНИЧЕНИЯ ОТВЕТА:\n"
-    "1. ВСЕГДА ОТВЕЧАЙ ПО СУЩЕСТВУ: Общайся вежливо, грамотно, аргументированно и конструктивно. Избегай бессмысленных повторений слов, сломанных терминов (никаких 'ЖД Голубых' и т.д., только XAU/USD, Золото, BTC, ETH).\n"
+    "1. ВСЕГДА ОТВЕЧАЙ ПО СУЩЕСТВУ: Общайся вежливо, грамотно, аргументированно и конструктивно. Избегай бессмысленных повторений слов и сломанных терминов (только XAU/USD, Золото, BTC, ETH).\n"
     "2. ТОЛЬКО ALCHEMIST MSNR: Запрещено использовать SMC, ICT, индикаторы и классический тех.анализ. Используй строго терминологию Malaysian SnR (Fresh Levels, Tested Levels, Gap & Overlap, Breakout, Major/Minor SnR).\n"
     "3. ИСПОЛЬЗУЙ АКТУАЛЬНЫЕ ДАННЫЕ: В каждом запросе тебе передаются свежие котировки. Строишь анализ и даешь ответы только на их основе.\n"
     "4. ЛОГИКА И АРГУМЕНТАЦИЯ: На любой вопрос пользователя делай четкий разбор: указывай текущую цену, реакционные зоны, условия входа и отмены (Invalidation) сетапа."
@@ -80,10 +83,7 @@ SYSTEM_INSTRUCTIONS = (
 # LIVE MARKET PRICES FETCHING
 # ---------------------------------------------------------------------------
 async def get_live_market_prices() -> str:
-    """Получение актуальных рыночных цен (Crypto + Gold/Forex) для передачи в ИИ"""
     prices = []
-    
-    # 1. Запрос криптовалют (BTC, ETH)
     try:
         r_crypto = await asyncio.to_thread(
             async_requests.get,
@@ -99,7 +99,6 @@ async def get_live_market_prices() -> str:
     except Exception as e:
         logger.warning(f"[PRICE FETCH] Ошибка получения крипто-цен: {e}")
 
-    # 2. Запрос Золота (XAU/USD) через Yahoo Finance
     try:
         r_forex = await asyncio.to_thread(
             async_requests.get,
@@ -117,13 +116,13 @@ async def get_live_market_prices() -> str:
         logger.warning(f"[PRICE FETCH] Ошибка получения цены на золото: {e}")
 
     if not prices:
-        return "Текущие рыночные котировки временно недоступны. Используй имеющиеся ориентиры и попроси пользователя уточнить TF."
+        return "Текущие рыночные котировки временно недоступны."
 
     now_msk_str = datetime.now(MSK_TZ).strftime("%Y-%m-%d %H:%M:%S МСК")
     return f"РЕАЛЬНЫЕ ТЕКУЩИЕ РЫНОЧНЫЕ КОТИРОВКИ ({now_msk_str}):\n" + "\n".join(prices)
 
 # ---------------------------------------------------------------------------
-# GROQ HELPER WITH FALLBACK & LOOP PROTECTION
+# GROQ HELPER
 # ---------------------------------------------------------------------------
 async def query_groq_ai(prompt: str) -> str:
     if not groq_client:
@@ -134,7 +133,6 @@ async def query_groq_ai(prompt: str) -> str:
 
     models_to_try = [GROQ_MODEL, "llama-3.3-70b-versatile", "llama3-70b-8192", "llama-3.1-8b-instant"]
 
-    last_error = None
     for model_name in models_to_try:
         try:
             completion = await groq_client.chat.completions.create(
@@ -151,10 +149,8 @@ async def query_groq_ai(prompt: str) -> str:
             if res_text:
                 return res_text[:1900]
         except Exception as e:
-            last_error = e
             logger.warning(f"[GROQ RETRY] Модель {model_name} ошибка: {e}")
 
-    logger.error(f"[GROQ ERROR] Все модели завершились ошибкой. Последняя: {last_error}")
     return "❌ Ошибка генерации ответа ИИ. Попробуйте сформулировать вопрос иначе."
 
 # ---------------------------------------------------------------------------
@@ -163,6 +159,7 @@ async def query_groq_ai(prompt: str) -> str:
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guild_scheduled_events = True
+intents.members = True  # Требуется для авто-роли при входе новых пользователей
 
 bot = commands.Bot(
     command_prefix="!",
@@ -264,7 +261,6 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
             
             if r.status_code == 200:
                 if "<html" in r.text.lower() or "<!doctype html" in r.text.lower():
-                    logger.warning(f"[NEWS API] Cloudflare перехватил запрос к {url}. Пропускаем источник.")
                     continue
 
                 parsed = []
@@ -294,8 +290,7 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
                                 "dt_utc": dt_utc,
                                 "impact": impact_level
                             })
-                    except Exception as json_err:
-                        logger.error(f"[NEWS API] Ошибка JSON {url}: {json_err}")
+                    except Exception:
                         continue
 
                 elif stype == "xml":
@@ -311,12 +306,11 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
     return NEWS_CACHE["data"]
 
 # ---------------------------------------------------------------------------
-# AUTOMATED TASKS
+# AUTOMATED TASKS (NEWS & EVENTS)
 # ---------------------------------------------------------------------------
 
 @tasks.loop(minutes=1)
 async def check_30min_news_alerts():
-    """Алерт за 30 минут до важной новости"""
     await bot.wait_until_ready()
     thread = await get_target_channel(TARGET_NEWS_THREAD_ID)
     if not thread:
@@ -362,7 +356,6 @@ async def check_30min_news_alerts():
 
 @tasks.loop(minutes=2)
 async def check_discord_events_alerts():
-    """Алерт за 30 минут до начала Discord-брифингов"""
     await bot.wait_until_ready()
     thread = await get_target_channel(TARGET_EVENTS_THREAD_ID)
     if not thread:
@@ -397,7 +390,6 @@ async def check_discord_events_alerts():
 
 @tasks.loop(hours=1)
 async def scheduled_news_digests():
-    """Ежедневные и еженедельные дайджесты в 8:00 МСК"""
     await bot.wait_until_ready()
     thread = await get_target_channel(TARGET_NEWS_THREAD_ID)
     if not thread:
@@ -408,7 +400,6 @@ async def scheduled_news_digests():
     if now_msk.hour == 8:
         news = await fetch_economic_news(force_refresh=True)
 
-        # 1. ЕЖЕНЕДЕЛЬНЫЙ ОТЧЕТ (Понедельник)
         if now_msk.weekday() == 0:
             grouped = {}
             for ev in news:
@@ -452,7 +443,6 @@ async def scheduled_news_digests():
                 for emb in embeds_to_send:
                     await thread.send(embed=emb)
 
-        # 2. ЕЖЕДНЕВНЫЙ ОТЧЕТ
         today_date = now_msk.date()
         today_events = []
         for ev in news:
@@ -482,7 +472,112 @@ async def scheduled_news_digests():
         await thread.send(embed=embed)
 
 # ---------------------------------------------------------------------------
-# BOT EVENTS & COMMANDS
+# AUTO-ROLE & ACTIVITY & LEADERBOARD SYSTEM
+# ---------------------------------------------------------------------------
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    """Выдача роли @Trader при входе"""
+    role = discord.utils.get(member.guild.roles, name="Trader")
+    if role:
+        try:
+            await member.add_roles(role)
+            logger.info(f"[AUTO-ROLE] Выдана роль Trader пользователю {member.name}")
+        except Exception as e:
+            logger.error(f"[AUTO-ROLE ERROR] {e}")
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot or not message.guild:
+        return
+
+    # Начисление XP за каждое сообщение
+    author_id = message.author.id
+    USER_XP[author_id] = USER_XP.get(author_id, 0) + 5
+
+    # Вопросы к ИИ в специальном канале
+    if bot.user in message.mentions and message.channel.id == AI_ALLOWED_THREAD_ID:
+        clean_prompt = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
+        if clean_prompt:
+            async with message.channel.typing():
+                response_text = await query_groq_ai(clean_prompt)
+                await message.reply(response_text, mention_author=True)
+        return
+
+    await bot.process_commands(message)
+
+# Команда проверки личного ранга
+@bot.command(name="rank", aliases=["level", "активность"])
+async def cmd_rank(ctx):
+    xp = USER_XP.get(ctx.author.id, 0)
+    embed = discord.Embed(
+        title="📊 Статистика активности",
+        description=f"Участник: {ctx.author.mention}\n⚡️ Накоплено опыта (XP): **{xp}**",
+        color=discord.Color.blue()
+    )
+    await ctx.send(embed=embed)
+
+# Команда вывода таблицы лидеров (рейтинг всех активных участников)
+@bot.command(name="leaderboard", aliases=["top", "топ", "рейтинг"])
+async def cmd_leaderboard(ctx):
+    """Показывает рейтинг самых активных участников сервера по XP"""
+    if not USER_XP:
+        await ctx.send("📉 База активности пока пуста. Участники еще не отправляли сообщения.")
+        return
+
+    # Сортируем пользователей по убыванию опыта (XP)
+    sorted_users = sorted(USER_XP.items(), key=lambda item: item[1], reverse=True)
+
+    lines = []
+    medals = ["🥇", "🥈", "🥉"]
+
+    for idx, (user_id, xp) in enumerate(sorted_users[:10], start=1):  # Топ-10 участников
+        user = ctx.guild.get_member(user_id)
+        name = user.mention if user else f"Пользователь (ID: {user_id})"
+        prefix = medals[idx - 1] if idx <= 3 else f"**{idx}.**"
+        lines.append(f"{prefix} {name} — **{xp} XP**")
+
+    embed = discord.Embed(
+        title="🏆 Рейтинг активности участников",
+        description="\n".join(lines),
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text="Активность начисляется за сообщения в чатах сервера.")
+    await ctx.send(embed=embed)
+
+# --- Модерационные команды ---
+
+@bot.command(name="clear", aliases=["purge", "очистить"])
+@commands.has_permissions(manage_messages=True)
+async def cmd_clear(ctx, amount: int = 10):
+    await ctx.channel.purge(limit=amount + 1)
+    msg = await ctx.send(f"🧹 Успешно удалено сообщений: {amount}")
+    await asyncio.sleep(3)
+    await msg.delete()
+
+@bot.command(name="kick", aliases=["кик"])
+@commands.has_permissions(kick_members=True)
+async def cmd_kick(ctx, member: discord.Member, *, reason: str = "Не указана"):
+    await member.kick(reason=reason)
+    await ctx.send(f"👢 Участник {member.mention} исключен. Причина: {reason}")
+
+@bot.command(name="ban", aliases=["бан"])
+@commands.has_permissions(ban_members=True)
+async def cmd_ban(ctx, member: discord.Member, *, reason: str = "Не указана"):
+    await member.ban(reason=reason)
+    await ctx.send(f"🔨 Участник {member.mention} заблокирован. Причина: {reason}")
+
+@cmd_clear.error
+@cmd_kick.error
+@cmd_ban.error
+async def mod_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ У недостаточно прав для выполнения этой команды.")
+    else:
+        await ctx.send("❌ Ошибка при выполнении модерационной команды.")
+
+# ---------------------------------------------------------------------------
+# BOT EVENTS & COMMANDS (TRADING / NEWS)
 # ---------------------------------------------------------------------------
 @bot.event
 async def on_ready():
@@ -496,25 +591,8 @@ async def on_ready():
     if not scheduled_news_digests.is_running():
         scheduled_news_digests.start()
 
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author == bot.user:
-        return
-
-    # Вопросы к ИИ в специальном канале
-    if bot.user in message.mentions and message.channel.id == AI_ALLOWED_THREAD_ID:
-        clean_prompt = message.content.replace(f"<@{bot.user.id}>", "").replace(f"<@!{bot.user.id}>", "").strip()
-        if clean_prompt:
-            async with message.channel.typing():
-                response_text = await query_groq_ai(clean_prompt)
-                await message.reply(response_text, mention_author=True)
-        return
-
-    await bot.process_commands(message)
-
 @bot.command(name="news")
 async def cmd_news(ctx):
-    """Ручной вызов новостей на сегодня"""
     thread = await get_target_channel(TARGET_NEWS_THREAD_ID)
     if not thread:
         await ctx.send("❌ Целевая ветка для новостей не найдена.")
@@ -557,7 +635,6 @@ async def cmd_news(ctx):
 
 @bot.command(name="ai")
 async def cmd_ai(ctx, *, query: str):
-    """Задать вопрос ИИ по торговле и MSNR Alchemist"""
     async with ctx.typing():
         response_text = await query_groq_ai(query)
         await ctx.send(response_text)
@@ -568,7 +645,6 @@ async def cmd_ai(ctx, *, query: str):
 async def main():
     await start_web_server()
     
-    # Инициализация SOCKS5 прокси внутри event loop
     if PROXY_URL:
         connector = ProxyConnector.from_url(PROXY_URL)
         bot._connection.connector = connector
@@ -580,7 +656,7 @@ async def main():
             await bot.start(DISCORD_TOKEN)
         except discord.errors.HTTPException as e:
             if e.status == 429 or "1015" in str(e):
-                logger.warning("⚠️ Cloudflare/Discord временно заблокировал IP (HTTP 429 / Error 1015). Ожидание 90 секунд...")
+                logger.warning("⚠️ Cloudflare/Discord заблокировал IP. Ожидание 90 секунд...")
                 await asyncio.sleep(90)
             else:
                 logger.error(f"❌ Ошибка Discord HTTP ({e.status}): {e}")
