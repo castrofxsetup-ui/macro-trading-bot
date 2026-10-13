@@ -539,4 +539,30 @@ async def cmd_sub(ctx, member: discord.Member, days: int):
         if role not in member.roles:
             await member.add_roles(role)
 
-        expires_str = new_end.astimezone(MSK_
+        expires_str = new_end.astimezone(MSK_TZ).strftime("%d.%m.%Y в %H:%M")
+        
+        embed = discord.Embed(
+            title="✅ Подписка Legacy оформлена!",
+            description=f"Участнику {member.mention} выдана подписка на **{days} дней**.\n⏳ Активна до: **{expires_str} (МСК)**",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+        
+        try:
+            await member.send(f"🎉 Вам на сервере **{ctx.guild.name}** оформлена/продлена подписка **Legacy** на {days} дней! Она активна до {expires_str} (МСК).")
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.error(f"[SUB COMMAND ERROR] {e}")
+        await ctx.send("❌ Произошла ошибка при выдаче подписки.")
+
+@bot.command(name="subinfo", aliases=["mysub", "мояподписка"])
+async def cmd_subinfo(ctx):
+    """Проверить статус своей подписки Legacy"""
+    try:
+        subs = load_subs()
+        user_id_str = str(ctx.author.id)
+
+        if user_id_str not in subs:
+            await ctx.send("📉 У
