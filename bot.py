@@ -35,6 +35,7 @@ TARGET_EVENTS_THREAD_ID = 1528506824687485118
 
 MSK_TZ = timezone(timedelta(hours=3))
 SUBS_FILE = "subs_db.json"
+XP_FILE = "xp_db.json"
 
 COUNTRY_FLAGS = {
     "USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "JPY": "🇯🇵",
@@ -59,8 +60,6 @@ SENT_NEWS_ALERTS = set()
 SENT_DISCORD_EVENTS = set()
 CACHE_TTL_SECONDS = 1800
 
-USER_XP = {}
-
 LAST_TOP_THREE = []
 LAST_OVERTAKE_TIME = 0
 GLOBAL_OVERTAKE_COOLDOWN = 180
@@ -72,7 +71,7 @@ PAIR_OVERTAKE_COOLDOWN = 300
 bot = None
 
 # ---------------------------------------------------------------------------
-# SUBSCRIPTION DATABASE HELPERS
+# DATABASE HELPERS (SUBS & XP)
 # ---------------------------------------------------------------------------
 def load_subs():
     if os.path.exists(SUBS_FILE):
@@ -90,18 +89,36 @@ def save_subs(data):
     except Exception as e:
         logger.error(f"[SUBS DB ERROR] Ошибка сохранения базы подписок: {e}")
 
+def load_xp():
+    if os.path.exists(XP_FILE):
+        try:
+            with open(XP_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return {int(k): v for k, v in data.items()}
+        except Exception:
+            return {}
+    return {}
+
+def save_xp(data):
+    try:
+        with open(XP_FILE, "w", encoding="utf-8") as f:
+            json.dump({str(k): v for k, v in data.items()}, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        logger.error(f"[XP DB ERROR] Ошибка сохранения опыта: {e}")
+
+USER_XP = load_xp()
+
 # ---------------------------------------------------------------------------
 # FACTORY FUNCTION TO CREATE BOT INSTANCE WITH PROPER PROXY CONNECTOR
 # ---------------------------------------------------------------------------
 def create_bot():
-    intents = intents = discord.Intents.default()
+    intents = discord.Intents.default()
     intents.message_content = True
     intents.guild_scheduled_events = True
     intents.members = True
     
     new_bot = commands.Bot(command_prefix="!", intents=intents)
 
-    # Переопределяем метод настройки сессии с поддержкой стабильного SOCKS5 и rdns=True
     original_setup_hook = new_bot.setup_hook
     
     async def custom_setup_hook():
@@ -110,7 +127,6 @@ def create_bot():
             
         if PROXY_URL:
             try:
-                # rdns=True решает проблему 502 Bad Gateway/ошибок шлюза на удаленных прокси
                 connector = ProxyConnector.from_url(PROXY_URL, rdns=True)
                 if new_bot.http._session:
                     await new_bot.http._session.close()
@@ -160,6 +176,7 @@ def create_bot():
 
             author_id = message.author.id
             USER_XP[author_id] = USER_XP.get(author_id, 0) + 5
+            save_xp(USER_XP)
 
             sorted_users = sorted(USER_XP.items(), key=lambda item: item[1], reverse=True)
             current_top_three = [u_id for u_id, _ in sorted_users[:3]]
@@ -303,6 +320,46 @@ def create_bot():
             await ctx.send(embed=embed)
         except Exception as e:
             logger.error(f"[SUBINFO ERROR] {e}")
+
+    @new_bot.command(name="subslist", aliases=["списокподписок"])
+    @commands.has_permissions(administrator=True)
+    async def cmd_subslist(ctx):
+        try:
+            subs = load_subs()
+            if not subs:
+                await ctx.send("📉 База данных подписок (`subs_db.json`) пуста.")
+                return
+
+            now = datetime.now(timezone.utc)
+            lines = []
+
+            for user_id_str, data in subs.items():
+                expires_at = datetime.fromisoformat(data["expires_at"])
+                if expires_at <= now:
+                    continue
+                
+                user = ctx.guild.get_member(int(user_id_str))
+                name = user.mention if user else f"ID: {user_id_str}"
+                expires_str = expires_at.astimezone(MSK_TZ).strftime("%d.%m.%Y в %H:%M")
+                
+                remaining = expires_at - now
+                days_left = remaining.days
+                
+                lines.append(f"👤 {name} — активна до **{expires_str} МСК** (осталось {days_left} дн.)")
+
+            if not lines:
+                await ctx.send("📉 Активных подписок на данный момент нет.")
+                return
+
+            embed = discord.Embed(
+                title="💎 Список активных подписок Legacy",
+                description="\n".join(lines),
+                color=discord.Color.gold()
+            )
+            await ctx.send(embed=embed)
+        except Exception as e:
+            logger.error(f"[SUBSLIST ERROR] {e}")
+            await ctx.send("❌ Прошибка при чтении базы подписок.")
 
     @new_bot.command(name="rank", aliases=["level", "активность"])
     async def cmd_rank(ctx):
