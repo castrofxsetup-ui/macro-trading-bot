@@ -589,3 +589,118 @@ async def cmd_subinfo(ctx):
             ),
             color=discord.Color.gold()
         )
+        await ctx.send(embed=embed)
+    except Exception as e:
+        logger.error(f"[SUBINFO ERROR] {e}")
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    try:
+        role = discord.utils.get(member.guild.roles, name="Trader")
+        if role:
+            await member.add_roles(role)
+            logger.info(f"[AUTO-ROLE] Выдана роль Trader пользователю {member.name}")
+    except Exception as e:
+        logger.error(f"[AUTO-ROLE] {e}")
+
+@bot.event
+async def on_message(message: discord.Message):
+    global LAST_TOP_THREE, LAST_OVERTAKE_TIME, LAST_OVERTAKE_PAIR, PAIR_OVERTAKE_TIME
+
+    try:
+        if message.author.bot or not message.guild:
+            return
+
+        author_id = message.author.id
+        USER_XP[author_id] = USER_XP.get(author_id, 0) + 5
+
+        sorted_users = sorted(USER_XP.items(), key=lambda item: item[1], reverse=True)
+        current_top_three = [u_id for u_id, _ in sorted_users[:3]]
+
+        if LAST_TOP_THREE and current_top_three != LAST_TOP_THREE:
+            now = time.time()
+            if now - LAST_OVERTAKE_TIME >= GLOBAL_OVERTAKE_COOLDOWN:
+                overtaker_id = author_id
+                if overtaker_id in current_top_three:
+                    new_pos = current_top_three.index(overtaker_id) + 1
+                    
+                    overtaken_id = None
+                    if overtaker_id in LAST_TOP_THREE:
+                        old_pos = LAST_TOP_THREE.index(overtaker_id)
+                        if new_pos - 1 < old_pos:
+                            overtaken_id = LAST_TOP_THREE[new_pos - 1]
+                    else:
+                        overtaken_id = LAST_TOP_THREE[-1]
+
+                    if overtaken_id and overtaken_id != overtaker_id:
+                        current_pair = (overtaker_id, overtaken_id)
+
+                        if current_pair != LAST_OVERTAKE_PAIR or (now - PAIR_OVERTAKE_TIME >= PAIR_OVERTAKE_COOLDOWN):
+                            overtaker_member = message.guild.get_member(overtaker_id)
+                            overtaken_member = message.guild.get_member(overtaken_id)
+
+                            overtaker_name = overtaker_member.mention if overtaker_member else f"<@{overtaker_id}>"
+                            overtaken_name = overtaken_member.mention if overtaken_member else f"<@{overtaken_id}>"
+
+                            medals = {1: "🥇 1-е место", 2: "🥈 2-е место", 3: "🥉 3-е место"}
+                            pos_str = medals.get(new_pos, f"**{new_pos}-е место**")
+
+                            embed = discord.Embed(
+                                title="⚡️ Смена лидера в Топе Активности!",
+                                description=(
+                                    f"🔥 {overtaker_name} вырывается вперед и забирает {pos_str}, обгоняя {overtaken_name}!\n\n"
+                                    f"👀 {overtaken_name}, самое время поднапрячься и вернуть свою позицию!"
+                                ),
+                                color=discord.Color.gold()
+                            )
+                            embed.set_footer(text="Рейтинг рассчитывается по сообщениям на сервере")
+                            
+                            await message.channel.send(embed=embed)
+                            
+                            LAST_OVERTAKE_TIME = now
+                            LAST_OVERTAKE_PAIR = current_pair
+                            PAIR_OVERTAKE_TIME = now
+
+        LAST_TOP_THREE = current_top_three
+        await bot.process_commands(message)
+    except Exception as e:
+        logger.error(f"[ON_MESSAGE] {e}")
+
+@bot.command(name="rank", aliases=["level", "активность"])
+async def cmd_rank(ctx):
+    try:
+        xp = USER_XP.get(ctx.author.id, 0)
+        embed = discord.Embed(
+            title="📊 Статистика активности",
+            description=f"Участник: {ctx.author.mention}\n⚡️ Накоплено опыта (XP): **{xp}**",
+            color=discord.Color.blue()
+        )
+        await ctx.send(embed=embed)
+    except Exception as e:
+        logger.error(f"[RANK] {e}")
+
+@bot.command(name="leaderboard", aliases=["top", "топ", "рейтинг"])
+async def cmd_leaderboard(ctx):
+    """Отображение ВСЕХ участников серверного рейтинга активности"""
+    try:
+        if not USER_XP:
+            await ctx.send("📉 База активности пока пуста. Участники еще не отправляли сообщения.")
+            return
+
+        sorted_users = sorted(USER_XP.items(), key=lambda item: item[1], reverse=True)
+        lines = []
+        medals = ["🥇", "🥈", "🥉"]
+
+        for idx, (user_id, xp) in enumerate(sorted_users, start=1):
+            user = ctx.guild.get_member(user_id)
+            name = user.mention if user else f"Пользователь (ID: {user_id})"
+            prefix = medals[idx - 1] if idx <= 3 else f"**{idx}.**"
+            lines.append(f"{prefix} {name} — **{xp} XP**")
+
+        current_chunk = ""
+        embeds_to_send = []
+
+        for line in lines:
+            if len(current_chunk) + len(line) + 1 > 3800:
+                embeds_to_send.append(discord.Embed(
+                    title="🏆 Рейтинг активности участников
