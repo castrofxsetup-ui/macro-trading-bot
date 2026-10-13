@@ -176,19 +176,16 @@ async def query_groq_ai(prompt: str) -> str:
     return "❌ Ошибка генерации ответа ИИ. Все доступные модели Groq временно недоступны."
 
 # ---------------------------------------------------------------------------
-# INITIALIZE DISCORD BOT (WITH SOCKS5 PROXY SUPPORT)
+# INITIALIZE DISCORD BOT
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guild_scheduled_events = True
 
-# Подключаем прокси через ProxyConnector (для работы с SOCKS5)
-connector = ProxyConnector.from_url(PROXY_URL) if PROXY_URL else None
-
+# Инициализируем бота без жестко привязанного коннектора на верхнем уровне
 bot = commands.Bot(
     command_prefix="!",
-    intents=intents,
-    connector=connector
+    intents=intents
 )
 
 # ---------------------------------------------------------------------------
@@ -590,6 +587,12 @@ async def cmd_ai(ctx, *, query: str):
 async def main():
     await start_web_server()
     
+    # Безопасно инициализируем коннектор внутри запущенного event loop
+    if PROXY_URL:
+        connector = ProxyConnector.from_url(PROXY_URL)
+        bot._connection.connector = connector
+        logger.info("🔒 SOCKS5 прокси успешно подключен к коннектору бота.")
+
     while True:
         try:
             logger.info("⚡️ Попытка подключения к Discord...")
