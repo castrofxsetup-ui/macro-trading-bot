@@ -11,7 +11,8 @@ from aiohttp import web
 import discord
 from discord.ext import commands, tasks
 from curl_cffi import requests as async_requests
-from aiohttp_socks import ProxyConnector
+from python_socks import ProxyType
+from python_socks.asyncio import Proxy
 
 # ---------------------------------------------------------------------------
 # LOGGING SETUP
@@ -68,7 +69,37 @@ PAIR_OVERTAKE_TIME = 0
 PAIR_OVERTAKE_COOLDOWN = 300  # 5 минут
 
 # ---------------------------------------------------------------------------
-# BOT CLASS WITH SAFE PROXY SETUP
+# CUSTOM SOCKS5 CONNECTOR (BYPASSING CLOUDFLARE VIA PYTHON-SOCKS)
+# ---------------------------------------------------------------------------
+class CustomProxyConnector(aiohttp.TCPConnector):
+    def __init__(self, proxy_url, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        clean_url = proxy_url.replace("socks5://", "").replace("socks5h://", "")
+        auth, server = clean_url.split("@") if "@" in clean_url else (None, clean_url)
+        username, password = auth.split(":") if auth and ":" in auth else (None, None)
+        host, port_str = server.split(":")
+        
+        self._proxy = Proxy(
+            proxy_type=ProxyType.SOCKS5,
+            host=host,
+            port=int(port_str),
+            username=username,
+            password=password,
+            rdns=True
+        )
+
+    async def _connect(self, req, traces, timeout):
+        # Перехватываем стандартный метод коннекта и заворачиваем его в SOCKS5 туннель
+        host = req.url.host
+        port = req.url.port
+        if port is None:
+            port = 443 if req.url.scheme == 'https' else 80
+
+        sock = await self._proxy.connect(dest_host=host, dest_port=port)
+        return aiohttp.helpers.TransportSocket(sock)
+
+# ---------------------------------------------------------------------------
+# BOT CLASS WITH PROXY SHIELD
 # ---------------------------------------------------------------------------
 class LegacyBot(commands.Bot):
     def __init__(self):
@@ -79,16 +110,14 @@ class LegacyBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        """Интеграция SOCKS5 прокси в HTTP-сессию бота на старте event loop"""
         if PROXY_URL:
             try:
-                connector = ProxyConnector.from_url(PROXY_URL)
-                # Пересоздаем сессию бота с использованием прокси-коннектора
+                connector = CustomProxyConnector(PROXY_URL)
                 await self.http.close()
                 self.http._session = aiohttp.ClientSession(connector=connector, headers=self.http._session.headers)
-                logger.info("🔒 SOCKS5 прокси успешно интегрирован через ProxyConnector.")
+                logger.info("🔒 SOCKS5 туннель успешно активирован через CustomProxyConnector.")
             except Exception as e:
-                logger.error(f"❌ Ошибка настройки прокси-коннектора: {e}")
+                logger.error(f"❌ Ошибка настройки туннеля: {e}")
 
 bot = LegacyBot()
 
@@ -632,18 +661,18 @@ async def main():
     
     while True:
         try:
-            logger.info("⚡️ Попытка подключения к Discord через защищенный ProxyConnector...")
+            logger.info("⚡️ Инициализация защищенного подключения через CustomProxyConnector...")
             await bot.start(DISCORD_TOKEN)
         except discord.errors.HTTPException as e:
             if e.status == 429 or "1015" in str(e):
-                logger.warning("⚠️ Временная блокировка IP / Cloudflare (HTTP 429/1015). Ожидание 45 секунд...")
-                await asyncio.sleep(45)
+                logger.warning("⚠️ Временная блокировка IP / Cloudflare (HTTP 429/1015). Ожидание 30 секунд...")
+                await asyncio.sleep(30)
             else:
                 logger.error(f"❌ Ошибка Discord HTTP ({e.status}): {e}")
-                await asyncio.sleep(20)
+                await asyncio.sleep(15)
         except Exception as e:
             logger.error(f"❌ Сбой сети/прокси: {e}")
-            await asyncio.sleep(20)
+            await asyncio.sleep(15)
 
 if __name__ == "__main__":
     try:
