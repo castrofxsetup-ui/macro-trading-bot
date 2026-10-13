@@ -64,29 +64,23 @@ USER_XP = {}
 # Отслеживание топ-3 лидеров и параметров антиспама обгонов
 LAST_TOP_THREE = []
 LAST_OVERTAKE_TIME = 0
-GLOBAL_OVERTAKE_COOLDOWN = 180  # Общий кулдаун (3 минуты)
+GLOBAL_OVERTAKE_COOLDOWN = 180  # Общий кулдаун между любыми анонсами (3 минуты / 180 сек)
 
 LAST_OVERTAKE_PAIR = (None, None)  # (Кто обогнал, Кого обогнали)
 PAIR_OVERTAKE_TIME = 0
-PAIR_OVERTAKE_COOLDOWN = 300  # Кулдаун для конкретной пары (5 минут)
+PAIR_OVERTAKE_COOLDOWN = 300  # Кулдаун для конкретной пары участников (5 минут / 300 сек)
 
 # ---------------------------------------------------------------------------
-# INITIALIZE DISCORD BOT (WITH PROXY CONNECTOR)
+# INITIALIZE DISCORD BOT
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guild_scheduled_events = True
 intents.members = True
 
-# Создаем SOCKS5 коннектор прокси для бота сразу на старте
-connector = ProxyConnector.from_url(PROXY_URL) if PROXY_URL else None
-if PROXY_URL:
-    logger.info("🔒 SOCKS5 прокси успешно привязан к коннектору бота.")
-
 bot = commands.Bot(
     command_prefix="!",
-    intents=intents,
-    connector=connector
+    intents=intents
 )
 
 # ---------------------------------------------------------------------------
@@ -606,9 +600,15 @@ async def cmd_news(ctx):
 async def main():
     await start_web_server()
     
+    # Безопасно инициализируем SOCKS5 коннектор внутри запущенного event loop
+    if PROXY_URL:
+        connector = ProxyConnector.from_url(PROXY_URL)
+        bot.http.connector = connector
+        logger.info("🔒 SOCKS5 прокси успешно привязан к HTTP-клиенту бота.")
+
     while True:
         try:
-            logger.info("⚡️ Попытка подключения к Discord через SOCKS5 прокси...")
+            logger.info("⚡️ Попытка подключения к Discord...")
             await bot.start(DISCORD_TOKEN)
         except discord.errors.HTTPException as e:
             if e.status == 429 or "1015" in str(e):
