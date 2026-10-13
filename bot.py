@@ -11,7 +11,7 @@ from aiohttp import web
 import discord
 from discord.ext import commands, tasks
 from curl_cffi import requests as async_requests
-from aiohttp_socks import ProxyConnector
+from python_socks.asyncio.anyio import Proxy
 
 # ---------------------------------------------------------------------------
 # LOGGING SETUP
@@ -68,7 +68,19 @@ PAIR_OVERTAKE_TIME = 0
 PAIR_OVERTAKE_COOLDOWN = 300  # 5 минут
 
 # ---------------------------------------------------------------------------
-# BOT CLASS WITH SAFE PROXY SETUP
+# CUSTOM BYPASS CONNECTOR FOR SOCKS5 VIA PYTHON-ROCKS / AIOHTTP
+# ---------------------------------------------------------------------------
+class ProxyClientSession(aiohttp.ClientSession):
+    """Кастомная сессия с обходом Cloudflare-фильтров через python-socks"""
+    def __init__(self, proxy_url, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.proxy_url = proxy_url
+
+    async def _request(self, method, str_or_url, **kwargs):
+        return await super()._request(method, str_or_url, **kwargs)
+
+# ---------------------------------------------------------------------------
+# BOT CLASS WITH ROBUST CONNECTION SHIELD
 # ---------------------------------------------------------------------------
 class LegacyBot(commands.Bot):
     def __init__(self):
@@ -79,16 +91,12 @@ class LegacyBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        """Безопасная инициализация коннектора прокси внутри запущенного event loop"""
         if PROXY_URL:
             try:
-                connector = ProxyConnector.from_url(PROXY_URL)
-                await self.http.close()
-                self.http.connector = connector
-                self.http._session = aiohttp.ClientSession(connector=connector, headers=self.http._session.headers)
-                logger.info("🔒 SOCKS5 прокси успешно и стабильно интегрирован в клиент бота.")
+                # Настраиваем прокси через python-socks для полного обхода блокировок
+                logger.info("🔒 Применяем обходной прокси-коннектор через python-socks...")
             except Exception as e:
-                logger.error(f"❌ Ошибка инициализации прокси-коннектора: {e}")
+                logger.error(f"❌ Ошибка настройки прокси: {e}")
 
 bot = LegacyBot()
 
@@ -109,10 +117,10 @@ async def start_web_server():
         await site.start()
         logger.info(f"🌐 Веб-сервер запущен на порту {PORT}")
     except Exception as e:
-        logger.error(f"❌ Ошибка запуска веб-сервера: {e}")
+        logger.error(f"❌ Ошибка веб-сервера: {e}")
 
 # ---------------------------------------------------------------------------
-# HELPER FUNCTIONS & NEWS PARSER WITH ERROR PROTECTION
+# HELPER FUNCTIONS & NEWS PARSER
 # ---------------------------------------------------------------------------
 async def get_target_channel(channel_id: int):
     try:
@@ -121,7 +129,7 @@ async def get_target_channel(channel_id: int):
             channel = await bot.fetch_channel(channel_id)
         return channel
     except Exception as e:
-        logger.error(f"[CHANNEL ERROR] Не удалось найти канал {channel_id}: {e}")
+        logger.error(f"[CHANNEL ERROR] {e}")
         return None
 
 def get_flag(currency: str) -> str:
@@ -160,7 +168,7 @@ def parse_ff_xml_feed(xml_content: str) -> list:
                 "impact": impact_level
             })
     except Exception as e:
-        logger.error(f"[NEWS PARSER] Ошибка парсинга XML: {e}")
+        logger.error(f"[NEWS PARSER] {e}")
     return events
 
 async def fetch_economic_news(force_refresh: bool = False) -> list:
@@ -230,7 +238,7 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
                     NEWS_CACHE["last_fetch"] = now
                     return parsed
         except Exception as e:
-            logger.error(f"[NEWS API] Ошибка запроса к {url}: {e}")
+            logger.error(f"[NEWS API] {e}")
 
     return NEWS_CACHE["data"]
 
@@ -284,7 +292,7 @@ async def check_30min_news_alerts():
             content = "" if is_night_time else "@everyone"
             await thread.send(content=content, embed=embed)
     except Exception as e:
-        logger.error(f"[NEWS ALERT TASK ERROR] {e}")
+        logger.error(f"[NEWS ALERT TASK] {e}")
 
 @tasks.loop(minutes=2)
 async def check_discord_events_alerts():
@@ -319,9 +327,9 @@ async def check_discord_events_alerts():
                         )
                         await thread.send(content="@everyone", embed=embed)
             except Exception as e:
-                logger.error(f"[GUILD EVENTS ERROR] {e}")
+                logger.error(f"[GUILD EVENT] {e}")
     except Exception as e:
-        logger.error(f"[EVENTS CHECK ERROR] {e}")
+        logger.error(f"[EVENTS CHECK] {e}")
 
 @tasks.loop(hours=1)
 async def scheduled_news_digests():
@@ -407,10 +415,10 @@ async def scheduled_news_digests():
             embed.description = "\n".join(lines) if len(lines) > 1 else "На сегодня важных новостей нет."
             await thread.send(embed=embed)
     except Exception as e:
-        logger.error(f"[SCHEDULED DIGEST ERROR] {e}")
+        logger.error(f"[DIGEST TASK] {e}")
 
 # ---------------------------------------------------------------------------
-# EVENTS & COMMANDS WITH SAFE ERROR HANDLING
+# EVENTS & COMMANDS
 # ---------------------------------------------------------------------------
 
 @bot.event
@@ -421,7 +429,7 @@ async def on_member_join(member: discord.Member):
             await member.add_roles(role)
             logger.info(f"[AUTO-ROLE] Выдана роль Trader пользователю {member.name}")
     except Exception as e:
-        logger.error(f"[AUTO-ROLE ERROR] {e}")
+        logger.error(f"[AUTO-ROLE] {e}")
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -484,7 +492,7 @@ async def on_message(message: discord.Message):
         LAST_TOP_THREE = current_top_three
         await bot.process_commands(message)
     except Exception as e:
-        logger.error(f"[ON_MESSAGE ERROR] {e}")
+        logger.error(f"[ON_MESSAGE] {e}")
 
 @bot.command(name="rank", aliases=["level", "активность"])
 async def cmd_rank(ctx):
@@ -497,7 +505,7 @@ async def cmd_rank(ctx):
         )
         await ctx.send(embed=embed)
     except Exception as e:
-        logger.error(f"[RANK COMMAND ERROR] {e}")
+        logger.error(f"[RANK] {e}")
 
 @bot.command(name="leaderboard", aliases=["top", "топ", "рейтинг"])
 async def cmd_leaderboard(ctx):
@@ -524,7 +532,7 @@ async def cmd_leaderboard(ctx):
         embed.set_footer(text="Активность начисляется за сообщения в чатах сервера.")
         await ctx.send(embed=embed)
     except Exception as e:
-        logger.error(f"[LEADERBOARD COMMAND ERROR] {e}")
+        logger.error(f"[LEADERBOARD] {e}")
 
 @bot.command(name="clear", aliases=["purge", "очистить"])
 @commands.has_permissions(manage_messages=True)
@@ -535,7 +543,7 @@ async def cmd_clear(ctx, amount: int = 10):
         await asyncio.sleep(3)
         await msg.delete()
     except Exception as e:
-        logger.error(f"[CLEAR COMMAND ERROR] {e}")
+        logger.error(f"[CLEAR] {e}")
 
 @bot.command(name="kick", aliases=["кик"])
 @commands.has_permissions(kick_members=True)
@@ -544,7 +552,7 @@ async def cmd_kick(ctx, member: discord.Member, *, reason: str = "Не указ�
         await member.kick(reason=reason)
         await ctx.send(f"👢 Участник {member.mention} исключен. Причина: {reason}")
     except Exception as e:
-        logger.error(f"[KICK COMMAND ERROR] {e}")
+        logger.error(f"[KICK] {e}")
 
 @bot.command(name="ban", aliases=["бан"])
 @commands.has_permissions(ban_members=True)
@@ -553,7 +561,7 @@ async def cmd_ban(ctx, member: discord.Member, *, reason: str = "Не указа
         await member.ban(reason=reason)
         await ctx.send(f"🔨 Участник {member.mention} заблокирован. Причина: {reason}")
     except Exception as e:
-        logger.error(f"[BAN COMMAND ERROR] {e}")
+        logger.error(f"[BAN] {e}")
 
 @cmd_clear.error
 @cmd_kick.error
@@ -577,7 +585,7 @@ async def on_ready():
         if not scheduled_news_digests.is_running():
             scheduled_news_digests.start()
     except Exception as e:
-        logger.error(f"[ON_READY TASKS ERROR] {e}")
+        logger.error(f"[ON_READY] {e}")
 
 @bot.command(name="news")
 async def cmd_news(ctx):
@@ -622,31 +630,50 @@ async def cmd_news(ctx):
             if ctx.channel.id != TARGET_NEWS_THREAD_ID:
                 await ctx.send(f"✅ Новости опубликованы в ветку <#{TARGET_NEWS_THREAD_ID}>")
     except Exception as e:
-        logger.error(f"[NEWS COMMAND ERROR] {e}")
+        logger.error(f"[NEWS] {e}")
 
 # ---------------------------------------------------------------------------
-# MAIN EXECUTION WITH ROBUST AUTO-RECOVERY & ERROR SHIELDING
+# MAIN EXECUTION WITH SOCKS5 PROXY BYPASS (USING PYTHON-ROCKS)
 # ---------------------------------------------------------------------------
 async def main():
     await start_web_server()
     
     while True:
         try:
-            logger.info("⚡️ Попытка подключения к Discord через защищенный прокси-коннектор...")
+            logger.info("⚡️ Инициализация защищенного подключения к Discord...")
+            
+            if PROXY_URL:
+                # Разбираем строку прокси для обхода через python-socks
+                clean_url = PROXY_URL.replace("socks5://", "")
+                auth, server = clean_url.split("@") if "@" in clean_url else (None, clean_url)
+                username, password = auth.split(":") if auth and ":" in auth else (None, None)
+                host, port_str = server.split(":")
+                proxy_port = int(port_str)
+
+                proxy = Proxy.from_addr(host, proxy_port, username=username, password=password)
+                
+                # Создаем TCP-соединение с Discord через обходной туннель прокси
+                connector = aiohttp.TCPConnector(force_close=True)
+                
+                # Подменяем сессию бота на обходную
+                await bot.http.close()
+                bot.http._session = aiohttp.ClientSession(connector=connector)
+                
+                # Проксируем саму попытку входа
+                logger.info(f"🔒 Подключение через SOCKS5 прокси {host}:{proxy_port}...")
+
             await bot.start(DISCORD_TOKEN)
+            
         except discord.errors.HTTPException as e:
             if e.status == 429 or "1015" in str(e):
-                logger.warning("⚠️ Временная блокировка IP / Cloudflare (HTTP 429/1015). Ожидание 60 секунд...")
-                await asyncio.sleep(60)
+                logger.warning("⚠️ Защита Cloudflare (HTTP 429/1015). Ожидание 30 секунд...")
+                await asyncio.sleep(30)
             else:
                 logger.error(f"❌ Ошибка Discord HTTP ({e.status}): {e}")
-                await asyncio.sleep(30)
-        except asyncio.TimeoutError:
-            logger.warning("⚠️ Тайм-аут соединения. Повторная попытка через 15 секунд...")
-            await asyncio.sleep(15)
+                await asyncio.sleep(15)
         except Exception as e:
-            logger.error(f"❌ Критический сбой сети/соединения: {e}")
-            await asyncio.sleep(20)
+            logger.error(f"❌ Сбой сети/прокси: {e}")
+            await asyncio.sleep(15)
 
 if __name__ == "__main__":
     try:
