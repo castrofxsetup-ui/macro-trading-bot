@@ -3,6 +3,7 @@ import sys
 import asyncio
 import logging
 import time
+import json
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 
@@ -33,6 +34,7 @@ TARGET_NEWS_THREAD_ID = 1528319066513604688
 TARGET_EVENTS_THREAD_ID = 1528506824687485118
 
 MSK_TZ = timezone(timedelta(hours=3))
+SUBS_FILE = "subs_db.json"
 
 COUNTRY_FLAGS = {
     "USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "JPY": "🇯🇵",
@@ -68,6 +70,25 @@ PAIR_OVERTAKE_TIME = 0
 PAIR_OVERTAKE_COOLDOWN = 300  # 5 минут
 
 # ---------------------------------------------------------------------------
+# SUBSCRIPTION DATABASE HELPERS
+# ---------------------------------------------------------------------------
+def load_subs():
+    if os.path.exists(SUBS_FILE):
+        try:
+            with open(SUBS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_subs(data):
+    try:
+        with open(SUBS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        logger.error(f"[SUBS DB ERROR] Ошибка сохранения базы подписок: {e}")
+
+# ---------------------------------------------------------------------------
 # BOT CLASS WITH STABLE PROXY SETUP
 # ---------------------------------------------------------------------------
 class LegacyBot(commands.Bot):
@@ -79,7 +100,6 @@ class LegacyBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        """Интеграция прокси в HTTP-сессию бота на старте с обработкой сессий"""
         if PROXY_URL:
             try:
                 connector = ProxyConnector.from_url(PROXY_URL)
@@ -238,8 +258,76 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
     return NEWS_CACHE["data"]
 
 # ---------------------------------------------------------------------------
-# AUTOMATED TASKS
+# AUTOMATED TASKS & SUBSCRIPTION MONITORING
 # ---------------------------------------------------------------------------
+
+@tasks.loop(hours=24)
+async def check_subscriptions_daily_loop():
+    """Ежедневная проверка сроков подписок (снятие роли и предупреждения за день до конца)"""
+    await bot.wait_until_ready()
+    try:
+        subs = load_subs()
+        if not subs:
+            return
+
+        now = datetime.now(timezone.utc)
+        updated = False
+        to_remove = []
+
+        for user_id_str, data in subs.items():
+            expires_at = datetime.fromisoformat(data["expires_at"])
+            time_left = expires_at - now
+            hours_left = time_left.total_seconds() / 3600.0
+
+            # Если срок полностью истек (меньше или равно 0)
+            if expires_at <= now:
+                to_remove.append(user_id_str)
+            
+            # Если до окончания осталось от 20 до 26 часов (ровно за 1 день) и уведомление еще не отправлялось
+            elif 20 <= hours_left <= 26 and not data.get("notified_1day", False):
+                for guild in bot.guilds:
+                    member = guild.get_member(int(user_id_str))
+                    if member:
+                        try:
+                            expires_str = expires_at.astimezone(MSK_TZ).strftime("%d.%m.%Y в %H:%M")
+                            await member.send(
+                                f"⚠️ Напоминание: Срок действия вашей подписки **Legacy** на сервере **{guild.name}** истекает завтра (**{expires_str} МСК**).\n"
+                                f"Для продления подписки напишите администратору **Castro**."
+                            )
+                            data["notified_1day"] = True
+                            updated = True
+                            logger.info(f"[SUB NOTIFY] Отправлено предупреждение за 1 день пользователю {member.name}")
+                        except Exception as e:
+                            logger.error(f"[SUB NOTIFY ERROR] Не удалось отправить ЛС пользователю {user_id_str}: {e}")
+
+        # Удаление просроченных подписок и снятие роли Legacy
+        if to_remove:
+            for guild in bot.guilds:
+                role = discord.utils.get(guild.roles, name="Legacy")
+                if not role:
+                    continue
+                
+                for user_id_str in to_remove:
+                    member = guild.get_member(int(user_id_str))
+                    if member and role in member.roles:
+                        try:
+                            await member.remove_roles(role)
+                            logger.info(f"[SUB EXPIRED] Снята роль Legacy с пользователя {member.name}")
+                            try:
+                                await member.send(f"⚠️ Срок действия вашей подписки **Legacy** на сервере **{guild.name}** истек. Роль была автоматически снята. Для продления напишите **Castro**.")
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            logger.error(f"[SUB REMOVE ERROR] {e}")
+                    
+                    if user_id_str in subs:
+                        del subs[user_id_str]
+                        updated = True
+
+        if updated:
+            save_subs(subs)
+    except Exception as e:
+        logger.error(f"[SUBS LOOP ERROR] {e}")
 
 @tasks.loop(minutes=1)
 async def check_30min_news_alerts():
@@ -413,8 +501,102 @@ async def scheduled_news_digests():
         logger.error(f"[DIGEST TASK] {e}")
 
 # ---------------------------------------------------------------------------
-# EVENTS & COMMANDS
+# EVENTS & COMMANDS (SUBSCRIPTION MANAGEMENT & GENERAL)
 # ---------------------------------------------------------------------------
+
+@bot.command(name="sub", aliases=["подписка"])
+@commands.has_permissions(administrator=True)
+async def cmd_sub(ctx, member: discord.Member, days: int):
+    """Выдать роль Legacy на 30, 90 или 360 дней (использование: !sub @user 30)"""
+    try:
+        if days not in [30, 90, 360]:
+            await ctx.send("❌ Доступные сроки подписки: **30**, **90** или **360** дней.")
+            return
+
+        role = discord.utils.get(ctx.guild.roles, name="Legacy")
+        if not role:
+            await ctx.send("❌ Роль с именем **Legacy** не найдена на сервере!")
+            return
+
+        subs = load_subs()
+        now = datetime.now(timezone.utc)
+        user_id_str = str(member.id)
+
+        # Продление или создание новой подписки
+        if user_id_str in subs:
+            current_end = datetime.fromisoformat(subs[user_id_str]["expires_at"])
+            if current_end > now:
+                new_end = current_end + timedelta(days=days)
+            else:
+                new_end = now + timedelta(days=days)
+        else:
+            new_end = now + timedelta(days=days)
+
+        subs[user_id_str] = {
+            "expires_at": new_end.isoformat(),
+            "days_total": days,
+            "notified_1day": False
+        }
+        save_subs(subs)
+
+        if role not in member.roles:
+            await member.add_roles(role)
+
+        expires_str = new_end.astimezone(MSK_TZ).strftime("%d.%m.%Y в %H:%M")
+        
+        embed = discord.Embed(
+            title="✅ Подписка Legacy оформлена!",
+            description=f"Участнику {member.mention} выдана подписка на **{days} дней**.\n⏳ Активна до: **{expires_str} (МСК)**",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+        
+        try:
+            await member.send(f"🎉 Вам на сервере **{ctx.guild.name}** оформлена/продлена подписка **Legacy** на {days} дней! Она активна до {expires_str} (МСК).")
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.error(f"[SUB COMMAND ERROR] {e}")
+        await ctx.send("❌ Произошла ошибка при выдаче подписки.")
+
+@bot.command(name="subinfo", aliases=["mysub", "мояподписка"])
+async def cmd_subinfo(ctx):
+    """Проверить статус своей подписки Legacy"""
+    try:
+        subs = load_subs()
+        user_id_str = str(ctx.author.id)
+
+        if user_id_str not in subs:
+            await ctx.send("📉 У вас нет активной подписки **Legacy**.")
+            return
+
+        data = subs[user_id_str]
+        expires_at = datetime.fromisoformat(data["expires_at"])
+        now = datetime.now(timezone.utc)
+
+        if expires_at <= now:
+            await ctx.send("⌛️ Ваша подписка **Legacy** истекла.")
+            return
+
+        remaining = expires_at - now
+        days_left = remaining.days
+        hours_left = remaining.seconds // 3600
+        expires_str = expires_at.astimezone(MSK_TZ).strftime("%d.%m.%Y в %H:%M")
+
+        embed = discord.Embed(
+            title="💎 Статус вашей подписки Legacy",
+            description=(
+                f"Статус: **Активна** ✅\n"
+                f"Осталось времени: **{days_left} дн. {hours_left} ч.**\n"
+                f"Истекает: **{expires_str} (МСК)**\n\n"
+                f"💬 Для продления подписки обратитесь к **Castro**."
+            ),
+            color=discord.Color.gold()
+        )
+        await ctx.send(embed=embed)
+    except Exception as e:
+        logger.error(f"[SUBINFO ERROR] {e}")
 
 @bot.event
 async def on_member_join(member: discord.Member):
@@ -579,6 +761,8 @@ async def on_ready():
             check_discord_events_alerts.start()
         if not scheduled_news_digests.is_running():
             scheduled_news_digests.start()
+        if not check_subscriptions_daily_loop.is_running():
+            check_subscriptions_daily_loop.start()
     except Exception as e:
         logger.error(f"[ON_READY] {e}")
 
