@@ -12,6 +12,7 @@ from aiohttp import web
 import discord
 from discord.ext import commands, tasks
 from curl_cffi import requests as async_requests
+from aiohttp_socks import ProxyConnector
 
 # ---------------------------------------------------------------------------
 # LOGGING SETUP
@@ -68,7 +69,6 @@ LAST_OVERTAKE_PAIR = (None, None)
 PAIR_OVERTAKE_TIME = 0
 PAIR_OVERTAKE_COOLDOWN = 300
 
-# Глобальная переменная для бота
 bot = None
 
 # ---------------------------------------------------------------------------
@@ -91,15 +91,38 @@ def save_subs(data):
         logger.error(f"[SUBS DB ERROR] Ошибка сохранения базы подписок: {e}")
 
 # ---------------------------------------------------------------------------
-# FACTORY FUNCTION TO CREATE BOT INSTANCE
+# FACTORY FUNCTION TO CREATE BOT INSTANCE WITH PROPER PROXY CONNECTOR
 # ---------------------------------------------------------------------------
 def create_bot():
-    intents = discord.Intents.default()
+    intents = intents = discord.Intents.default()
     intents.message_content = True
     intents.guild_scheduled_events = True
     intents.members = True
     
-    new_bot = commands.Bot(command_prefix="!", intents=intents, proxy=PROXY_URL if PROX_IS_VALID(PROXY_URL) else None)
+    new_bot = commands.Bot(command_prefix="!", intents=intents)
+
+    # Переопределяем метод настройки сессии с поддержкой стабильного SOCKS5 и rdns=True
+    original_setup_hook = new_bot.setup_hook
+    
+    async def custom_setup_hook():
+        if original_setup_hook:
+            await original_setup_hook()
+            
+        if PROXY_URL:
+            try:
+                # rdns=True решает проблему 502 Bad Gateway/ошибок шлюза на удаленных прокси
+                connector = ProxyConnector.from_url(PROXY_URL, rdns=True)
+                if new_bot.http._session:
+                    await new_bot.http._session.close()
+                new_bot.http._session = aiohttp.ClientSession(
+                    connector=connector,
+                    headers=new_bot.http._session.headers
+                )
+                logger.info("🔒 SOCKS5 прокси успешно интегрирован в сессию бота через ProxyConnector (rdns=True).")
+            except Exception as e:
+                logger.error(f"❌ Ошибка настройки SOCKS5 прокси-коннектора: {e}")
+
+    new_bot.setup_hook = custom_setup_hook
 
     @new_bot.event
     async def on_ready():
@@ -124,7 +147,6 @@ def create_bot():
             role = discord.utils.get(member.guild.roles, name="Trader")
             if role:
                 await member.add_roles(role)
-                logger.info(f"[AUTO-ROLE] Выдана роль Trader пользователю {member.name}")
         except Exception as e:
             logger.error(f"[AUTO-ROLE] {e}")
 
@@ -191,7 +213,6 @@ def create_bot():
         except Exception as e:
             logger.error(f"[ON_MESSAGE] {e}")
 
-    # Регистрируем команды
     @new_bot.command(name="sub", aliases=["подписка"])
     @commands.has_permissions(administrator=True)
     async def cmd_sub(ctx, member: discord.Member, days: int):
@@ -415,9 +436,6 @@ def create_bot():
             logger.error(f"[NEWS] {e}")
 
     return new_bot
-
-def PROX_IS_VALID(url):
-    return url and isinstance(url, str) and url.startswith(("http", "socks"))
 
 # ---------------------------------------------------------------------------
 # WEB SERVER FOR RENDER KEEP-ALIVE
@@ -808,7 +826,7 @@ async def scheduled_news_digests():
         logger.error(f"[DIGEST TASK] {e}")
 
 # ---------------------------------------------------------------------------
-# MAIN EXECUTION (С СОЗДАНИЕМ НОВОГО ЭКЗЕМПЛЯРА БОТА ПРИ ПЕРЕПОДКЛЮЧЕНИИ)
+# MAIN EXECUTION
 # ---------------------------------------------------------------------------
 async def main():
     global bot
@@ -817,11 +835,11 @@ async def main():
     while True:
         try:
             bot = create_bot()
-            logger.info("⚡️ Инициализация подключения к Discord API...")
+            logger.info("⚡️ Инициализация подключения к Discord API через SOCKS5 прокси...")
             await bot.start(DISCORD_TOKEN)
         except discord.errors.HTTPException as e:
             if e.status in (429, 1015) or "1015" in str(e):
-                logger.warning("⚠️ Временная блокировка IP / Cloudflare (HTTP 429/1015). Ожидание 5 минут для сброса ограничений...")
+                logger.warning("⚠️ Временная блокировка IP / Cloudflare (HTTP 429/1015). Ожидание 5 минут для сброса...")
                 try:
                     if bot:
                         await bot.close()
@@ -837,7 +855,7 @@ async def main():
                     pass
                 await asyncio.sleep(30)
         except Exception as e:
-            logger.error(f"❌ Сбой сети/прокси: {e}")
+            logger.error(f"❌ Сбой сети/прокси (502 Bad Gateway или таймаут). Повторная попытка через 30 секунд...")
             try:
                 if bot:
                     await bot.close()
