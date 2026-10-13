@@ -487,3 +487,4 @@ async def scheduled_news_digests():
             for ev, ev_msk in today_events:
                 flag = get_flag(ev["country"])
                 time_str = ev_msk.strftime("%H:%M")
+                impact_str = "🔴 **HIGH**" if ev["impact"] == "HIGH" else "🟠
