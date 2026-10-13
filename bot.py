@@ -181,9 +181,8 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.guild_scheduled_events = True
 
-# Увеличиваем таймаут соединения в клиенте Discord для стабильности на Render
-connector = aiohttp.TCPConnector(ssl=False)
 client_timeout = aiohttp.ClientTimeout(total=60, connect=30)
+connector = aiohttp.TCPConnector(ssl=False)
 
 bot = commands.Bot(
     command_prefix="!",
