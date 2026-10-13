@@ -487,4 +487,172 @@ async def scheduled_news_digests():
             for ev, ev_msk in today_events:
                 flag = get_flag(ev["country"])
                 time_str = ev_msk.strftime("%H:%M")
-                impact_str = "🔴 **HIGH**" if ev["impact"] == "HIGH" else "🟠
+                impact_str = "🔴 **HIGH**" if ev["impact"] == "HIGH" else "🟠 **MEDIUM**"
+                lines.append((
+                    f"\n🕘 {time_str} | {flag} **{ev['country']}** — {ev['title']}\n"
+                    f"{impact_str}"
+                ))
+
+            embed.description = "\n".join(lines) if len(lines) > 1 else "На сегодня важных новостей нет."
+            await thread.send(embed=embed)
+    except Exception as e:
+        logger.error(f"[DIGEST TASK] {e}")
+
+# ---------------------------------------------------------------------------
+# EVENTS & COMMANDS (SUBSCRIPTION MANAGEMENT & GENERAL)
+# ---------------------------------------------------------------------------
+
+@bot.command(name="sub", aliases=["подписка"])
+@commands.has_permissions(administrator=True)
+async def cmd_sub(ctx, member: discord.Member, days: int):
+    """Выдать роль Legacy на 30, 90 или 360 дней (использование: !sub @user 30)"""
+    try:
+        if days not in [30, 90, 360]:
+            await ctx.send("❌ Доступные сроки подписки: **30**, **90** или **360** дней.")
+            return
+
+        role = discord.utils.get(ctx.guild.roles, name="Legacy")
+        if not role:
+            await ctx.send("❌ Роль с именем **Legacy** не найдена на сервере!")
+            return
+
+        subs = load_subs()
+        now = datetime.now(timezone.utc)
+        user_id_str = str(member.id)
+
+        if user_id_str in subs:
+            current_end = datetime.fromisoformat(subs[user_id_str]["expires_at"])
+            if current_end > now:
+                new_end = current_end + timedelta(days=days)
+            else:
+                new_end = now + timedelta(days=days)
+        else:
+            new_end = now + timedelta(days=days)
+
+        subs[user_id_str] = {
+            "expires_at": new_end.isoformat(),
+            "days_total": days,
+            "notified_1day": False
+        }
+        save_subs(subs)
+
+        if role not in member.roles:
+            await member.add_roles(role)
+
+        expires_str = new_end.astimezone(MSK_TZ).strftime("%d.%m.%Y в %H:%M")
+        
+        embed = discord.Embed(
+            title="✅ Подписка Legacy оформлена!",
+            description=f"Участнику {member.mention} выдана подписка на **{days} дней**.\n⏳ Активна до: **{expires_str} (МСК)**",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+        
+        try:
+            await member.send(f"🎉 Вам на сервере **{ctx.guild.name}** оформлена/продлена подписка **Legacy** на {days} дней! Она активна до {expires_str} (МСК).")
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.error(f"[SUB COMMAND ERROR] {e}")
+        await ctx.send("❌ Произошла ошибка при выдаче подписки.")
+
+@bot.command(name="subinfo", aliases=["mysub", "мояподписка"])
+async def cmd_subinfo(ctx):
+    """Проверить статус своей подписки Legacy"""
+    try:
+        subs = load_subs()
+        user_id_str = str(ctx.author.id)
+
+        if user_id_str not in subs:
+            await ctx.send("📉 У вас нет активной подписки **Legacy**.")
+            return
+
+        data = subs[user_id_str]
+        expires_at = datetime.fromisoformat(data["expires_at"])
+        now = datetime.now(timezone.utc)
+
+        if expires_at <= now:
+            await ctx.send("⌛️ Ваша подписка **Legacy** истекла.")
+            return
+
+        remaining = expires_at - now
+        days_left = remaining.days
+        hours_left = remaining.seconds // 3600
+        expires_str = expires_at.astimezone(MSK_TZ).strftime("%d.%m.%Y в %H:%M")
+
+        embed = discord.Embed(
+            title="💎 Статус вашей подписки Legacy",
+            description=(
+                f"Статус: **Активна** ✅\n"
+                f"Осталось времени: **{days_left} дн. {hours_left} ч.**\n"
+                f"Истекает: **{expires_str} (МСК)**\n\n"
+                f"💬 Для продления подписки обратитесь к **Castro**."
+            ),
+            color=discord.Color.gold()
+        )
+        await ctx.send(embed=embed)
+    except Exception as e:
+        logger.error(f"[SUBINFO ERROR] {e}")
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    try:
+        role = discord.utils.get(member.guild.roles, name="Trader")
+        if role:
+            await member.add_roles(role)
+            logger.info(f"[AUTO-ROLE] Выдана роль Trader пользователю {member.name}")
+    except Exception as e:
+        logger.error(f"[AUTO-ROLE] {e}")
+
+@bot.event
+async def on_message(message: discord.Message):
+    global LAST_TOP_THREE, LAST_OVERTAKE_TIME, LAST_OVERTAKE_PAIR, PAIR_OVERTAKE_TIME
+
+    try:
+        if message.author.bot or not message.guild:
+            return
+
+        author_id = message.author.id
+        USER_XP[author_id] = USER_XP.get(author_id, 0) + 5
+
+        sorted_users = sorted(USER_XP.items(), key=lambda item: item[1], reverse=True)
+        current_top_three = [u_id for u_id, _ in sorted_users[:3]]
+
+        if LAST_TOP_THREE and current_top_three != LAST_TOP_THREE:
+            now = time.time()
+            if now - LAST_OVERTAKE_TIME >= GLOBAL_OVERTAKE_COOLDOWN:
+                overtaker_id = author_id
+                if overtaker_id in current_top_three:
+                    new_pos = current_top_three.index(overtaker_id) + 1
+                    
+                    overtaken_id = None
+                    if overtaker_id in LAST_TOP_THREE:
+                        old_pos = LAST_TOP_THREE.index(overtaker_id)
+                        if new_pos - 1 < old_pos:
+                            overtaken_id = LAST_TOP_THREE[new_pos - 1]
+                    else:
+                        overtaken_id = LAST_TOP_THREE[-1]
+
+                    if overtaken_id and overtaken_id != overtaker_id:
+                        current_pair = (overtaker_id, overtaken_id)
+
+                        if current_pair != LAST_OVERTAKE_PAIR or (now - PAIR_OVERTAKE_TIME >= PAIR_OVERTAKE_COOLDOWN):
+                            overtaker_member = message.guild.get_member(overtaker_id)
+                            overtaken_member = message.guild.get_member(overtaken_id)
+
+                            overtaker_name = overtaker_member.mention if overtaker_member else f"<@{overtaker_id}>"
+                            overtaken_name = overtaken_member.mention if overtaken_member else f"<@{overtaken_id}>"
+
+                            medals = {1: "🥇 1-е место", 2: "🥈 2-е место", 3: "🥉 3-е место"}
+                            pos_str = medals.get(new_pos, f"**{new_pos}-е место**")
+
+                            embed = discord.Embed(
+                                title="⚡️ Смена лидера в Топе Активности!",
+                                description=(
+                                    f"🔥 {overtaker_name} вырывается вперед и забирает {pos_str}, обгоняя {overtaken_name}!\n\n"
+                                    f"👀 {overtaken_name}, самое время поднапрячься и вернуть свою позицию!"
+                                ),
+                                color=discord.Color.gold()
+                            )
+                            embed.set_footer(text="Рейтинг рассчитывается по сообщения
