@@ -61,10 +61,14 @@ CACHE_TTL_SECONDS = 1800  # 30 минут
 # База данных активности в памяти (User ID -> XP)
 USER_XP = {}
 
-# Отслеживание топ-3 лидеров и кулдауна уведомлений об обгоне
-LAST_TOP_THREE = []  # Список ID участников [1-е место, 2-е место, 3-е место]
-LAST_OVERTAKE_TIME = 0  # Timestamp последнего анонса обгона
-OVERTAKE_COOLDOWN_SECONDS = 3600  # 1 час между уведомлениями
+# Отслеживание топ-3 лидеров и параметров антиспама обгонов
+LAST_TOP_THREE = []
+LAST_OVERTAKE_TIME = 0
+GLOBAL_OVERTAKE_COOLDOWN = 180  # Общий кулдаун между любыми анонсами обгона (3 минуты)
+
+LAST_OVERTAKE_PAIR = (None, None)  # (Кто обогнал, Кого обогнали)
+PAIR_OVERTAKE_TIME = 0
+PAIR_OVERTAKE_COOLDOWN = 300  # Кулдаун для конкретной пары участников (5 минут)
 
 # ---------------------------------------------------------------------------
 # INITIALIZE DISCORD BOT
@@ -72,7 +76,7 @@ OVERTAKE_COOLDOWN_SECONDS = 3600  # 1 час между уведомлениям
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guild_scheduled_events = True
-intents.members = True  # Требуется для авто-роли при входе новых пользователей
+intents.members = True
 
 bot = commands.Bot(
     command_prefix="!",
@@ -385,7 +389,7 @@ async def scheduled_news_digests():
         await thread.send(embed=embed)
 
 # ---------------------------------------------------------------------------
-# AUTO-ROLE & ACTIVITY (JUNIPER-LIKE) & LEADERBOARD SYSTEM
+# AUTO-ROLE & ACTIVITY & LEADERBOARD SYSTEM (WITH SMART OVERTAKE ANTISPAM)
 # ---------------------------------------------------------------------------
 
 @bot.event
@@ -401,30 +405,28 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_message(message: discord.Message):
-    global LAST_TOP_THREE, LAST_OVERTAKE_TIME
+    global LAST_TOP_THREE, LAST_OVERTAKE_TIME, LAST_OVERTAKE_PAIR, PAIR_OVERTAKE_TIME
 
     if message.author.bot or not message.guild:
         return
 
-    # Подсчет активности (XP за сообщения)
+    # Начисление XP за сообщения
     author_id = message.author.id
     USER_XP[author_id] = USER_XP.get(author_id, 0) + 5
 
-    # Проверка изменения позиций в топ-3
+    # Проверка изменений в топ-3
     sorted_users = sorted(USER_XP.items(), key=lambda item: item[1], reverse=True)
     current_top_three = [u_id for u_id, _ in sorted_users[:3]]
 
-    # Если прошлый топ был заполнен и произошла смена позиций среди первых 3 мест
     if LAST_TOP_THREE and current_top_three != LAST_TOP_THREE:
         now = time.time()
-        # Проверяем, прошел ли 1 час с прошлого анонса
-        if now - LAST_OVERTAKE_TIME >= OVERTAKE_COOLDOWN_SECONDS:
-            # Находим пользователя, который поднялся выше
+        
+        # 1. Общий кулдаун уведомлений (не чаще чем раз в 3 минуты)
+        if now - LAST_OVERTAKE_TIME >= GLOBAL_OVERTAKE_COOLDOWN:
             overtaker_id = author_id
             if overtaker_id in current_top_three:
                 new_pos = current_top_three.index(overtaker_id) + 1
                 
-                # Проверяем, кто потерял позицию
                 overtaken_id = None
                 if overtaker_id in LAST_TOP_THREE:
                     old_pos = LAST_TOP_THREE.index(overtaker_id)
@@ -434,19 +436,193 @@ async def on_message(message: discord.Message):
                     overtaken_id = LAST_TOP_THREE[-1]
 
                 if overtaken_id and overtaken_id != overtaker_id:
-                    overtaker_member = message.guild.get_member(overtaker_id)
-                    overtaken_member = message.guild.get_member(overtaken_id)
+                    current_pair = (overtaker_id, overtaken_id)
 
-                    overtaker_name = overtaker_member.mention if overtaker_member else f"<@{overtaker_id}>"
-                    overtaken_name = overtaken_member.mention if overtaken_member else f"<@{overtaken_id}>"
+                    # 2. Проверка антиспама для той же пары (не чаще чем раз в 5 минут для одних и тех же людей)
+                    if current_pair != LAST_OVERTAKE_PAIR or (now - PAIR_OVERTAKE_TIME >= PAIR_OVERTAKE_COOLDOWN):
+                        overtaker_member = message.guild.get_member(overtaker_id)
+                        overtaken_member = message.guild.get_member(overtaken_id)
 
-                    medals = {1: "🥇 1-е место", 2: "🥈 2-е место", 3: "🥉 3-е место"}
-                    pos_str = medals.get(new_pos, f"**{new_pos}-е место**")
+                        overtaker_name = overtaker_member.mention if overtaker_member else f"<@{overtaker_id}>"
+                        overtaken_name = overtaken_member.mention if overtaken_member else f"<@{overtaken_id}>"
 
-                    embed = discord.Embed(
-                        title="⚡️ Смена лидера в Топе Активности!",
-                        description=(
-                            f"🔥 {overtaker_name} вырывается вперед и забирает {pos_str}, обгоняя {overtaken_name}!\n\n"
-                            f"👀 {overtaken_name}, самое время поднапрячься и вернуть свою позицию!"
-                        ),
-                        color=discord.Color.gold()
+                        medals = {1: "🥇 1-е место", 2: "🥈 2-е место", 3: "🥉 3-е место"}
+                        pos_str = medals.get(new_pos, f"**{new_pos}-е место**")
+
+                        embed = discord.Embed(
+                            title="⚡️ Смена лидера в Топе Активности!",
+                            description=(
+                                f"🔥 {overtaker_name} вырывается вперед и забирает {pos_str}, обгоняя {overtaken_name}!\n\n"
+                                f"👀 {overtaken_name}, самое время поднапрячься и вернуть свою позицию!"
+                            ),
+                            color=discord.Color.gold()
+                        )
+                        embed.set_footer(text="Рейтинг рассчитывается по сообщениям на сервере")
+                        
+                        await message.channel.send(embed=embed)
+                        
+                        # Обновляем временные метки и текущую пару
+                        LAST_OVERTAKE_TIME = now
+                        LAST_OVERTAKE_PAIR = current_pair
+                        PAIR_OVERTAKE_TIME = now
+
+    LAST_TOP_THREE = current_top_three
+
+    await bot.process_commands(message)
+
+# Команда проверки личного ранга
+@bot.command(name="rank", aliases=["level", "активность"])
+async def cmd_rank(ctx):
+    xp = USER_XP.get(ctx.author.id, 0)
+    embed = discord.Embed(
+        title="📊 Статистика активности",
+        description=f"Участник: {ctx.author.mention}\n⚡️ Накоплено опыта (XP): **{xp}**",
+        color=discord.Color.blue()
+    )
+    await ctx.send(embed=embed)
+
+# Команда вывода таблицы лидеров
+@bot.command(name="leaderboard", aliases=["top", "топ", "рейтинг"])
+async def cmd_leaderboard(ctx):
+    if not USER_XP:
+        await ctx.send("📉 База активности пока пуста. Участники еще не отправляли сообщения.")
+        return
+
+    sorted_users = sorted(USER_XP.items(), key=lambda item: item[1], reverse=True)
+
+    lines = []
+    medals = ["🥇", "🥈", "🥉"]
+
+    for idx, (user_id, xp) in enumerate(sorted_users[:10], start=1):
+        user = ctx.guild.get_member(user_id)
+        name = user.mention if user else f"Пользователь (ID: {user_id})"
+        prefix = medals[idx - 1] if idx <= 3 else f"**{idx}.**"
+        lines.append(f"{prefix} {name} — **{xp} XP**")
+
+    embed = discord.Embed(
+        title="🏆 Рейтинг активности участников",
+        description="\n".join(lines),
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text="Активность начисляется за сообщения в чатах сервера.")
+    await ctx.send(embed=embed)
+
+# --- Модерационные команды ---
+
+@bot.command(name="clear", aliases=["purge", "очистить"])
+@commands.has_permissions(manage_messages=True)
+async def cmd_clear(ctx, amount: int = 10):
+    await ctx.channel.purge(limit=amount + 1)
+    msg = await ctx.send(f"🧹 Успешно удалено сообщений: {amount}")
+    await asyncio.sleep(3)
+    await msg.delete()
+
+@bot.command(name="kick", aliases=["кик"])
+@commands.has_permissions(kick_members=True)
+async def cmd_kick(ctx, member: discord.Member, *, reason: str = "Не указана"):
+    await member.kick(reason=reason)
+    await ctx.send(f"👢 Участник {member.mention} исключен. Причина: {reason}")
+
+@bot.command(name="ban", aliases=["бан"])
+@commands.has_permissions(ban_members=True)
+async def cmd_ban(ctx, member: discord.Member, *, reason: str = "Не указана"):
+    await member.ban(reason=reason)
+    await ctx.send(f"🔨 Участник {member.mention} заблокирован. Причина: {reason}")
+
+@cmd_clear.error
+@cmd_kick.error
+@cmd_ban.error
+async def mod_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ У вас недостаточно прав для выполнения этой команды.")
+    else:
+        await ctx.send("❌ Ошибка при выполнении модерационной команды.")
+
+# ---------------------------------------------------------------------------
+# BOT EVENTS & COMMANDS (TRADING / NEWS)
+# ---------------------------------------------------------------------------
+@bot.event
+async def on_ready():
+    logger.info(f"✅ Успешный вход: {bot.user} (ID: {bot.user.id})")
+    await fetch_economic_news(force_refresh=True)
+
+    if not check_30min_news_alerts.is_running():
+        check_30min_news_alerts.start()
+    if not check_discord_events_alerts.is_running():
+        check_discord_events_alerts.start()
+    if not scheduled_news_digests.is_running():
+        scheduled_news_digests.start()
+
+@bot.command(name="news")
+async def cmd_news(ctx):
+    thread = await get_target_channel(TARGET_NEWS_THREAD_ID)
+    if not thread:
+        await ctx.send("❌ Целевая ветка для новостей не найдена.")
+        return
+
+    async with ctx.typing():
+        news = await fetch_economic_news()
+        now_msk = datetime.now(MSK_TZ)
+        today_date = now_msk.date()
+
+        today_events = []
+        for ev in news:
+            if not ev.get("dt_utc"):
+                continue
+            ev_msk = ev["dt_utc"].astimezone(MSK_TZ)
+            if ev_msk.date() == today_date:
+                today_events.append((ev, ev_msk))
+
+        embed = discord.Embed(
+            title="**Ежедневный экономический календарь Forex**",
+            color=discord.Color.gold()
+        )
+
+        day_name = DAYS_RU[now_msk.weekday()]
+        lines = [f"📅 *Запланированные события: {day_name}, {now_msk.strftime('%d.%m')}*"]
+
+        for ev, ev_msk in today_events:
+            flag = get_flag(ev["country"])
+            time_str = ev_msk.strftime("%H:%M")
+            impact_str = "🔴 **HIGH**" if ev["impact"] == "HIGH" else "🟠 **MEDIUM**"
+
+            lines.append(f"\n🕘 {time_str} | {flag} **{ev['country']}** — {ev['title']}")
+            lines.append(f"{impact_str}")
+
+        embed.description = "\n".join(lines) if len(lines) > 1 else "На сегодня важных новостей больше нет."
+        await thread.send(embed=embed)
+        
+        if ctx.channel.id != TARGET_NEWS_THREAD_ID:
+            await ctx.send(f"✅ Новости опубликованы в ветку <#{TARGET_NEWS_THREAD_ID}>")
+
+# ---------------------------------------------------------------------------
+# MAIN EXECUTION WITH AUTO-RECONNECT
+# ---------------------------------------------------------------------------
+async def main():
+    await start_web_server()
+    
+    if PROXY_URL:
+        connector = ProxyConnector.from_url(PROXY_URL)
+        bot._connection.connector = connector
+        logger.info("🔒 SOCKS5 прокси успешно подключен к коннектору бота.")
+
+    while True:
+        try:
+            logger.info("⚡️ Попытка подключения к Discord...")
+            await bot.start(DISCORD_TOKEN)
+        except discord.errors.HTTPException as e:
+            if e.status == 429 or "1015" in str(e):
+                logger.warning("⚠️ Cloudflare/Discord заблокировал IP. Ожидание 90 секунд...")
+                await asyncio.sleep(90)
+            else:
+                logger.error(f"❌ Ошибка Discord HTTP ({e.status}): {e}")
+                await asyncio.sleep(30)
+        except Exception as e:
+            logger.error(f"❌ Непредвиденный сбой сети/подключения: {e}")
+            await asyncio.sleep(20)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен вручную.")
