@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 import json
+import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 
@@ -30,8 +31,13 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 PROXY_URL = os.getenv("PROXY_URL")
 PORT = int(os.getenv("PORT", 10000))
 
+# ID веток/каналов
 TARGET_NEWS_THREAD_ID = 1528319066513604688
 TARGET_EVENTS_THREAD_ID = 1528506824687485118
+TARGET_STREAMS_CHANNEL_ID = 1528319066513604688  # Замените при необходимости на ID канала для анонсов стримов
+
+# YouTube Channel ID (например: UCxxxxxxxxxxxx) или handle (@channelname)
+YOUTUBE_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID", "")
 
 MSK_TZ = timezone(timedelta(hours=3))
 SUBS_FILE = "subs_db.json"
@@ -58,6 +64,7 @@ if not DISCORD_TOKEN:
 NEWS_CACHE = {"data": [], "last_fetch": 0}
 SENT_NEWS_ALERTS = set()
 SENT_DISCORD_EVENTS = set()
+SENT_YOUTUBE_STREAMS = set()
 CACHE_TTL_SECONDS = 1800
 
 LAST_TOP_THREE = []
@@ -69,7 +76,7 @@ PAIR_OVERTAKE_TIME = 0
 PAIR_OVERTAKE_COOLDOWN = 300
 
 bot = None
-USE_PROXY = True  # Флаг для автоматического переключения при сбое прокси
+USE_PROXY = True
 
 # ---------------------------------------------------------------------------
 # DATABASE HELPERS (SUBS & XP)
@@ -110,7 +117,7 @@ def save_xp(data):
 USER_XP = load_xp()
 
 # ---------------------------------------------------------------------------
-# FACTORY FUNCTION TO CREATE BOT INSTANCE WITH PROXY FALLBACK
+# FACTORY FUNCTION TO CREATE BOT INSTANCE
 # ---------------------------------------------------------------------------
 def create_bot():
     global USE_PROXY
@@ -144,9 +151,9 @@ def create_bot():
                     connector=connector,
                     headers=new_bot.http._session.headers if hasattr(new_bot.http, "_session") else {}
                 )
-                logger.info("🔒 SOCKS5 прокси успешно интегрирован в сессию бота через ProxyConnector (rdns=True).")
+                logger.info("🔒 SOCKS5 прокси успешно интегрирован в сессию бота.")
             except Exception as e:
-                logger.error(f"❌ Ошибка настройки SOCKS5 прокси-коннектора: {e}. Переключаемся на прямое подключение.")
+                logger.warning(f"⚠️ Не удалось подключить SOCKS5 прокси ({e}). Используется прямое подключение.")
                 USE_PROXY = False
 
     new_bot.setup_hook = custom_setup_hook
@@ -165,6 +172,8 @@ def create_bot():
                 scheduled_news_digests.start()
             if not check_subscriptions_daily_loop.is_running():
                 check_subscriptions_daily_loop.start()
+            if YOUTUBE_CHANNEL_ID and not check_youtube_streams_loop.is_running():
+                check_youtube_streams_loop.start()
         except Exception as e:
             logger.error(f"[ON_READY] {e}")
 
@@ -442,24 +451,6 @@ def create_bot():
         except Exception as e:
             logger.error(f"[CLEAR] {e}")
 
-    @new_bot.command(name="kick", aliases=["кик"])
-    @commands.has_permissions(kick_members=True)
-    async def cmd_kick(ctx, member: discord.Member, *, reason: str = "Не указана"):
-        try:
-            await member.kick(reason=reason)
-            await ctx.send(f"👢 Участник {member.mention} исключен. Причина: {reason}")
-        except Exception as e:
-            logger.error(f"[KICK] {e}")
-
-    @new_bot.command(name="ban", aliases=["бан"])
-    @commands.has_permissions(ban_members=True)
-    async def cmd_ban(ctx, member: discord.Member, *, reason: str = "Не указана"):
-        try:
-            await member.ban(reason=reason)
-            await ctx.send(f"🔨 Участник {member.mention} заблокирован. Причина: {reason}")
-        except Exception as e:
-            logger.error(f"[BAN] {e}")
-
     @new_bot.command(name="news")
     async def cmd_news(ctx):
         try:
@@ -651,8 +642,62 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
     return NEWS_CACHE["data"]
 
 # ---------------------------------------------------------------------------
-# AUTOMATED TASKS & SUBSCRIPTION MONITORING
+# AUTOMATED TASKS (YOUTUBE, DISCORD EVENTS, NEWS & SUBSCRIPTIONS)
 # ---------------------------------------------------------------------------
+
+@tasks.loop(minutes=5)
+async def check_youtube_streams_loop():
+    """Проверка начала прямых трансляций на YouTube."""
+    try:
+        if not bot or not YOUTUBE_CHANNEL_ID:
+            return
+        await bot.wait_until_ready()
+
+        channel = await get_target_channel(TARGET_STREAMS_CHANNEL_ID)
+        if not channel:
+            return
+
+        rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={YOUTUBE_CHANNEL_ID}"
+        
+        r = await asyncio.to_thread(
+            async_requests.get,
+            rss_url,
+            impersonate="chrome120",
+            timeout=10
+        )
+
+        if r.status_code == 200:
+            root = ET.fromstring(r.text)
+            ns = {"atom": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015"}
+            
+            for entry in root.findall("atom:entry", ns):
+                video_id = entry.findtext("yt:videoId", namespaces=ns)
+                title = entry.findtext("atom:title", namespaces=ns)
+                link = f"https://www.youtube.com/watch?v={video_id}"
+
+                if video_id and video_id not in SENT_YOUTUBE_STREAMS:
+                    # Проверяем, является ли видео прямым эфиром
+                    video_page = await asyncio.to_thread(
+                        async_requests.get,
+                        link,
+                        impersonate="chrome120",
+                        timeout=10
+                    )
+                    
+                    if video_page.status_code == 200 and ('"isLive":true' in video_page.text or '"style":"LIVE"' in video_page.text):
+                        SENT_YOUTUBE_STREAMS.add(video_id)
+                        
+                        embed = discord.Embed(
+                            title="🔴 На YouTube начался прямой эфир!",
+                            description=f"**[{title}]({link})**\n\nПрисоединяйтесь к трансляции!",
+                            color=discord.Color.red()
+                        )
+                        embed.set_thumbnail(url=f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg")
+                        
+                        await channel.send(content="@everyone", embed=embed)
+                        break
+    except Exception as e:
+        logger.error(f"[YOUTUBE LOOP ERROR] {e}")
 
 @tasks.loop(hours=24)
 async def check_subscriptions_daily_loop():
