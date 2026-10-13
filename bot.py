@@ -820,25 +820,31 @@ async def cmd_news(ctx):
         logger.error(f"[NEWS] {e}")
 
 # ---------------------------------------------------------------------------
-# MAIN EXECUTION
+# MAIN EXECUTION (С ЗАЩИТОЙ ОТ CLOUDFLARE 429/1015)
 # ---------------------------------------------------------------------------
 async def main():
     await start_web_server()
     
     while True:
         try:
-            logger.info("⚡️ Инициализация подключения с защищенным ProxyConnector...")
+            logger.info("⚡️ Инициализация подключения к Discord API...")
             await bot.start(DISCORD_TOKEN)
         except discord.errors.HTTPException as e:
-            if e.status == 429 or "1015" in str(e):
-                logger.warning("⚠️ Временная блокировка IP / Cloudflare (HTTP 429/1015). Ожидание 30 секунд...")
-                await asyncio.sleep(30)
+            if e.status in (429, 1015) or "1015" in str(e):
+                logger.warning("⚠️ Временная блокировка IP / Cloudflare (HTTP 429/1015). Ожидание 5 минут для сброса ограничений...")
+                await bot.close()
+                await asyncio.sleep(300)  # Ждем 5 минут, чтобы баг-лист IP очистился
             else:
                 logger.error(f"❌ Ошибка Discord HTTP ({e.status}): {e}")
-                await asyncio.sleep(15)
+                await bot.close()
+                await asyncio.sleep(30)
         except Exception as e:
             logger.error(f"❌ Сбой сети/прокси: {e}")
-            await asyncio.sleep(15)
+            try:
+                await bot.close()
+            except Exception:
+                pass
+            await asyncio.sleep(30)
 
 if __name__ == "__main__":
     try:
