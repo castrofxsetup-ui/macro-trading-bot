@@ -11,7 +11,6 @@ from aiohttp import web
 import discord
 from discord.ext import commands, tasks
 from curl_cffi import requests as async_requests
-from aiohttp_socks import ProxyConnector
 
 # ---------------------------------------------------------------------------
 # LOGGING SETUP
@@ -28,6 +27,13 @@ logger = logging.getLogger("LegacyBot")
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 PROXY_URL = os.getenv("PROXY_URL")
 PORT = int(os.getenv("PORT", 10000))
+
+# Прописываем прокси в окружение для автоматического подхвата библиотеками
+if PROXY_URL:
+    os.environ["HTTP_PROXY"] = PROXY_URL
+    os.environ["HTTPS_PROXY"] = PROXY_URL
+    os.environ["ALL_PROXY"] = PROXY_URL
+    logger.info("🔒 Прокси успешно зарегистрирован в системном окружении.")
 
 # ID целевых веток Discord
 TARGET_NEWS_THREAD_ID = 1528319066513604688
@@ -56,7 +62,7 @@ if not DISCORD_TOKEN:
 NEWS_CACHE = {"data": [], "last_fetch": 0}
 SENT_NEWS_ALERTS = set()
 SENT_DISCORD_EVENTS = set()
-CACHE_TTL_SECONDS = 1800  # 30 минут
+CACHE_TTL_SECONDS = 1800
 
 # База данных активности в памяти (User ID -> XP)
 USER_XP = {}
@@ -64,11 +70,11 @@ USER_XP = {}
 # Отслеживание топ-3 лидеров и параметров антиспама обгонов
 LAST_TOP_THREE = []
 LAST_OVERTAKE_TIME = 0
-GLOBAL_OVERTAKE_COOLDOWN = 180  # Общий кулдаун между любыми анонсами (3 минуты / 180 сек)
+GLOBAL_OVERTAKE_COOLDOWN = 180  # 3 минуты
 
-LAST_OVERTAKE_PAIR = (None, None)  # (Кто обогнал, Кого обогнали)
+LAST_OVERTAKE_PAIR = (None, None)
 PAIR_OVERTAKE_TIME = 0
-PAIR_OVERTAKE_COOLDOWN = 300  # Кулдаун для конкретной пары участников (5 минут / 300 сек)
+PAIR_OVERTAKE_COOLDOWN = 300  # 5 минут
 
 # ---------------------------------------------------------------------------
 # INITIALIZE DISCORD BOT
@@ -78,10 +84,15 @@ intents.message_content = True
 intents.guild_scheduled_events = True
 intents.members = True
 
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents
-)
+# Передаем proxy аргумент напрямую в бота (поддерживается в новых версиях discord.py)
+bot_kwargs = {
+    "command_prefix": "!",
+    "intents": intents
+}
+if PROXY_URL:
+    bot_kwargs["proxy"] = PROXY_URL
+
+bot = commands.Bot(**bot_kwargs)
 
 # ---------------------------------------------------------------------------
 # WEB SERVER FOR RENDER KEEP-ALIVE
@@ -389,12 +400,11 @@ async def scheduled_news_digests():
         await thread.send(embed=embed)
 
 # ---------------------------------------------------------------------------
-# AUTO-ROLE & ACTIVITY & LEADERBOARD SYSTEM (WITH SMART OVERTAKE ANTISPAM)
+# AUTO-ROLE & ACTIVITY & LEADERBOARD SYSTEM
 # ---------------------------------------------------------------------------
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    """Выдача роли @Trader при входе"""
     role = discord.utils.get(member.guild.roles, name="Trader")
     if role:
         try:
@@ -410,18 +420,14 @@ async def on_message(message: discord.Message):
     if message.author.bot or not message.guild:
         return
 
-    # Начисление XP за сообщения
     author_id = message.author.id
     USER_XP[author_id] = USER_XP.get(author_id, 0) + 5
 
-    # Проверка изменений в топ-3
     sorted_users = sorted(USER_XP.items(), key=lambda item: item[1], reverse=True)
     current_top_three = [u_id for u_id, _ in sorted_users[:3]]
 
     if LAST_TOP_THREE and current_top_three != LAST_TOP_THREE:
         now = time.time()
-        
-        # 1. Общий кулдаун уведомлений (не чаще чем раз в 3 минуты / 180 сек)
         if now - LAST_OVERTAKE_TIME >= GLOBAL_OVERTAKE_COOLDOWN:
             overtaker_id = author_id
             if overtaker_id in current_top_three:
@@ -438,7 +444,6 @@ async def on_message(message: discord.Message):
                 if overtaken_id and overtaken_id != overtaker_id:
                     current_pair = (overtaker_id, overtaken_id)
 
-                    # 2. Антиспам для конкретной пары (не чаще чем раз в 5 минут / 300 сек между одними и теми же людьми)
                     if current_pair != LAST_OVERTAKE_PAIR or (now - PAIR_OVERTAKE_TIME >= PAIR_OVERTAKE_COOLDOWN):
                         overtaker_member = message.guild.get_member(overtaker_id)
                         overtaken_member = message.guild.get_member(overtaken_id)
@@ -466,10 +471,8 @@ async def on_message(message: discord.Message):
                         PAIR_OVERTAKE_TIME = now
 
     LAST_TOP_THREE = current_top_three
-
     await bot.process_commands(message)
 
-# Команда проверки личного ранга
 @bot.command(name="rank", aliases=["level", "активность"])
 async def cmd_rank(ctx):
     xp = USER_XP.get(ctx.author.id, 0)
@@ -480,7 +483,6 @@ async def cmd_rank(ctx):
     )
     await ctx.send(embed=embed)
 
-# Команда вывода таблицы лидеров
 @bot.command(name="leaderboard", aliases=["top", "топ", "рейтинг"])
 async def cmd_leaderboard(ctx):
     if not USER_XP:
@@ -488,7 +490,6 @@ async def cmd_leaderboard(ctx):
         return
 
     sorted_users = sorted(USER_XP.items(), key=lambda item: item[1], reverse=True)
-
     lines = []
     medals = ["🥇", "🥈", "🥉"]
 
@@ -505,8 +506,6 @@ async def cmd_leaderboard(ctx):
     )
     embed.set_footer(text="Активность начисляется за сообщения в чатах сервера.")
     await ctx.send(embed=embed)
-
-# --- Модерационные команды ---
 
 @bot.command(name="clear", aliases=["purge", "очистить"])
 @commands.has_permissions(manage_messages=True)
@@ -537,9 +536,6 @@ async def mod_error(ctx, error):
     else:
         await ctx.send("❌ Ошибка при выполнении модерационной команды.")
 
-# ---------------------------------------------------------------------------
-# BOT EVENTS & COMMANDS (TRADING / NEWS)
-# ---------------------------------------------------------------------------
 @bot.event
 async def on_ready():
     logger.info(f"✅ Успешный вход: {bot.user} (ID: {bot.user.id})")
@@ -595,30 +591,23 @@ async def cmd_news(ctx):
             await ctx.send(f"✅ Новости опубликованы в ветку <#{TARGET_NEWS_THREAD_ID}>")
 
 # ---------------------------------------------------------------------------
-# MAIN EXECUTION WITH AUTO-RECONNECT (PROPER SOCKS5 CONNECTOR INIT)
+# MAIN EXECUTION
 # ---------------------------------------------------------------------------
 async def main():
     await start_web_server()
-    
-    # Инициализация коннектора внутри event loop для правильного обхода блокировок
-    if PROXY_URL:
-        connector = ProxyConnector.from_url(PROXY_URL)
-        bot._connection.connector = connector
-        logger.info("🔒 SOCKS5 прокси успешно интегрирован в соединение бота.")
-
     while True:
         try:
-            logger.info("⚡️ Попытка подключения к Discord...")
+            logger.info("⚡️ Попытка подключения к Discord через встроенный прокси-адаптер...")
             await bot.start(DISCORD_TOKEN)
         except discord.errors.HTTPException as e:
             if e.status == 429 or "1015" in str(e):
-                logger.warning("⚠️ Cloudflare/Discord временно заблокировал IP. Ожидание 90 секунд...")
-                await asyncio.sleep(90)
+                logger.warning("⚠️ Временный затык сети/Cloudflare. Ожидание 60 секунд...")
+                await asyncio.sleep(60)
             else:
                 logger.error(f"❌ Ошибка Discord HTTP ({e.status}): {e}")
                 await asyncio.sleep(30)
         except Exception as e:
-            logger.error(f"❌ Непредвиденный сбой сети/подключения: {e}")
+            logger.error(f"❌ Сбой сети: {e}")
             await asyncio.sleep(20)
 
 if __name__ == "__main__":
