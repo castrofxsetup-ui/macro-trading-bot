@@ -12,6 +12,7 @@ from aiohttp import web
 import discord
 from discord.ext import commands, tasks
 from curl_cffi import requests as async_requests
+import asyncpg
 
 # ---------------------------------------------------------------------------
 # LOGGING SETUP
@@ -26,7 +27,8 @@ logger = logging.getLogger("LegacyBot")
 # CONFIGURATION & ENVIRONMENT VARIABLES
 # ---------------------------------------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-PROXY_URL = os.getenv("PROXY_URL")  # Используется для парсинга новостей и YouTube
+PROXY_URL = os.getenv("PROXY_URL")
+DATABASE_URL = os.getenv("DATABASE_URL")  # PostgreSQL URL от Render
 PORT = int(os.getenv("PORT", 10000))
 
 TARGET_NEWS_THREAD_ID = 1528319066513604688
@@ -36,8 +38,6 @@ TARGET_STREAMS_CHANNEL_ID = 1528319066513604688
 YOUTUBE_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID", "")
 
 MSK_TZ = timezone(timedelta(hours=3))
-SUBS_FILE = "subs_db.json"
-XP_FILE = "xp_db.json"
 
 COUNTRY_FLAGS = {
     "USD": "🇺🇸", "EUR": "🇪🇺", "GBP": "🇬🇧", "JPY": "🇯🇵",
@@ -72,44 +72,96 @@ PAIR_OVERTAKE_TIME = 0
 PAIR_OVERTAKE_COOLDOWN = 300
 
 bot = None
+db_pool = None
+USER_XP = {}
 
 # ---------------------------------------------------------------------------
-# DATABASE HELPERS (SUBS & XP)
+# POSTGRESQL DATABASE HELPERS (PERSISTENT CLOUD STORAGE)
 # ---------------------------------------------------------------------------
-def load_subs():
-    if os.path.exists(SUBS_FILE):
-        try:
-            with open(SUBS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+async def init_db():
+    global db_pool, USER_XP
+    if not DATABASE_URL:
+        logger.warning("⚠️ DATABASE_URL не указан. База данных не подключена.")
+        return
 
-def save_subs(data):
     try:
-        with open(SUBS_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
+        # Корректировка протокола для asyncpg
+        url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+        db_pool = await asyncpg.create_pool(dsn=url)
+        
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_xp (
+                    user_id BIGINT PRIMARY KEY,
+                    xp BIGINT NOT NULL DEFAULT 0
+                );
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    user_id BIGINT PRIMARY KEY,
+                    expires_at TEXT NOT NULL,
+                    days_total INT NOT NULL,
+                    notified_1day BOOLEAN NOT NULL DEFAULT FALSE
+                );
+            """)
+            
+            # Загрузка XP в память для быстрой работы
+            rows = await conn.fetch("SELECT user_id, xp FROM user_xp;")
+            USER_XP = {row["user_id"]: row["xp"] for row in rows}
+            
+        logger.info("✅ Успешное подключение к PostgreSQL БД!")
     except Exception as e:
-        logger.error(f"[SUBS DB ERROR] Ошибка сохранения базы подписок: {e}")
+        logger.error(f"❌ Ошибка подключения к базе данных: {e}")
 
-def load_xp():
-    if os.path.exists(XP_FILE):
+async def add_user_xp(user_id: int, amount: int = 5):
+    global USER_XP
+    USER_XP[user_id] = USER_XP.get(user_id, 0) + amount
+    if db_pool:
         try:
-            with open(XP_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return {int(k): v for k, v in data.items()}
-        except Exception:
-            return {}
-    return {}
+            async with db_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO user_xp (user_id, xp) VALUES ($1, $2)
+                    ON CONFLICT (user_id) DO UPDATE SET xp = $2;
+                """, user_id, USER_XP[user_id])
+        except Exception as e:
+            logger.error(f"[DB XP SAVE ERROR] {e}")
 
-def save_xp(data):
+async def db_load_subs() -> dict:
+    if not db_pool:
+        return {}
     try:
-        with open(XP_FILE, "w", encoding="utf-8") as f:
-            json.dump({str(k): v for k, v in data.items()}, f, ensure_ascii=False, indent=4)
+        async with db_pool.acquire() as conn:
+            rows = await conn.fetch("SELECT user_id, expires_at, days_total, notified_1day FROM subscriptions;")
+            return {
+                str(row["user_id"]): {
+                    "expires_at": row["expires_at"],
+                    "days_total": row["days_total"],
+                    "notified_1day": row["notified_1day"]
+                }
+                for row in rows
+            }
     except Exception as e:
-        logger.error(f"[XP DB ERROR] Ошибка сохранения опыта: {e}")
+        logger.error(f"[DB SUBS LOAD ERROR] {e}")
+        return {}
 
-USER_XP = load_xp()
+async def db_save_sub(user_id: int, expires_at: str, days_total: int, notified: bool):
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO subscriptions (user_id, expires_at, days_total, notified_1day)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        expires_at = $2, days_total = $3, notified_1day = $4;
+                """, user_id, expires_at, days_total, notified)
+        except Exception as e:
+            logger.error(f"[DB SUB SAVE ERROR] {e}")
+
+async def db_delete_sub(user_id: int):
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute("DELETE FROM subscriptions WHERE user_id = $1;", user_id)
+        except Exception as e:
+            logger.error(f"[DB SUB DELETE ERROR] {e}")
 
 # ---------------------------------------------------------------------------
 # FACTORY FUNCTION TO CREATE BOT INSTANCE
@@ -125,6 +177,7 @@ def create_bot():
     @new_bot.event
     async def on_ready():
         logger.info(f"✅ Успешный вход: {new_bot.user} (ID: {new_bot.user.id})")
+        await init_db()
         try:
             await fetch_economic_news(force_refresh=True)
 
@@ -159,8 +212,7 @@ def create_bot():
                 return
 
             author_id = message.author.id
-            USER_XP[author_id] = USER_XP.get(author_id, 0) + 5
-            save_xp(USER_XP)
+            await add_user_xp(author_id, 5)
 
             sorted_users = sorted(USER_XP.items(), key=lambda item: item[1], reverse=True)
             current_top_three = [u_id for u_id, _ in sorted_users[:3]]
@@ -227,7 +279,7 @@ def create_bot():
                 await ctx.send("❌ Роль с именем **Legacy** не найдена на сервере!")
                 return
 
-            subs = load_subs()
+            subs = await db_load_subs()
             now = datetime.now(timezone.utc)
             user_id_str = str(member.id)
 
@@ -240,12 +292,7 @@ def create_bot():
             else:
                 new_end = now + timedelta(days=days)
 
-            subs[user_id_str] = {
-                "expires_at": new_end.isoformat(),
-                "days_total": days,
-                "notified_1day": False
-            }
-            save_subs(subs)
+            await db_save_sub(member.id, new_end.isoformat(), days, False)
 
             if role not in member.roles:
                 await member.add_roles(role)
@@ -271,7 +318,7 @@ def create_bot():
     @new_bot.command(name="subinfo", aliases=["mysub", "мояподписка"])
     async def cmd_subinfo(ctx):
         try:
-            subs = load_subs()
+            subs = await db_load_subs()
             user_id_str = str(ctx.author.id)
 
             if user_id_str not in subs:
@@ -309,9 +356,9 @@ def create_bot():
     @commands.has_permissions(administrator=True)
     async def cmd_subslist(ctx):
         try:
-            subs = load_subs()
+            subs = await db_load_subs()
             if not subs:
-                await ctx.send("📉 База данных подписок (`subs_db.json`) пуста.")
+                await ctx.send("📉 База данных подписок пуста.")
                 return
 
             now = datetime.now(timezone.utc)
@@ -343,7 +390,7 @@ def create_bot():
             await ctx.send(embed=embed)
         except Exception as e:
             logger.error(f"[SUBSLIST ERROR] {e}")
-            await ctx.send("❌ Ошибка при чтении базы подписок.")
+            await ctx.send(f"❌ Ошибка при чтении подписок: {e}")
 
     @new_bot.command(name="rank", aliases=["level", "активность"])
     async def cmd_rank(ctx):
@@ -480,7 +527,7 @@ async def start_web_server():
         logger.error(f"❌ Ошибка веб-сервера: {e}")
 
 # ---------------------------------------------------------------------------
-# HELPER FUNCTIONS & NEWS PARSER (С ПОДДЕРЖКОЙ ПРОКСИ ДЛЯ HTTP ЗАПРОСОВ)
+# HELPER FUNCTIONS & NEWS PARSER
 # ---------------------------------------------------------------------------
 async def get_target_channel(channel_id: int, client_bot=None):
     b = client_bot if client_bot else bot
@@ -610,12 +657,11 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
     return NEWS_CACHE["data"]
 
 # ---------------------------------------------------------------------------
-# AUTOMATED TASKS (YOUTUBE, DISCORD EVENTS, NEWS & SUBSCRIPTIONS)
+# AUTOMATED TASKS
 # ---------------------------------------------------------------------------
 
 @tasks.loop(minutes=5)
 async def check_youtube_streams_loop():
-    """Проверка начала прямых трансляций на YouTube."""
     try:
         if not bot or not YOUTUBE_CHANNEL_ID:
             return
@@ -675,12 +721,11 @@ async def check_subscriptions_daily_loop():
         return
     await bot.wait_until_ready()
     try:
-        subs = load_subs()
+        subs = await db_load_subs()
         if not subs:
             return
 
         now = datetime.now(timezone.utc)
-        updated = False
         to_remove = []
 
         for user_id_str, data in subs.items():
@@ -689,7 +734,7 @@ async def check_subscriptions_daily_loop():
             hours_left = time_left.total_seconds() / 3600.0
 
             if expires_at <= now:
-                to_remove.append(user_id_str)
+                to_remove.append(int(user_id_str))
             elif 20 <= hours_left <= 26 and not data.get("notified_1day", False):
                 for guild in bot.guilds:
                     member = guild.get_member(int(user_id_str))
@@ -700,8 +745,7 @@ async def check_subscriptions_daily_loop():
                                 f"⚠️ Напоминание: Срок действия вашей подписки **Legacy** на сервере **{guild.name}** истекает завтра (**{expires_str} МСК**).\n"
                                 f"Для продления подписки напишите администратору **Castro**."
                             )
-                            data["notified_1day"] = True
-                            updated = True
+                            await db_save_sub(int(user_id_str), data["expires_at"], data["days_total"], True)
                         except Exception as e:
                             logger.error(f"[SUB NOTIFY ERROR] {e}")
 
@@ -711,8 +755,8 @@ async def check_subscriptions_daily_loop():
                 if not role:
                     continue
                 
-                for user_id_str in to_remove:
-                    member = guild.get_member(int(user_id_str))
+                for user_id in to_remove:
+                    member = guild.get_member(user_id)
                     if member and role in member.roles:
                         try:
                             await member.remove_roles(role)
@@ -723,12 +767,7 @@ async def check_subscriptions_daily_loop():
                         except Exception as e:
                             logger.error(f"[SUB REMOVE ERROR] {e}")
                     
-                    if user_id_str in subs:
-                        del subs[user_id_str]
-                        updated = True
-
-        if updated:
-            save_subs(subs)
+                    await db_delete_sub(user_id)
     except Exception as e:
         logger.error(f"[SUBS LOOP ERROR] {e}")
 
