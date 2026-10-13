@@ -69,6 +69,7 @@ PAIR_OVERTAKE_TIME = 0
 PAIR_OVERTAKE_COOLDOWN = 300
 
 bot = None
+USE_PROXY = True  # Флаг для автоматического переключения при сбое прокси
 
 # ---------------------------------------------------------------------------
 # DATABASE HELPERS (SUBS & XP)
@@ -109,9 +110,10 @@ def save_xp(data):
 USER_XP = load_xp()
 
 # ---------------------------------------------------------------------------
-# FACTORY FUNCTION TO CREATE BOT INSTANCE WITH STABLE PROXY CONNECTOR
+# FACTORY FUNCTION TO CREATE BOT INSTANCE WITH PROXY FALLBACK
 # ---------------------------------------------------------------------------
 def create_bot():
+    global USE_PROXY
     intents = discord.Intents.default()
     intents.message_content = True
     intents.guild_scheduled_events = True
@@ -122,21 +124,19 @@ def create_bot():
     original_setup_hook = new_bot.setup_hook
     
     async def custom_setup_hook():
+        global USE_PROXY
         if original_setup_hook:
             await original_setup_hook()
             
-        if PROXY_URL:
+        if PROXY_URL and USE_PROXY:
             try:
-                # rdns=True гарантирует правильный обход ограничений и стабильный коннект
                 connector = ProxyConnector.from_url(PROXY_URL, rdns=True)
                 
-                # Безопасное переподключение сессии HTTP клиента в discord.py
                 if hasattr(new_bot.http, "connector") and new_bot.http.connector:
                     await new_bot.http.connector.close()
                 
                 new_bot.http.connector = connector
                 
-                # Пересоздаем сессию с новым коннектором
                 if hasattr(new_bot.http, "_session") and new_bot.http._session:
                     await new_bot.http._session.close()
                 
@@ -146,7 +146,8 @@ def create_bot():
                 )
                 logger.info("🔒 SOCKS5 прокси успешно интегрирован в сессию бота через ProxyConnector (rdns=True).")
             except Exception as e:
-                logger.error(f"❌ Ошибка настройки SOCKS5 прокси-коннектора: {e}")
+                logger.error(f"❌ Ошибка настройки SOCKS5 прокси-коннектора: {e}. Переключаемся на прямое подключение.")
+                USE_PROXY = False
 
     new_bot.setup_hook = custom_setup_hook
 
@@ -922,7 +923,7 @@ async def main():
                     pass
                 await asyncio.sleep(30)
         except Exception as e:
-            logger.error(f"❌ Сбой сети/прокси. Повторная попытка через 30 секунд...")
+            logger.error(f"❌ Сбой сети/прокси. Переподключение через 30 секунд...")
             try:
                 if bot:
                     await bot.close()
