@@ -4,7 +4,6 @@ import asyncio
 import logging
 import time
 import json
-import re
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 
@@ -34,9 +33,9 @@ PORT = int(os.getenv("PORT", 10000))
 # ID веток/каналов
 TARGET_NEWS_THREAD_ID = 1528319066513604688
 TARGET_EVENTS_THREAD_ID = 1528506824687485118
-TARGET_STREAMS_CHANNEL_ID = 1528319066513604688  # Замените при необходимости на ID канала для анонсов стримов
+TARGET_STREAMS_CHANNEL_ID = 1528319066513604688  # Канал для анонсов стримов
 
-# YouTube Channel ID (например: UCxxxxxxxxxxxx) или handle (@channelname)
+# YouTube Channel ID (например: UCxxxxxxxxxxxx)
 YOUTUBE_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID", "")
 
 MSK_TZ = timezone(timedelta(hours=3))
@@ -117,7 +116,7 @@ def save_xp(data):
 USER_XP = load_xp()
 
 # ---------------------------------------------------------------------------
-# FACTORY FUNCTION TO CREATE BOT INSTANCE
+# FACTORY FUNCTION TO CREATE BOT INSTANCE WITH SMART FALLBACK
 # ---------------------------------------------------------------------------
 def create_bot():
     global USE_PROXY
@@ -153,7 +152,7 @@ def create_bot():
                 )
                 logger.info("🔒 SOCKS5 прокси успешно интегрирован в сессию бота.")
             except Exception as e:
-                logger.warning(f"⚠️ Не удалось подключить SOCKS5 прокси ({e}). Используется прямое подключение.")
+                logger.warning(f"⚠️ Не удалось подключить прокси ({e}). Переход на прямое подключение.")
                 USE_PROXY = False
 
     new_bot.setup_hook = custom_setup_hook
@@ -676,7 +675,6 @@ async def check_youtube_streams_loop():
                 link = f"https://www.youtube.com/watch?v={video_id}"
 
                 if video_id and video_id not in SENT_YOUTUBE_STREAMS:
-                    # Проверяем, является ли видео прямым эфиром
                     video_page = await asyncio.to_thread(
                         async_requests.get,
                         link,
@@ -923,61 +921,4 @@ async def scheduled_news_digests():
 
             embed = discord.Embed(
                 title="**Ежедневный экономический календарь Forex**",
-                color=discord.Color.gold()
-            )
-
-            lines = [f"📅 *Запланированные события: {date_str_formatted}*"]
-            for ev, ev_msk in today_events:
-                flag = get_flag(ev["country"])
-                time_str = ev_msk.strftime("%H:%M")
-                impact_str = "🔴 **HIGH**" if ev["impact"] == "HIGH" else "🟠 **MEDIUM**"
-                lines.append(f"\n🕘 {time_str} | {flag} **{ev['country']}** — {ev['title']}\n{impact_str}")
-
-            embed.description = "\n".join(lines) if len(lines) > 1 else "На сегодня важных новостей нет."
-            await thread.send(embed=embed)
-    except Exception as e:
-        logger.error(f"[DIGEST TASK] {e}")
-
-# ---------------------------------------------------------------------------
-# MAIN EXECUTION
-# ---------------------------------------------------------------------------
-async def main():
-    global bot
-    await start_web_server()
-    
-    while True:
-        try:
-            bot = create_bot()
-            logger.info("⚡️ Инициализация подключения к Discord API...")
-            await bot.start(DISCORD_TOKEN)
-        except discord.errors.HTTPException as e:
-            if e.status in (429, 1015) or "1015" in str(e):
-                logger.warning("⚠️ Временная блокировка IP / Cloudflare (HTTP 429/1015). Ожидание 5 минут для сброса...")
-                try:
-                    if bot:
-                        await bot.close()
-                except Exception:
-                    pass
-                await asyncio.sleep(300)
-            else:
-                logger.error(f"❌ Ошибка Discord HTTP ({e.status}): {e}")
-                try:
-                    if bot:
-                        await bot.close()
-                except Exception:
-                    pass
-                await asyncio.sleep(30)
-        except Exception as e:
-            logger.error(f"❌ Сбой сети/прокси. Переподключение через 30 секунд...")
-            try:
-                if bot:
-                    await bot.close()
-            except Exception:
-                pass
-            await asyncio.sleep(30)
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Бот остановлен вручную.")
+                color
