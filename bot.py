@@ -595,16 +595,16 @@ async def cmd_news(ctx):
             await ctx.send(f"✅ Новости опубликованы в ветку <#{TARGET_NEWS_THREAD_ID}>")
 
 # ---------------------------------------------------------------------------
-# MAIN EXECUTION WITH AUTO-RECONNECT
+# MAIN EXECUTION WITH AUTO-RECONNECT (PROPER SOCKS5 CONNECTOR INIT)
 # ---------------------------------------------------------------------------
 async def main():
     await start_web_server()
     
-    # Безопасно инициализируем SOCKS5 коннектор внутри запущенного event loop
+    # Инициализация коннектора внутри event loop для правильного обхода блокировок
     if PROXY_URL:
         connector = ProxyConnector.from_url(PROXY_URL)
-        bot.http.connector = connector
-        logger.info("🔒 SOCKS5 прокси успешно привязан к HTTP-клиенту бота.")
+        bot._connection.connector = connector
+        logger.info("🔒 SOCKS5 прокси успешно интегрирован в соединение бота.")
 
     while True:
         try:
@@ -612,7 +612,7 @@ async def main():
             await bot.start(DISCORD_TOKEN)
         except discord.errors.HTTPException as e:
             if e.status == 429 or "1015" in str(e):
-                logger.warning("⚠️ Cloudflare/Discord заблокировал IP. Ожидание 90 секунд...")
+                logger.warning("⚠️ Cloudflare/Discord временно заблокировал IP. Ожидание 90 секунд...")
                 await asyncio.sleep(90)
             else:
                 logger.error(f"❌ Ошибка Discord HTTP ({e.status}): {e}")
