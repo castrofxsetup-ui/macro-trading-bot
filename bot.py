@@ -12,6 +12,7 @@ from aiohttp import web
 import discord
 from discord.ext import commands, tasks
 from curl_cffi import requests as async_requests
+from aiohttp_socks import ProxyConnector
 
 # ---------------------------------------------------------------------------
 # LOGGING SETUP
@@ -108,7 +109,7 @@ def save_xp(data):
 USER_XP = load_xp()
 
 # ---------------------------------------------------------------------------
-# FACTORY FUNCTION TO CREATE BOT INSTANCE
+# FACTORY FUNCTION TO CREATE BOT INSTANCE WITH STABLE PROXY CONNECTOR
 # ---------------------------------------------------------------------------
 def create_bot():
     intents = discord.Intents.default()
@@ -116,12 +117,38 @@ def create_bot():
     intents.guild_scheduled_events = True
     intents.members = True
     
-    # Передаем proxy напрямую в стандартный параметр discord.py
-    new_bot = commands.Bot(
-        command_prefix="!", 
-        intents=intents,
-        proxy=PROXY_URL if PROXY_URL else None
-    )
+    new_bot = commands.Bot(command_prefix="!", intents=intents)
+
+    original_setup_hook = new_bot.setup_hook
+    
+    async def custom_setup_hook():
+        if original_setup_hook:
+            await original_setup_hook()
+            
+        if PROXY_URL:
+            try:
+                # rdns=True гарантирует правильный обход ограничений и стабильный коннект
+                connector = ProxyConnector.from_url(PROXY_URL, rdns=True)
+                
+                # Безопасное переподключение сессии HTTP клиента в discord.py
+                if hasattr(new_bot.http, "connector") and new_bot.http.connector:
+                    await new_bot.http.connector.close()
+                
+                new_bot.http.connector = connector
+                
+                # Пересоздаем сессию с новым коннектором
+                if hasattr(new_bot.http, "_session") and new_bot.http._session:
+                    await new_bot.http._session.close()
+                
+                new_bot.http._session = aiohttp.ClientSession(
+                    connector=connector,
+                    headers=new_bot.http._session.headers if hasattr(new_bot.http, "_session") else {}
+                )
+                logger.info("🔒 SOCKS5 прокси успешно интегрирован в сессию бота через ProxyConnector (rdns=True).")
+            except Exception as e:
+                logger.error(f"❌ Ошибка настройки SOCKS5 прокси-коннектора: {e}")
+
+    new_bot.setup_hook = custom_setup_hook
 
     @new_bot.event
     async def on_ready():
