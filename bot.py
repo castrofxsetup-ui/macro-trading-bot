@@ -132,7 +132,7 @@ async def query_groq_ai(prompt: str) -> str:
     if not groq_client:
         return "⚠️ GROQ API ключ не настроен."
 
-    # Получаем актуальные котировки рынка
+    # Получаем актуальные котировки рынка с текущим временем по МСК
     live_prices_context = await get_live_market_prices()
     full_prompt = f"{live_prices_context}\n\nЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{prompt}"
 
@@ -390,7 +390,7 @@ async def check_discord_events_alerts():
 
     for guild in bot.guilds:
         try:
-            events = await guild.fetch_scheduled_events()
+            events = await guild.fetch_scheduled_events(with_counts=True)
             for event in events:
                 if not event.start_time:
                     continue
