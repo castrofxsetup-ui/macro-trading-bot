@@ -175,16 +175,22 @@ async def query_groq_ai(prompt: str) -> str:
     return "❌ Ошибка генерации ответа ИИ. Все доступные модели Groq временно недоступны."
 
 # ---------------------------------------------------------------------------
-# INITIALIZE DISCORD BOT (WITH PROXY SUPPORT)
+# INITIALIZE DISCORD BOT (WITH PROXY & TIMEOUT SUPPORT)
 # ---------------------------------------------------------------------------
 intents = discord.Intents.default()
 intents.message_content = True
 intents.guild_scheduled_events = True
 
+# Увеличиваем таймаут соединения в клиенте Discord для стабильности на Render
+connector = aiohttp.TCPConnector(ssl=False)
+client_timeout = aiohttp.ClientTimeout(total=60, connect=30)
+
 bot = commands.Bot(
     command_prefix="!",
     intents=intents,
-    proxy=PROXY_URL if PROXY_URL else None
+    proxy=PROXY_URL if PROXY_URL else None,
+    connector=connector,
+    timeout=client_timeout
 )
 
 # ---------------------------------------------------------------------------
