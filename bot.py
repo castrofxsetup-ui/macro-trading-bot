@@ -12,7 +12,6 @@ from aiohttp import web
 import discord
 from discord.ext import commands, tasks
 from curl_cffi import requests as async_requests
-from aiohttp_socks import ProxyConnector
 
 # ---------------------------------------------------------------------------
 # LOGGING SETUP
@@ -69,6 +68,9 @@ LAST_OVERTAKE_PAIR = (None, None)
 PAIR_OVERTAKE_TIME = 0
 PAIR_OVERTAKE_COOLDOWN = 300
 
+# Глобальная переменная для бота
+bot = None
+
 # ---------------------------------------------------------------------------
 # SUBSCRIPTION DATABASE HELPERS
 # ---------------------------------------------------------------------------
@@ -89,31 +91,333 @@ def save_subs(data):
         logger.error(f"[SUBS DB ERROR] Ошибка сохранения базы подписок: {e}")
 
 # ---------------------------------------------------------------------------
-# BOT CLASS WITH STABLE PROXY SETUP
+# FACTORY FUNCTION TO CREATE BOT INSTANCE
 # ---------------------------------------------------------------------------
-class LegacyBot(commands.Bot):
-    def __init__(self):
-        intents = discord.Intents.default()
-        intents.message_content = True
-        intents.guild_scheduled_events = True
-        intents.members = True
-        super().__init__(command_prefix="!", intents=intents)
+def create_bot():
+    intents = discord.Intents.default()
+    intents.message_content = True
+    intents.guild_scheduled_events = True
+    intents.members = True
+    
+    new_bot = commands.Bot(command_prefix="!", intents=intents, proxy=PROXY_URL if PROX_IS_VALID(PROXY_URL) else None)
 
-    async def setup_hook(self):
-        if PROXY_URL:
+    @new_bot.event
+    async def on_ready():
+        logger.info(f"✅ Успешный вход: {new_bot.user} (ID: {new_bot.user.id})")
+        try:
+            await fetch_economic_news(force_refresh=True)
+
+            if not check_30min_news_alerts.is_running():
+                check_30min_news_alerts.start()
+            if not check_discord_events_alerts.is_running():
+                check_discord_events_alerts.start()
+            if not scheduled_news_digests.is_running():
+                scheduled_news_digests.start()
+            if not check_subscriptions_daily_loop.is_running():
+                check_subscriptions_daily_loop.start()
+        except Exception as e:
+            logger.error(f"[ON_READY] {e}")
+
+    @new_bot.event
+    async def on_member_join(member: discord.Member):
+        try:
+            role = discord.utils.get(member.guild.roles, name="Trader")
+            if role:
+                await member.add_roles(role)
+                logger.info(f"[AUTO-ROLE] Выдана роль Trader пользователю {member.name}")
+        except Exception as e:
+            logger.error(f"[AUTO-ROLE] {e}")
+
+    @new_bot.event
+    async def on_message(message: discord.Message):
+        global LAST_TOP_THREE, LAST_OVERTAKE_TIME, LAST_OVERTAKE_PAIR, PAIR_OVERTAKE_TIME
+
+        try:
+            if message.author.bot or not message.guild:
+                return
+
+            author_id = message.author.id
+            USER_XP[author_id] = USER_XP.get(author_id, 0) + 5
+
+            sorted_users = sorted(USER_XP.items(), key=lambda item: item[1], reverse=True)
+            current_top_three = [u_id for u_id, _ in sorted_users[:3]]
+
+            if LAST_TOP_THREE and current_top_three != LAST_TOP_THREE:
+                now = time.time()
+                if now - LAST_OVERTAKE_TIME >= GLOBAL_OVERTAKE_COOLDOWN:
+                    overtaker_id = author_id
+                    if overtaker_id in current_top_three:
+                        new_pos = current_top_three.index(overtaker_id) + 1
+                        
+                        overtaken_id = None
+                        if overtaker_id in LAST_TOP_THREE:
+                            old_pos = LAST_TOP_THREE.index(overtaker_id)
+                            if new_pos - 1 < old_pos:
+                                overtaken_id = LAST_TOP_THREE[new_pos - 1]
+                        else:
+                            overtaken_id = LAST_TOP_THREE[-1]
+
+                        if overtaken_id and overtaken_id != overtaker_id:
+                            current_pair = (overtaker_id, overtaken_id)
+
+                            if current_pair != LAST_OVERTAKE_PAIR or (now - PAIR_OVERTAKE_TIME >= PAIR_OVERTAKE_COOLDOWN):
+                                overtaker_member = message.guild.get_member(overtaker_id)
+                                overtaken_member = message.guild.get_member(overtaken_id)
+
+                                overtaker_name = overtaker_member.mention if overtaker_member else f"<@{overtaker_id}>"
+                                overtaken_name = overtaken_member.mention if overtaken_member else f"<@{overtaken_id}>"
+
+                                medals = {1: "🥇 1-е место", 2: "🥈 2-е место", 3: "🥉 3-е место"}
+                                pos_str = medals.get(new_pos, f"**{new_pos}-е место**")
+
+                                embed = discord.Embed(
+                                    title="⚡️ Смена лидера в Топе Активности!",
+                                    description=(
+                                        f"🔥 {overtaker_name} вырывается вперед и забирает {pos_str}, обгоняя {overtaken_name}!\n\n"
+                                        f"👀 {overtaken_name}, самое время поднапрячься и вернуть свою позицию!"
+                                    ),
+                                    color=discord.Color.gold()
+                                )
+                                embed.set_footer(text="Рейтинг рассчитывается по сообщениям на сервере")
+                                
+                                await message.channel.send(embed=embed)
+                                
+                                LAST_OVERTAKE_TIME = now
+                                LAST_OVERTAKE_PAIR = current_pair
+                                PAIR_OVERTAKE_TIME = now
+
+            LAST_TOP_THREE = current_top_three
+            await new_bot.process_commands(message)
+        except Exception as e:
+            logger.error(f"[ON_MESSAGE] {e}")
+
+    # Регистрируем команды
+    @new_bot.command(name="sub", aliases=["подписка"])
+    @commands.has_permissions(administrator=True)
+    async def cmd_sub(ctx, member: discord.Member, days: int):
+        try:
+            if days not in [30, 90, 360]:
+                await ctx.send("❌ Доступные сроки подписки: **30**, **90** или **360** дней.")
+                return
+
+            role = discord.utils.get(ctx.guild.roles, name="Legacy")
+            if not role:
+                await ctx.send("❌ Роль с именем **Legacy** не найдена на сервере!")
+                return
+
+            subs = load_subs()
+            now = datetime.now(timezone.utc)
+            user_id_str = str(member.id)
+
+            if user_id_str in subs:
+                current_end = datetime.fromisoformat(subs[user_id_str]["expires_at"])
+                if current_end > now:
+                    new_end = current_end + timedelta(days=days)
+                else:
+                    new_end = now + timedelta(days=days)
+            else:
+                new_end = now + timedelta(days=days)
+
+            subs[user_id_str] = {
+                "expires_at": new_end.isoformat(),
+                "days_total": days,
+                "notified_1day": False
+            }
+            save_subs(subs)
+
+            if role not in member.roles:
+                await member.add_roles(role)
+
+            expires_str = new_end.astimezone(MSK_TZ).strftime("%d.%m.%Y в %H:%M")
+            
+            embed = discord.Embed(
+                title="✅ Подписка Legacy оформлена!",
+                description=f"Участнику {member.mention} выдана подписка на **{days} дней**.\n⏳ Активна до: **{expires_str} (МСК)**",
+                color=discord.Color.green()
+            )
+            await ctx.send(embed=embed)
+            
             try:
-                connector = ProxyConnector.from_url(PROXY_URL)
-                if self.http._session:
-                    await self.http._session.close()
-                self.http._session = aiohttp.ClientSession(
-                    connector=connector,
-                    headers=self.http._session.headers
-                )
-                logger.info("🔒 SOCKS5 прокси успешно зафиксирован в сессии бота через ProxyConnector.")
-            except Exception as e:
-                logger.error(f"❌ Ошибка настройки прокси-коннектора: {e}")
+                await member.send(f"🎉 Вам на сервере **{ctx.guild.name}** оформлена/продлена подписка **Legacy** на {days} дней! Она активна до {expires_str} (МСК).")
+            except Exception:
+                pass
 
-bot = LegacyBot()
+        except Exception as e:
+            logger.error(f"[SUB COMMAND ERROR] {e}")
+            await ctx.send("❌ Произошла ошибка при выдаче подписки.")
+
+    @new_bot.command(name="subinfo", aliases=["mysub", "мояподписка"])
+    async def cmd_subinfo(ctx):
+        try:
+            subs = load_subs()
+            user_id_str = str(ctx.author.id)
+
+            if user_id_str not in subs:
+                await ctx.send("📉 У вас нет активной подписки **Legacy**.")
+                return
+
+            data = subs[user_id_str]
+            expires_at = datetime.fromisoformat(data["expires_at"])
+            now = datetime.now(timezone.utc)
+
+            if expires_at <= now:
+                await ctx.send("⌛️ Ваша подписка **Legacy** истекла.")
+                return
+
+            remaining = expires_at - now
+            days_left = remaining.days
+            hours_left = remaining.seconds // 3600
+            expires_str = expires_at.astimezone(MSK_TZ).strftime("%d.%m.%Y в %H:%M")
+
+            embed = discord.Embed(
+                title="💎 Статус вашей подписки Legacy",
+                description=(
+                    f"Статус: **Активна** ✅\n"
+                    f"Осталось времени: **{days_left} дн. {hours_left} ч.**\n"
+                    f"Истекает: **{expires_str} (МСК)**\n\n"
+                    f"💬 Для продления подписки обратитесь к **Castro**."
+                ),
+                color=discord.Color.gold()
+            )
+            await ctx.send(embed=embed)
+        except Exception as e:
+            logger.error(f"[SUBINFO ERROR] {e}")
+
+    @new_bot.command(name="rank", aliases=["level", "активность"])
+    async def cmd_rank(ctx):
+        try:
+            xp = USER_XP.get(ctx.author.id, 0)
+            embed = discord.Embed(
+                title="📊 Статистика активности",
+                description=f"Участник: {ctx.author.mention}\n⚡️ Накоплено опыта (XP): **{xp}**",
+                color=discord.Color.blue()
+            )
+            await ctx.send(embed=embed)
+        except Exception as e:
+            logger.error(f"[RANK] {e}")
+
+    @new_bot.command(name="leaderboard", aliases=["top", "топ", "рейтинг"])
+    async def cmd_leaderboard(ctx):
+        try:
+            if not USER_XP:
+                await ctx.send("📉 База активности пока пуста. Участники еще не отправляли сообщения.")
+                return
+
+            sorted_users = sorted(USER_XP.items(), key=lambda item: item[1], reverse=True)
+            lines = []
+            medals = ["🥇", "🥈", "🥉"]
+
+            for idx, (user_id, xp) in enumerate(sorted_users, start=1):
+                user = ctx.guild.get_member(user_id)
+                name = user.mention if user else f"Пользователь (ID: {user_id})"
+                prefix = medals[idx - 1] if idx <= 3 else f"**{idx}.**"
+                lines.append(f"{prefix} {name} — **{xp} XP**")
+
+            current_chunk = ""
+            embeds_to_send = []
+
+            for line in lines:
+                if len(current_chunk) + len(line) + 1 > 3800:
+                    embeds_to_send.append(discord.Embed(
+                        title="🏆 Рейтинг активности участников",
+                        description=current_chunk,
+                        color=discord.Color.gold()
+                    ))
+                    current_chunk = line
+                else:
+                    current_chunk += "\n" + line if current_chunk else line
+
+            if current_chunk:
+                embeds_to_send.append(discord.Embed(
+                    title="🏆 Рейтинг активности участников",
+                    description=current_chunk,
+                    color=discord.Color.gold()
+                ))
+
+            for idx, emb in enumerate(embeds_to_send):
+                if idx == len(embeds_to_send) - 1:
+                    emb.set_footer(text=f"Всего участников в списке: {len(sorted_users)} | Активность за сообщения")
+                await ctx.send(embed=emb)
+
+        except Exception as e:
+            logger.error(f"[LEADERBOARD] {e}")
+
+    @new_bot.command(name="clear", aliases=["purge", "очистить"])
+    @commands.has_permissions(manage_messages=True)
+    async def cmd_clear(ctx, amount: int = 10):
+        try:
+            await ctx.channel.purge(limit=amount + 1)
+            msg = await ctx.send(f"🧹 Успешно удалено сообщений: {amount}")
+            await asyncio.sleep(3)
+            await msg.delete()
+        except Exception as e:
+            logger.error(f"[CLEAR] {e}")
+
+    @new_bot.command(name="kick", aliases=["кик"])
+    @commands.has_permissions(kick_members=True)
+    async def cmd_kick(ctx, member: discord.Member, *, reason: str = "Не указана"):
+        try:
+            await member.kick(reason=reason)
+            await ctx.send(f"👢 Участник {member.mention} исключен. Причина: {reason}")
+        except Exception as e:
+            logger.error(f"[KICK] {e}")
+
+    @new_bot.command(name="ban", aliases=["бан"])
+    @commands.has_permissions(ban_members=True)
+    async def cmd_ban(ctx, member: discord.Member, *, reason: str = "Не указана"):
+        try:
+            await member.ban(reason=reason)
+            await ctx.send(f"🔨 Участник {member.mention} заблокирован. Причина: {reason}")
+        except Exception as e:
+            logger.error(f"[BAN] {e}")
+
+    @new_bot.command(name="news")
+    async def cmd_news(ctx):
+        try:
+            thread = await get_target_channel(TARGET_NEWS_THREAD_ID, new_bot)
+            if not thread:
+                await ctx.send("❌ Целевая ветка для новостей не найдена.")
+                return
+
+            async with ctx.typing():
+                news = await fetch_economic_news()
+                now_msk = datetime.now(MSK_TZ)
+                today_date = now_msk.date()
+
+                today_events = []
+                for ev in news:
+                    if not ev.get("dt_utc"):
+                        continue
+                    ev_msk = ev["dt_utc"].astimezone(MSK_TZ)
+                    if ev_msk.date() == today_date:
+                        today_events.append((ev, ev_msk))
+
+                embed = discord.Embed(
+                    title="**Ежедневный экономический календарь Forex**",
+                    color=discord.Color.gold()
+                )
+
+                day_name = DAYS_RU[now_msk.weekday()]
+                lines = [f"📅 *Запланированные события: {day_name}, {now_msk.strftime('%d.%m')}*"]
+
+                for ev, ev_msk in today_events:
+                    flag = get_flag(ev["country"])
+                    time_str = ev_msk.strftime("%H:%M")
+                    impact_str = "🔴 **HIGH**" if ev["impact"] == "HIGH" else "🟠 **MEDIUM**"
+                    lines.append(f"\n🕘 {time_str} | {flag} **{ev['country']}** — {ev['title']}\n{impact_str}")
+
+                embed.description = "\n".join(lines) if len(lines) > 1 else "На сегодня важных новостей больше нет."
+                await thread.send(embed=embed)
+                
+                if ctx.channel.id != TARGET_NEWS_THREAD_ID:
+                    await ctx.send(f"✅ Новости опубликованы в ветку <#{TARGET_NEWS_THREAD_ID}>")
+        except Exception as e:
+            logger.error(f"[NEWS] {e}")
+
+    return new_bot
+
+def PROX_IS_VALID(url):
+    return url and isinstance(url, str) and url.startswith(("http", "socks"))
 
 # ---------------------------------------------------------------------------
 # WEB SERVER FOR RENDER KEEP-ALIVE
@@ -137,11 +441,14 @@ async def start_web_server():
 # ---------------------------------------------------------------------------
 # HELPER FUNCTIONS & NEWS PARSER
 # ---------------------------------------------------------------------------
-async def get_target_channel(channel_id: int):
+async def get_target_channel(channel_id: int, client_bot=None):
+    b = client_bot if client_bot else bot
+    if not b:
+        return None
     try:
-        channel = bot.get_channel(channel_id)
+        channel = b.get_channel(channel_id)
         if not channel:
-            channel = await bot.fetch_channel(channel_id)
+            channel = await b.fetch_channel(channel_id)
         return channel
     except Exception as e:
         logger.error(f"[CHANNEL ERROR] {e}")
@@ -263,6 +570,8 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
 
 @tasks.loop(hours=24)
 async def check_subscriptions_daily_loop():
+    if not bot:
+        return
     await bot.wait_until_ready()
     try:
         subs = load_subs()
@@ -292,9 +601,8 @@ async def check_subscriptions_daily_loop():
                             )
                             data["notified_1day"] = True
                             updated = True
-                            logger.info(f"[SUB NOTIFY] Отправлено предупреждение за 1 день пользователю {member.name}")
                         except Exception as e:
-                            logger.error(f"[SUB NOTIFY ERROR] Не удалось отправить ЛС пользователю {user_id_str}: {e}")
+                            logger.error(f"[SUB NOTIFY ERROR] {e}")
 
         if to_remove:
             for guild in bot.guilds:
@@ -307,9 +615,8 @@ async def check_subscriptions_daily_loop():
                     if member and role in member.roles:
                         try:
                             await member.remove_roles(role)
-                            logger.info(f"[SUB EXPIRED] Снята роль Legacy с пользователя {member.name}")
                             try:
-                                await member.send(f"⚠️ Срок действия вашей подписки **Legacy** на сервере **{guild.name}** истек. Роль была автоматически снята. Для продления напишите **Castro**.")
+                                await member.send(f"⚠️ Срок действия вашей подписки **Legacy** на сервере **{guild.name}** истек. Для продления напишите **Castro**.")
                             except Exception:
                                 pass
                         except Exception as e:
@@ -327,6 +634,8 @@ async def check_subscriptions_daily_loop():
 @tasks.loop(minutes=1)
 async def check_30min_news_alerts():
     try:
+        if not bot:
+            return
         await bot.wait_until_ready()
         thread = await get_target_channel(TARGET_NEWS_THREAD_ID)
         if not thread:
@@ -375,6 +684,8 @@ async def check_30min_news_alerts():
 @tasks.loop(minutes=2)
 async def check_discord_events_alerts():
     try:
+        if not bot:
+            return
         await bot.wait_until_ready()
         thread = await get_target_channel(TARGET_EVENTS_THREAD_ID)
         if not thread:
@@ -412,6 +723,8 @@ async def check_discord_events_alerts():
 @tasks.loop(hours=1)
 async def scheduled_news_digests():
     try:
+        if not bot:
+            return
         await bot.wait_until_ready()
         thread = await get_target_channel(TARGET_NEWS_THREAD_ID)
         if not thread:
@@ -495,353 +808,39 @@ async def scheduled_news_digests():
         logger.error(f"[DIGEST TASK] {e}")
 
 # ---------------------------------------------------------------------------
-# EVENTS & COMMANDS (SUBSCRIPTION MANAGEMENT & GENERAL)
-# ---------------------------------------------------------------------------
-
-@bot.command(name="sub", aliases=["подписка"])
-@commands.has_permissions(administrator=True)
-async def cmd_sub(ctx, member: discord.Member, days: int):
-    try:
-        if days not in [30, 90, 360]:
-            await ctx.send("❌ Доступные сроки подписки: **30**, **90** или **360** дней.")
-            return
-
-        role = discord.utils.get(ctx.guild.roles, name="Legacy")
-        if not role:
-            await ctx.send("❌ Роль с именем **Legacy** не найдена на сервере!")
-            return
-
-        subs = load_subs()
-        now = datetime.now(timezone.utc)
-        user_id_str = str(member.id)
-
-        if user_id_str in subs:
-            current_end = datetime.fromisoformat(subs[user_id_str]["expires_at"])
-            if current_end > now:
-                new_end = current_end + timedelta(days=days)
-            else:
-                new_end = now + timedelta(days=days)
-        else:
-            new_end = now + timedelta(days=days)
-
-        subs[user_id_str] = {
-            "expires_at": new_end.isoformat(),
-            "days_total": days,
-            "notified_1day": False
-        }
-        save_subs(subs)
-
-        if role not in member.roles:
-            await member.add_roles(role)
-
-        expires_str = new_end.astimezone(MSK_TZ).strftime("%d.%m.%Y в %H:%M")
-        
-        embed = discord.Embed(
-            title="✅ Подписка Legacy оформлена!",
-            description=f"Участнику {member.mention} выдана подписка на **{days} дней**.\n⏳ Активна до: **{expires_str} (МСК)**",
-            color=discord.Color.green()
-        )
-        await ctx.send(embed=embed)
-        
-        try:
-            await member.send(f"🎉 Вам на сервере **{ctx.guild.name}** оформлена/продлена подписка **Legacy** на {days} дней! Она активна до {expires_str} (МСК).")
-        except Exception:
-            pass
-
-    except Exception as e:
-        logger.error(f"[SUB COMMAND ERROR] {e}")
-        await ctx.send("❌ Произошла ошибка при выдаче подписки.")
-
-@bot.command(name="subinfo", aliases=["mysub", "мояподписка"])
-async def cmd_subinfo(ctx):
-    try:
-        subs = load_subs()
-        user_id_str = str(ctx.author.id)
-
-        if user_id_str not in subs:
-            await ctx.send("📉 У вас нет активной подписки **Legacy**.")
-            return
-
-        data = subs[user_id_str]
-        expires_at = datetime.fromisoformat(data["expires_at"])
-        now = datetime.now(timezone.utc)
-
-        if expires_at <= now:
-            await ctx.send("⌛️ Ваша подписка **Legacy** истекла.")
-            return
-
-        remaining = expires_at - now
-        days_left = remaining.days
-        hours_left = remaining.seconds // 3600
-        expires_str = expires_at.astimezone(MSK_TZ).strftime("%d.%m.%Y в %H:%M")
-
-        embed = discord.Embed(
-            title="💎 Статус вашей подписки Legacy",
-            description=(
-                f"Статус: **Активна** ✅\n"
-                f"Осталось времени: **{days_left} дн. {hours_left} ч.**\n"
-                f"Истекает: **{expires_str} (МСК)**\n\n"
-                f"💬 Для продления подписки обратитесь к **Castro**."
-            ),
-            color=discord.Color.gold()
-        )
-        await ctx.send(embed=embed)
-    except Exception as e:
-        logger.error(f"[SUBINFO ERROR] {e}")
-
-@bot.event
-async def on_member_join(member: discord.Member):
-    try:
-        role = discord.utils.get(member.guild.roles, name="Trader")
-        if role:
-            await member.add_roles(role)
-            logger.info(f"[AUTO-ROLE] Выдана роль Trader пользователю {member.name}")
-    except Exception as e:
-        logger.error(f"[AUTO-ROLE] {e}")
-
-@bot.event
-async def on_message(message: discord.Message):
-    global LAST_TOP_THREE, LAST_OVERTAKE_TIME, LAST_OVERTAKE_PAIR, PAIR_OVERTAKE_TIME
-
-    try:
-        if message.author.bot or not message.guild:
-            return
-
-        author_id = message.author.id
-        USER_XP[author_id] = USER_XP.get(author_id, 0) + 5
-
-        sorted_users = sorted(USER_XP.items(), key=lambda item: item[1], reverse=True)
-        current_top_three = [u_id for u_id, _ in sorted_users[:3]]
-
-        if LAST_TOP_THREE and current_top_three != LAST_TOP_THREE:
-            now = time.time()
-            if now - LAST_OVERTAKE_TIME >= GLOBAL_OVERTAKE_COOLDOWN:
-                overtaker_id = author_id
-                if overtaker_id in current_top_three:
-                    new_pos = current_top_three.index(overtaker_id) + 1
-                    
-                    overtaken_id = None
-                    if overtaker_id in LAST_TOP_THREE:
-                        old_pos = LAST_TOP_THREE.index(overtaker_id)
-                        if new_pos - 1 < old_pos:
-                            overtaken_id = LAST_TOP_THREE[new_pos - 1]
-                    else:
-                        overtaken_id = LAST_TOP_THREE[-1]
-
-                    if overtaken_id and overtaken_id != overtaker_id:
-                        current_pair = (overtaker_id, overtaken_id)
-
-                        if current_pair != LAST_OVERTAKE_PAIR or (now - PAIR_OVERTAKE_TIME >= PAIR_OVERTAKE_COOLDOWN):
-                            overtaker_member = message.guild.get_member(overtaker_id)
-                            overtaken_member = message.guild.get_member(overtaken_id)
-
-                            overtaker_name = overtaker_member.mention if overtaker_member else f"<@{overtaker_id}>"
-                            overtaken_name = overtaken_member.mention if overtaken_member else f"<@{overtaken_id}>"
-
-                            medals = {1: "🥇 1-е место", 2: "🥈 2-е место", 3: "🥉 3-е место"}
-                            pos_str = medals.get(new_pos, f"**{new_pos}-е место**")
-
-                            embed = discord.Embed(
-                                title="⚡️ Смена лидера в Топе Активности!",
-                                description=(
-                                    f"🔥 {overtaker_name} вырывается вперед и забирает {pos_str}, обгоняя {overtaken_name}!\n\n"
-                                    f"👀 {overtaken_name}, самое время поднапрячься и вернуть свою позицию!"
-                                ),
-                                color=discord.Color.gold()
-                            )
-                            embed.set_footer(text="Рейтинг рассчитывается по сообщениям на сервере")
-                            
-                            await message.channel.send(embed=embed)
-                            
-                            LAST_OVERTAKE_TIME = now
-                            LAST_OVERTAKE_PAIR = current_pair
-                            PAIR_OVERTAKE_TIME = now
-
-        LAST_TOP_THREE = current_top_three
-        await bot.process_commands(message)
-    except Exception as e:
-        logger.error(f"[ON_MESSAGE] {e}")
-
-@bot.command(name="rank", aliases=["level", "активность"])
-async def cmd_rank(ctx):
-    try:
-        xp = USER_XP.get(ctx.author.id, 0)
-        embed = discord.Embed(
-            title="📊 Статистика активности",
-            description=f"Участник: {ctx.author.mention}\n⚡️ Накоплено опыта (XP): **{xp}**",
-            color=discord.Color.blue()
-        )
-        await ctx.send(embed=embed)
-    except Exception as e:
-        logger.error(f"[RANK] {e}")
-
-@bot.command(name="leaderboard", aliases=["top", "топ", "рейтинг"])
-async def cmd_leaderboard(ctx):
-    try:
-        if not USER_XP:
-            await ctx.send("📉 База активности пока пуста. Участники еще не отправляли сообщения.")
-            return
-
-        sorted_users = sorted(USER_XP.items(), key=lambda item: item[1], reverse=True)
-        lines = []
-        medals = ["🥇", "🥈", "🥉"]
-
-        for idx, (user_id, xp) in enumerate(sorted_users, start=1):
-            user = ctx.guild.get_member(user_id)
-            name = user.mention if user else f"Пользователь (ID: {user_id})"
-            prefix = medals[idx - 1] if idx <= 3 else f"**{idx}.**"
-            lines.append(f"{prefix} {name} — **{xp} XP**")
-
-        current_chunk = ""
-        embeds_to_send = []
-
-        for line in lines:
-            if len(current_chunk) + len(line) + 1 > 3800:
-                embeds_to_send.append(discord.Embed(
-                    title="🏆 Рейтинг активности участников",
-                    description=current_chunk,
-                    color=discord.Color.gold()
-                ))
-                current_chunk = line
-            else:
-                current_chunk += "\n" + line if current_chunk else line
-
-        if current_chunk:
-            embeds_to_send.append(discord.Embed(
-                title="🏆 Рейтинг активности участников",
-                description=current_chunk,
-                color=discord.Color.gold()
-            ))
-
-        for idx, emb in enumerate(embeds_to_send):
-            if idx == len(embeds_to_send) - 1:
-                emb.set_footer(text=f"Всего участников в списке: {len(sorted_users)} | Активность за сообщения")
-            await ctx.send(embed=emb)
-
-    except Exception as e:
-        logger.error(f"[LEADERBOARD] {e}")
-
-@bot.command(name="clear", aliases=["purge", "очистить"])
-@commands.has_permissions(manage_messages=True)
-async def cmd_clear(ctx, amount: int = 10):
-    try:
-        await ctx.channel.purge(limit=amount + 1)
-        msg = await ctx.send(f"🧹 Успешно удалено сообщений: {amount}")
-        await asyncio.sleep(3)
-        await msg.delete()
-    except Exception as e:
-        logger.error(f"[CLEAR] {e}")
-
-@bot.command(name="kick", aliases=["кик"])
-@commands.has_permissions(kick_members=True)
-async def cmd_kick(ctx, member: discord.Member, *, reason: str = "Не указана"):
-    try:
-        await member.kick(reason=reason)
-        await ctx.send(f"👢 Участник {member.mention} исключен. Причина: {reason}")
-    except Exception as e:
-        logger.error(f"[KICK] {e}")
-
-@bot.command(name="ban", aliases=["бан"])
-@commands.has_permissions(ban_members=True)
-async def cmd_ban(ctx, member: discord.Member, *, reason: str = "Не указана"):
-    try:
-        await member.ban(reason=reason)
-        await ctx.send(f"🔨 Участник {member.mention} заблокирован. Причина: {reason}")
-    except Exception as e:
-        logger.error(f"[BAN] {e}")
-
-@cmd_clear.error
-@cmd_kick.error
-@cmd_ban.error
-async def mod_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("❌ У вас недостаточно прав для выполнения этой команды.")
-    else:
-        await ctx.send("❌ Ошибка при выполнении модерационной команды.")
-
-@bot.event
-async def on_ready():
-    logger.info(f"✅ Успешный вход: {bot.user} (ID: {bot.user.id})")
-    try:
-        await fetch_economic_news(force_refresh=True)
-
-        if not check_30min_news_alerts.is_running():
-            check_30min_news_alerts.start()
-        if not check_discord_events_alerts.is_running():
-            check_discord_events_alerts.start()
-        if not scheduled_news_digests.is_running():
-            scheduled_news_digests.start()
-        if not check_subscriptions_daily_loop.is_running():
-            check_subscriptions_daily_loop.start()
-    except Exception as e:
-        logger.error(f"[ON_READY] {e}")
-
-@bot.command(name="news")
-async def cmd_news(ctx):
-    try:
-        thread = await get_target_channel(TARGET_NEWS_THREAD_ID)
-        if not thread:
-            await ctx.send("❌ Целевая ветка для новостей не найдена.")
-            return
-
-        async with ctx.typing():
-            news = await fetch_economic_news()
-            now_msk = datetime.now(MSK_TZ)
-            today_date = now_msk.date()
-
-            today_events = []
-            for ev in news:
-                if not ev.get("dt_utc"):
-                    continue
-                ev_msk = ev["dt_utc"].astimezone(MSK_TZ)
-                if ev_msk.date() == today_date:
-                    today_events.append((ev, ev_msk))
-
-            embed = discord.Embed(
-                title="**Ежедневный экономический календарь Forex**",
-                color=discord.Color.gold()
-            )
-
-            day_name = DAYS_RU[now_msk.weekday()]
-            lines = [f"📅 *Запланированные события: {day_name}, {now_msk.strftime('%d.%m')}*"]
-
-            for ev, ev_msk in today_events:
-                flag = get_flag(ev["country"])
-                time_str = ev_msk.strftime("%H:%M")
-                impact_str = "🔴 **HIGH**" if ev["impact"] == "HIGH" else "🟠 **MEDIUM**"
-                lines.append(f"\n🕘 {time_str} | {flag} **{ev['country']}** — {ev['title']}\n{impact_str}")
-
-            embed.description = "\n".join(lines) if len(lines) > 1 else "На сегодня важных новостей больше нет."
-            await thread.send(embed=embed)
-            
-            if ctx.channel.id != TARGET_NEWS_THREAD_ID:
-                await ctx.send(f"✅ Новости опубликованы в ветку <#{TARGET_NEWS_THREAD_ID}>")
-    except Exception as e:
-        logger.error(f"[NEWS] {e}")
-
-# ---------------------------------------------------------------------------
-# MAIN EXECUTION (С ЗАЩИТОЙ ОТ CLOUDFLARE 429/1015)
+# MAIN EXECUTION (С СОЗДАНИЕМ НОВОГО ЭКЗЕМПЛЯРА БОТА ПРИ ПЕРЕПОДКЛЮЧЕНИИ)
 # ---------------------------------------------------------------------------
 async def main():
+    global bot
     await start_web_server()
     
     while True:
         try:
+            bot = create_bot()
             logger.info("⚡️ Инициализация подключения к Discord API...")
             await bot.start(DISCORD_TOKEN)
         except discord.errors.HTTPException as e:
             if e.status in (429, 1015) or "1015" in str(e):
                 logger.warning("⚠️ Временная блокировка IP / Cloudflare (HTTP 429/1015). Ожидание 5 минут для сброса ограничений...")
-                await bot.close()
-                await asyncio.sleep(300)  # Ждем 5 минут, чтобы баг-лист IP очистился
+                try:
+                    if bot:
+                        await bot.close()
+                except Exception:
+                    pass
+                await asyncio.sleep(300)
             else:
                 logger.error(f"❌ Ошибка Discord HTTP ({e.status}): {e}")
-                await bot.close()
+                try:
+                    if bot:
+                        await bot.close()
+                except Exception:
+                    pass
                 await asyncio.sleep(30)
         except Exception as e:
             logger.error(f"❌ Сбой сети/прокси: {e}")
             try:
-                await bot.close()
+                if bot:
+                    await bot.close()
             except Exception:
                 pass
             await asyncio.sleep(30)
