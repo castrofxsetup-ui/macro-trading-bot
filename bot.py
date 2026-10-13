@@ -11,6 +11,7 @@ from aiohttp import web
 import discord
 from discord.ext import commands, tasks
 from curl_cffi import requests as async_requests
+from aiohttp_socks import ProxyConnector
 
 # ---------------------------------------------------------------------------
 # LOGGING SETUP
@@ -28,14 +29,6 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 PROXY_URL = os.getenv("PROXY_URL")
 PORT = int(os.getenv("PORT", 10000))
 
-# Прописываем прокси в окружение для автоматического подхвата библиотеками
-if PROXY_URL:
-    os.environ["HTTP_PROXY"] = PROXY_URL
-    os.environ["HTTPS_PROXY"] = PROXY_URL
-    os.environ["ALL_PROXY"] = PROXY_URL
-    logger.info("🔒 Прокси успешно зарегистрирован в системном окружении.")
-
-# ID целевых веток Discord
 TARGET_NEWS_THREAD_ID = 1528319066513604688
 TARGET_EVENTS_THREAD_ID = 1528506824687485118
 
@@ -64,10 +57,8 @@ SENT_NEWS_ALERTS = set()
 SENT_DISCORD_EVENTS = set()
 CACHE_TTL_SECONDS = 1800
 
-# База данных активности в памяти (User ID -> XP)
 USER_XP = {}
 
-# Отслеживание топ-3 лидеров и параметров антиспама обгонов
 LAST_TOP_THREE = []
 LAST_OVERTAKE_TIME = 0
 GLOBAL_OVERTAKE_COOLDOWN = 180  # 3 минуты
@@ -77,22 +68,29 @@ PAIR_OVERTAKE_TIME = 0
 PAIR_OVERTAKE_COOLDOWN = 300  # 5 минут
 
 # ---------------------------------------------------------------------------
-# INITIALIZE DISCORD BOT
+# BOT CLASS WITH SAFE PROXY SETUP
 # ---------------------------------------------------------------------------
-intents = discord.Intents.default()
-intents.message_content = True
-intents.guild_scheduled_events = True
-intents.members = True
+class LegacyBot(commands.Bot):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.guild_scheduled_events = True
+        intents.members = True
+        super().__init__(command_prefix="!", intents=intents)
 
-# Передаем proxy аргумент напрямую в бота (поддерживается в новых версиях discord.py)
-bot_kwargs = {
-    "command_prefix": "!",
-    "intents": intents
-}
-if PROXY_URL:
-    bot_kwargs["proxy"] = PROXY_URL
+    async def setup_hook(self):
+        """Безопасная инициализация коннектора прокси внутри запущенного event loop"""
+        if PROXY_URL:
+            try:
+                connector = ProxyConnector.from_url(PROXY_URL)
+                await self.http.close()
+                self.http.connector = connector
+                self.http._session = aiohttp.ClientSession(connector=connector, headers=self.http._session.headers)
+                logger.info("🔒 SOCKS5 прокси успешно и стабильно интегрирован в клиент бота.")
+            except Exception as e:
+                logger.error(f"❌ Ошибка инициализации прокси-коннектора: {e}")
 
-bot = commands.Bot(**bot_kwargs)
+bot = LegacyBot()
 
 # ---------------------------------------------------------------------------
 # WEB SERVER FOR RENDER KEEP-ALIVE
@@ -101,27 +99,30 @@ async def handle_ping(request):
     return web.Response(text="Bot is running!", status=200)
 
 async def start_web_server():
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    app.router.add_get("/ping", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info(f"🌐 Веб-сервер запущен на порту {PORT}")
+    try:
+        app = web.Application()
+        app.router.add_get("/", handle_ping)
+        app.router.add_get("/ping", handle_ping)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", PORT)
+        await site.start()
+        logger.info(f"🌐 Веб-сервер запущен на порту {PORT}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка запуска веб-сервера: {e}")
 
 # ---------------------------------------------------------------------------
-# HELPER FUNCTIONS & NEWS PARSER
+# HELPER FUNCTIONS & NEWS PARSER WITH ERROR PROTECTION
 # ---------------------------------------------------------------------------
 async def get_target_channel(channel_id: int):
-    channel = bot.get_channel(channel_id)
-    if not channel:
-        try:
+    try:
+        channel = bot.get_channel(channel_id)
+        if not channel:
             channel = await bot.fetch_channel(channel_id)
-        except Exception as e:
-            logger.error(f"[CHANNEL ERROR] Не удалось найти канал {channel_id}: {e}")
-            return None
-    return channel
+        return channel
+    except Exception as e:
+        logger.error(f"[CHANNEL ERROR] Не удалось найти канал {channel_id}: {e}")
+        return None
 
 def get_flag(currency: str) -> str:
     return COUNTRY_FLAGS.get(str(currency).upper(), "🌐")
@@ -234,298 +235,325 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
     return NEWS_CACHE["data"]
 
 # ---------------------------------------------------------------------------
-# AUTOMATED TASKS (NEWS & EVENTS)
+# AUTOMATED TASKS
 # ---------------------------------------------------------------------------
 
 @tasks.loop(minutes=1)
 async def check_30min_news_alerts():
-    await bot.wait_until_ready()
-    thread = await get_target_channel(TARGET_NEWS_THREAD_ID)
-    if not thread:
-        return
+    try:
+        await bot.wait_until_ready()
+        thread = await get_target_channel(TARGET_NEWS_THREAD_ID)
+        if not thread:
+            return
 
-    news = await fetch_economic_news()
-    now_utc = datetime.now(timezone.utc)
-    now_msk = now_utc.astimezone(MSK_TZ)
+        news = await fetch_economic_news()
+        now_utc = datetime.now(timezone.utc)
+        now_msk = now_utc.astimezone(MSK_TZ)
 
-    is_night_time = (0 <= now_msk.hour < 8)
-    upcoming_events = []
-    
-    for ev in news:
-        if ev.get("impact") != "HIGH" or not ev.get("dt_utc"):
-            continue
+        is_night_time = (0 <= now_msk.hour < 8)
+        upcoming_events = []
+        
+        for ev in news:
+            if ev.get("impact") != "HIGH" or not ev.get("dt_utc"):
+                continue
 
-        dt_utc = ev["dt_utc"]
-        time_diff = (dt_utc - now_utc).total_seconds() / 60.0
-        event_id = f"{ev['title']}_{dt_utc.isoformat()}"
+            dt_utc = ev["dt_utc"]
+            time_diff = (dt_utc - now_utc).total_seconds() / 60.0
+            event_id = f"{ev['title']}_{dt_utc.isoformat()}"
 
-        if 28 <= time_diff <= 31 and event_id not in SENT_NEWS_ALERTS:
-            upcoming_events.append((ev, event_id))
+            if 28 <= time_diff <= 31 and event_id not in SENT_NEWS_ALERTS:
+                upcoming_events.append((ev, event_id))
 
-    if upcoming_events:
-        lines = []
-        for ev, event_id in upcoming_events:
-            SENT_NEWS_ALERTS.add(event_id)
-            dt_msk = ev["dt_utc"].astimezone(MSK_TZ)
-            time_str = dt_msk.strftime("%H:%M")
-            flag = get_flag(ev["country"])
-            lines.append(f"{flag} **{ev['country']}** — {ev['title']} | 🕘 {time_str}")
+        if upcoming_events:
+            lines = []
+            for ev, event_id in upcoming_events:
+                SENT_NEWS_ALERTS.add(event_id)
+                dt_msk = ev["dt_utc"].astimezone(MSK_TZ)
+                time_str = dt_msk.strftime("%H:%M")
+                flag = get_flag(ev["country"])
+                lines.append(f"{flag} **{ev['country']}** — {ev['title']} | 🕘 {time_str}")
 
-        description_text = "\n".join(lines) + "\n\n-# ⌛️ Публикация через 30 минут"
+            description_text = "\n".join(lines) + "\n\n-# ⌛️ Публикация через 30 минут"
 
-        embed = discord.Embed(
-            title="**Запланированное событие:**" if len(upcoming_events) == 1 else "**Запланированные события:**",
-            description=description_text,
-            color=discord.Color.red()
-        )
+            embed = discord.Embed(
+                title="**Запланированное событие:**" if len(upcoming_events) == 1 else "**Запланированные события:**",
+                description=description_text,
+                color=discord.Color.red()
+            )
 
-        content = "" if is_night_time else "@everyone"
-        await thread.send(content=content, embed=embed)
+            content = "" if is_night_time else "@everyone"
+            await thread.send(content=content, embed=embed)
+    except Exception as e:
+        logger.error(f"[NEWS ALERT TASK ERROR] {e}")
 
 @tasks.loop(minutes=2)
 async def check_discord_events_alerts():
-    await bot.wait_until_ready()
-    thread = await get_target_channel(TARGET_EVENTS_THREAD_ID)
-    if not thread:
-        return
+    try:
+        await bot.wait_until_ready()
+        thread = await get_target_channel(TARGET_EVENTS_THREAD_ID)
+        if not thread:
+            return
 
-    now_utc = datetime.now(timezone.utc)
+        now_utc = datetime.now(timezone.utc)
 
-    for guild in bot.guilds:
-        try:
-            events = await guild.fetch_scheduled_events(with_counts=True)
-            for event in events:
-                if not event.start_time:
-                    continue
-                
-                time_diff = (event.start_time - now_utc).total_seconds() / 60.0
-                event_id = f"{event.id}_{event.start_time.isoformat()}"
+        for guild in bot.guilds:
+            try:
+                events = await guild.fetch_scheduled_events(with_counts=True)
+                for event in events:
+                    if not event.start_time:
+                        continue
+                    
+                    time_diff = (event.start_time - now_utc).total_seconds() / 60.0
+                    event_id = f"{event.id}_{event.start_time.isoformat()}"
 
-                if 28 <= time_diff <= 32 and event_id not in SENT_DISCORD_EVENTS:
-                    SENT_DISCORD_EVENTS.add(event_id)
+                    if 28 <= time_diff <= 32 and event_id not in SENT_DISCORD_EVENTS:
+                        SENT_DISCORD_EVENTS.add(event_id)
 
-                    embed = discord.Embed(
-                        description=(
-                            f"🕘 Через 30 минут начнётся **{event.name}**!\n\n"
-                            f"Ссылка, чтоб присоединиться к нашему брифингу 👇\n"
-                            f"{event.url}"
-                        ),
-                        color=discord.Color.gold()
-                    )
-                    await thread.send(content="@everyone", embed=embed)
-        except Exception as e:
-            logger.error(f"[EVENTS CHECK ERROR] {e}")
+                        embed = discord.Embed(
+                            description=(
+                                f"🕘 Через 30 минут начнётся **{event.name}**!\n\n"
+                                f"Ссылка, чтоб присоединиться к нашему брифингу 👇\n"
+                                f"{event.url}"
+                            ),
+                            color=discord.Color.gold()
+                        )
+                        await thread.send(content="@everyone", embed=embed)
+            except Exception as e:
+                logger.error(f"[GUILD EVENTS ERROR] {e}")
+    except Exception as e:
+        logger.error(f"[EVENTS CHECK ERROR] {e}")
 
 @tasks.loop(hours=1)
 async def scheduled_news_digests():
-    await bot.wait_until_ready()
-    thread = await get_target_channel(TARGET_NEWS_THREAD_ID)
-    if not thread:
-        return
+    try:
+        await bot.wait_until_ready()
+        thread = await get_target_channel(TARGET_NEWS_THREAD_ID)
+        if not thread:
+            return
 
-    now_msk = datetime.now(MSK_TZ)
+        now_msk = datetime.now(MSK_TZ)
 
-    if now_msk.hour == 8:
-        news = await fetch_economic_news(force_refresh=True)
+        if now_msk.hour == 8:
+            news = await fetch_economic_news(force_refresh=True)
 
-        if now_msk.weekday() == 0:
-            grouped = {}
+            if now_msk.weekday() == 0:
+                grouped = {}
+                for ev in news:
+                    if not ev.get("dt_utc"):
+                        continue
+                    ev_msk = ev["dt_utc"].astimezone(MSK_TZ)
+                    day_key = ev_msk.date()
+                    if day_key not in grouped:
+                        grouped[day_key] = []
+                    grouped[day_key].append((ev, ev_msk))
+
+                lines = []
+                for day_date in sorted(grouped.keys()):
+                    first_ev_msk = grouped[day_date][0][1]
+                    day_name = DAYS_RU[first_ev_msk.weekday()]
+                    month_name = MONTHS_RU[first_ev_msk.month]
+                    
+                    lines.append(f"\n**📅 {day_name}, {first_ev_msk.day}, {month_name}**")
+
+                    for ev, ev_msk in grouped[day_date]:
+                        flag = get_flag(ev["country"])
+                        time_str = ev_msk.strftime("%H:%M")
+                        impact_str = "🔴 **HIGH**" if ev["impact"] == "HIGH" else "🟠 **MEDIUM**"
+                        lines.append(f"{flag} **{ev['country']}** — {ev['title']} | 🕘 {time_str} | {impact_str}")
+
+                current_text = ""
+                embeds_to_send = []
+
+                for line in lines:
+                    if len(current_text) + len(line) + 1 > 3900:
+                        embeds_to_send.append(discord.Embed(description=current_text, color=discord.Color.blue()))
+                        current_text = line
+                    else:
+                        current_text += "\n" + line if current_text else line
+
+                if current_text:
+                    embeds_to_send.append(discord.Embed(description=current_text, color=discord.Color.blue()))
+
+                if embeds_to_send:
+                    embeds_to_send[0].title = "**Экономический календарь Forex на неделю:**"
+                    for emb in embeds_to_send:
+                        await thread.send(embed=emb)
+
+            today_date = now_msk.date()
+            today_events = []
             for ev in news:
                 if not ev.get("dt_utc"):
                     continue
                 ev_msk = ev["dt_utc"].astimezone(MSK_TZ)
-                day_key = ev_msk.date()
-                if day_key not in grouped:
-                    grouped[day_key] = []
-                grouped[day_key].append((ev, ev_msk))
+                if ev_msk.date() == today_date:
+                    today_events.append((ev, ev_msk))
 
-            lines = []
-            for day_date in sorted(grouped.keys()):
-                first_ev_msk = grouped[day_date][0][1]
-                day_name = DAYS_RU[first_ev_msk.weekday()]
-                month_name = MONTHS_RU[first_ev_msk.month]
-                
-                lines.append(f"\n**📅 {day_name}, {first_ev_msk.day}, {month_name}**")
+            day_name = DAYS_RU[now_msk.weekday()]
+            date_str_formatted = f"{day_name}, {now_msk.strftime('%d.%m')}"
 
-                for ev, ev_msk in grouped[day_date]:
-                    flag = get_flag(ev["country"])
-                    time_str = ev_msk.strftime("%H:%M")
-                    impact_str = "🔴 **HIGH**" if ev["impact"] == "HIGH" else "🟠 **MEDIUM**"
-                    lines.append(f"{flag} **{ev['country']}** — {ev['title']} | 🕘 {time_str} | {impact_str}")
+            embed = discord.Embed(
+                title="**Ежедневный экономический календарь Forex**",
+                color=discord.Color.gold()
+            )
 
-            current_text = ""
-            embeds_to_send = []
+            lines = [f"📅 *Запланированные события: {date_str_formatted}*"]
+            for ev, ev_msk in today_events:
+                flag = get_flag(ev["country"])
+                time_str = ev_msk.strftime("%H:%M")
+                impact_str = "🔴 **HIGH**" if ev["impact"] == "HIGH" else "🟠 **MEDIUM**"
+                lines.append(f"\n🕘 {time_str} | {flag} **{ev['country']}** — {ev['title']}")
+                lines.append(f"{impact_str}")
 
-            for line in lines:
-                if len(current_text) + len(line) + 1 > 3900:
-                    embeds_to_send.append(discord.Embed(description=current_text, color=discord.Color.blue()))
-                    current_text = line
-                else:
-                    current_text += "\n" + line if current_text else line
-
-            if current_text:
-                embeds_to_send.append(discord.Embed(description=current_text, color=discord.Color.blue()))
-
-            if embeds_to_send:
-                embeds_to_send[0].title = "**Экономический календарь Forex на неделю:**"
-                for emb in embeds_to_send:
-                    await thread.send(embed=emb)
-
-        today_date = now_msk.date()
-        today_events = []
-        for ev in news:
-            if not ev.get("dt_utc"):
-                continue
-            ev_msk = ev["dt_utc"].astimezone(MSK_TZ)
-            if ev_msk.date() == today_date:
-                today_events.append((ev, ev_msk))
-
-        day_name = DAYS_RU[now_msk.weekday()]
-        date_str_formatted = f"{day_name}, {now_msk.strftime('%d.%m')}"
-
-        embed = discord.Embed(
-            title="**Ежедневный экономический календарь Forex**",
-            color=discord.Color.gold()
-        )
-
-        lines = [f"📅 *Запланированные события: {date_str_formatted}*"]
-        for ev, ev_msk in today_events:
-            flag = get_flag(ev["country"])
-            time_str = ev_msk.strftime("%H:%M")
-            impact_str = "🔴 **HIGH**" if ev["impact"] == "HIGH" else "🟠 **MEDIUM**"
-            lines.append(f"\n🕘 {time_str} | {flag} **{ev['country']}** — {ev['title']}")
-            lines.append(f"{impact_str}")
-
-        embed.description = "\n".join(lines) if len(lines) > 1 else "На сегодня важных новостей нет."
-        await thread.send(embed=embed)
+            embed.description = "\n".join(lines) if len(lines) > 1 else "На сегодня важных новостей нет."
+            await thread.send(embed=embed)
+    except Exception as e:
+        logger.error(f"[SCHEDULED DIGEST ERROR] {e}")
 
 # ---------------------------------------------------------------------------
-# AUTO-ROLE & ACTIVITY & LEADERBOARD SYSTEM
+# EVENTS & COMMANDS WITH SAFE ERROR HANDLING
 # ---------------------------------------------------------------------------
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    role = discord.utils.get(member.guild.roles, name="Trader")
-    if role:
-        try:
+    try:
+        role = discord.utils.get(member.guild.roles, name="Trader")
+        if role:
             await member.add_roles(role)
             logger.info(f"[AUTO-ROLE] Выдана роль Trader пользователю {member.name}")
-        except Exception as e:
-            logger.error(f"[AUTO-ROLE ERROR] {e}")
+    except Exception as e:
+        logger.error(f"[AUTO-ROLE ERROR] {e}")
 
 @bot.event
 async def on_message(message: discord.Message):
     global LAST_TOP_THREE, LAST_OVERTAKE_TIME, LAST_OVERTAKE_PAIR, PAIR_OVERTAKE_TIME
 
-    if message.author.bot or not message.guild:
-        return
+    try:
+        if message.author.bot or not message.guild:
+            return
 
-    author_id = message.author.id
-    USER_XP[author_id] = USER_XP.get(author_id, 0) + 5
+        author_id = message.author.id
+        USER_XP[author_id] = USER_XP.get(author_id, 0) + 5
 
-    sorted_users = sorted(USER_XP.items(), key=lambda item: item[1], reverse=True)
-    current_top_three = [u_id for u_id, _ in sorted_users[:3]]
+        sorted_users = sorted(USER_XP.items(), key=lambda item: item[1], reverse=True)
+        current_top_three = [u_id for u_id, _ in sorted_users[:3]]
 
-    if LAST_TOP_THREE and current_top_three != LAST_TOP_THREE:
-        now = time.time()
-        if now - LAST_OVERTAKE_TIME >= GLOBAL_OVERTAKE_COOLDOWN:
-            overtaker_id = author_id
-            if overtaker_id in current_top_three:
-                new_pos = current_top_three.index(overtaker_id) + 1
-                
-                overtaken_id = None
-                if overtaker_id in LAST_TOP_THREE:
-                    old_pos = LAST_TOP_THREE.index(overtaker_id)
-                    if new_pos - 1 < old_pos:
-                        overtaken_id = LAST_TOP_THREE[new_pos - 1]
-                else:
-                    overtaken_id = LAST_TOP_THREE[-1]
+        if LAST_TOP_THREE and current_top_three != LAST_TOP_THREE:
+            now = time.time()
+            if now - LAST_OVERTAKE_TIME >= GLOBAL_OVERTAKE_COOLDOWN:
+                overtaker_id = author_id
+                if overtaker_id in current_top_three:
+                    new_pos = current_top_three.index(overtaker_id) + 1
+                    
+                    overtaken_id = None
+                    if overtaker_id in LAST_TOP_THREE:
+                        old_pos = LAST_TOP_THREE.index(overtaker_id)
+                        if new_pos - 1 < old_pos:
+                            overtaken_id = LAST_TOP_THREE[new_pos - 1]
+                    else:
+                        overtaken_id = LAST_TOP_THREE[-1]
 
-                if overtaken_id and overtaken_id != overtaker_id:
-                    current_pair = (overtaker_id, overtaken_id)
+                    if overtaken_id and overtaken_id != overtaker_id:
+                        current_pair = (overtaker_id, overtaken_id)
 
-                    if current_pair != LAST_OVERTAKE_PAIR or (now - PAIR_OVERTAKE_TIME >= PAIR_OVERTAKE_COOLDOWN):
-                        overtaker_member = message.guild.get_member(overtaker_id)
-                        overtaken_member = message.guild.get_member(overtaken_id)
+                        if current_pair != LAST_OVERTAKE_PAIR or (now - PAIR_OVERTAKE_TIME >= PAIR_OVERTAKE_COOLDOWN):
+                            overtaker_member = message.guild.get_member(overtaker_id)
+                            overtaken_member = message.guild.get_member(overtaken_id)
 
-                        overtaker_name = overtaker_member.mention if overtaker_member else f"<@{overtaker_id}>"
-                        overtaken_name = overtaken_member.mention if overtaken_member else f"<@{overtaken_id}>"
+                            overtaker_name = overtaker_member.mention if overtaker_member else f"<@{overtaker_id}>"
+                            overtaken_name = overtaken_member.mention if overtaken_member else f"<@{overtaken_id}>"
 
-                        medals = {1: "🥇 1-е место", 2: "🥈 2-е место", 3: "🥉 3-е место"}
-                        pos_str = medals.get(new_pos, f"**{new_pos}-е место**")
+                            medals = {1: "🥇 1-е место", 2: "🥈 2-е место", 3: "🥉 3-е место"}
+                            pos_str = medals.get(new_pos, f"**{new_pos}-е место**")
 
-                        embed = discord.Embed(
-                            title="⚡️ Смена лидера в Топе Активности!",
-                            description=(
-                                f"🔥 {overtaker_name} вырывается вперед и забирает {pos_str}, обгоняя {overtaken_name}!\n\n"
-                                f"👀 {overtaken_name}, самое время поднапрячься и вернуть свою позицию!"
-                            ),
-                            color=discord.Color.gold()
-                        )
-                        embed.set_footer(text="Рейтинг рассчитывается по сообщениям на сервере")
-                        
-                        await message.channel.send(embed=embed)
-                        
-                        LAST_OVERTAKE_TIME = now
-                        LAST_OVERTAKE_PAIR = current_pair
-                        PAIR_OVERTAKE_TIME = now
+                            embed = discord.Embed(
+                                title="⚡️ Смена лидера в Топе Активности!",
+                                description=(
+                                    f"🔥 {overtaker_name} вырывается вперед и забирает {pos_str}, обгоняя {overtaken_name}!\n\n"
+                                    f"👀 {overtaken_name}, самое время поднапрячься и вернуть свою позицию!"
+                                ),
+                                color=discord.Color.gold()
+                            )
+                            embed.set_footer(text="Рейтинг рассчитывается по сообщениям на сервере")
+                            
+                            await message.channel.send(embed=embed)
+                            
+                            LAST_OVERTAKE_TIME = now
+                            LAST_OVERTAKE_PAIR = current_pair
+                            PAIR_OVERTAKE_TIME = now
 
-    LAST_TOP_THREE = current_top_three
-    await bot.process_commands(message)
+        LAST_TOP_THREE = current_top_three
+        await bot.process_commands(message)
+    except Exception as e:
+        logger.error(f"[ON_MESSAGE ERROR] {e}")
 
 @bot.command(name="rank", aliases=["level", "активность"])
 async def cmd_rank(ctx):
-    xp = USER_XP.get(ctx.author.id, 0)
-    embed = discord.Embed(
-        title="📊 Статистика активности",
-        description=f"Участник: {ctx.author.mention}\n⚡️ Накоплено опыта (XP): **{xp}**",
-        color=discord.Color.blue()
-    )
-    await ctx.send(embed=embed)
+    try:
+        xp = USER_XP.get(ctx.author.id, 0)
+        embed = discord.Embed(
+            title="📊 Статистика активности",
+            description=f"Участник: {ctx.author.mention}\n⚡️ Накоплено опыта (XP): **{xp}**",
+            color=discord.Color.blue()
+        )
+        await ctx.send(embed=embed)
+    except Exception as e:
+        logger.error(f"[RANK COMMAND ERROR] {e}")
 
 @bot.command(name="leaderboard", aliases=["top", "топ", "рейтинг"])
 async def cmd_leaderboard(ctx):
-    if not USER_XP:
-        await ctx.send("📉 База активности пока пуста. Участники еще не отправляли сообщения.")
-        return
+    try:
+        if not USER_XP:
+            await ctx.send("📉 База активности пока пуста. Участники еще не отправляли сообщения.")
+            return
 
-    sorted_users = sorted(USER_XP.items(), key=lambda item: item[1], reverse=True)
-    lines = []
-    medals = ["🥇", "🥈", "🥉"]
+        sorted_users = sorted(USER_XP.items(), key=lambda item: item[1], reverse=True)
+        lines = []
+        medals = ["🥇", "🥈", "🥉"]
 
-    for idx, (user_id, xp) in enumerate(sorted_users[:10], start=1):
-        user = ctx.guild.get_member(user_id)
-        name = user.mention if user else f"Пользователь (ID: {user_id})"
-        prefix = medals[idx - 1] if idx <= 3 else f"**{idx}.**"
-        lines.append(f"{prefix} {name} — **{xp} XP**")
+        for idx, (user_id, xp) in enumerate(sorted_users[:10], start=1):
+            user = ctx.guild.get_member(user_id)
+            name = user.mention if user else f"Пользователь (ID: {user_id})"
+            prefix = medals[idx - 1] if idx <= 3 else f"**{idx}.**"
+            lines.append(f"{prefix} {name} — **{xp} XP**")
 
-    embed = discord.Embed(
-        title="🏆 Рейтинг активности участников",
-        description="\n".join(lines),
-        color=discord.Color.gold()
-    )
-    embed.set_footer(text="Активность начисляется за сообщения в чатах сервера.")
-    await ctx.send(embed=embed)
+        embed = discord.Embed(
+            title="🏆 Рейтинг активности участников",
+            description="\n".join(lines),
+            color=discord.Color.gold()
+        )
+        embed.set_footer(text="Активность начисляется за сообщения в чатах сервера.")
+        await ctx.send(embed=embed)
+    except Exception as e:
+        logger.error(f"[LEADERBOARD COMMAND ERROR] {e}")
 
 @bot.command(name="clear", aliases=["purge", "очистить"])
 @commands.has_permissions(manage_messages=True)
 async def cmd_clear(ctx, amount: int = 10):
-    await ctx.channel.purge(limit=amount + 1)
-    msg = await ctx.send(f"🧹 Успешно удалено сообщений: {amount}")
-    await asyncio.sleep(3)
-    await msg.delete()
+    try:
+        await ctx.channel.purge(limit=amount + 1)
+        msg = await ctx.send(f"🧹 Успешно удалено сообщений: {amount}")
+        await asyncio.sleep(3)
+        await msg.delete()
+    except Exception as e:
+        logger.error(f"[CLEAR COMMAND ERROR] {e}")
 
 @bot.command(name="kick", aliases=["кик"])
 @commands.has_permissions(kick_members=True)
 async def cmd_kick(ctx, member: discord.Member, *, reason: str = "Не указана"):
-    await member.kick(reason=reason)
-    await ctx.send(f"👢 Участник {member.mention} исключен. Причина: {reason}")
+    try:
+        await member.kick(reason=reason)
+        await ctx.send(f"👢 Участник {member.mention} исключен. Причина: {reason}")
+    except Exception as e:
+        logger.error(f"[KICK COMMAND ERROR] {e}")
 
 @bot.command(name="ban", aliases=["бан"])
 @commands.has_permissions(ban_members=True)
 async def cmd_ban(ctx, member: discord.Member, *, reason: str = "Не указана"):
-    await member.ban(reason=reason)
-    await ctx.send(f"🔨 Участник {member.mention} заблокирован. Причина: {reason}")
+    try:
+        await member.ban(reason=reason)
+        await ctx.send(f"🔨 Участник {member.mention} заблокирован. Причина: {reason}")
+    except Exception as e:
+        logger.error(f"[BAN COMMAND ERROR] {e}")
 
 @cmd_clear.error
 @cmd_kick.error
@@ -539,75 +567,85 @@ async def mod_error(ctx, error):
 @bot.event
 async def on_ready():
     logger.info(f"✅ Успешный вход: {bot.user} (ID: {bot.user.id})")
-    await fetch_economic_news(force_refresh=True)
+    try:
+        await fetch_economic_news(force_refresh=True)
 
-    if not check_30min_news_alerts.is_running():
-        check_30min_news_alerts.start()
-    if not check_discord_events_alerts.is_running():
-        check_discord_events_alerts.start()
-    if not scheduled_news_digests.is_running():
-        scheduled_news_digests.start()
+        if not check_30min_news_alerts.is_running():
+            check_30min_news_alerts.start()
+        if not check_discord_events_alerts.is_running():
+            check_discord_events_alerts.start()
+        if not scheduled_news_digests.is_running():
+            scheduled_news_digests.start()
+    except Exception as e:
+        logger.error(f"[ON_READY TASKS ERROR] {e}")
 
 @bot.command(name="news")
 async def cmd_news(ctx):
-    thread = await get_target_channel(TARGET_NEWS_THREAD_ID)
-    if not thread:
-        await ctx.send("❌ Целевая ветка для новостей не найдена.")
-        return
+    try:
+        thread = await get_target_channel(TARGET_NEWS_THREAD_ID)
+        if not thread:
+            await ctx.send("❌ Целевая ветка для новостей не найдена.")
+            return
 
-    async with ctx.typing():
-        news = await fetch_economic_news()
-        now_msk = datetime.now(MSK_TZ)
-        today_date = now_msk.date()
+        async with ctx.typing():
+            news = await fetch_economic_news()
+            now_msk = datetime.now(MSK_TZ)
+            today_date = now_msk.date()
 
-        today_events = []
-        for ev in news:
-            if not ev.get("dt_utc"):
-                continue
-            ev_msk = ev["dt_utc"].astimezone(MSK_TZ)
-            if ev_msk.date() == today_date:
-                today_events.append((ev, ev_msk))
+            today_events = []
+            for ev in news:
+                if not ev.get("dt_utc"):
+                    continue
+                ev_msk = ev["dt_utc"].astimezone(MSK_TZ)
+                if ev_msk.date() == today_date:
+                    today_events.append((ev, ev_msk))
 
-        embed = discord.Embed(
-            title="**Ежедневный экономический календарь Forex**",
-            color=discord.Color.gold()
-        )
+            embed = discord.Embed(
+                title="**Ежедневный экономический календарь Forex**",
+                color=discord.Color.gold()
+            )
 
-        day_name = DAYS_RU[now_msk.weekday()]
-        lines = [f"📅 *Запланированные события: {day_name}, {now_msk.strftime('%d.%m')}*"]
+            day_name = DAYS_RU[now_msk.weekday()]
+            lines = [f"📅 *Запланированные события: {day_name}, {now_msk.strftime('%d.%m')}*"]
 
-        for ev, ev_msk in today_events:
-            flag = get_flag(ev["country"])
-            time_str = ev_msk.strftime("%H:%M")
-            impact_str = "🔴 **HIGH**" if ev["impact"] == "HIGH" else "🟠 **MEDIUM**"
+            for ev, ev_msk in today_events:
+                flag = get_flag(ev["country"])
+                time_str = ev_msk.strftime("%H:%M")
+                impact_str = "🔴 **HIGH**" if ev["impact"] == "HIGH" else "🟠 **MEDIUM**"
 
-            lines.append(f"\n🕘 {time_str} | {flag} **{ev['country']}** — {ev['title']}")
-            lines.append(f"{impact_str}")
+                lines.append(f"\n🕘 {time_str} | {flag} **{ev['country']}** — {ev['title']}")
+                lines.append(f"{impact_str}")
 
-        embed.description = "\n".join(lines) if len(lines) > 1 else "На сегодня важных новостей больше нет."
-        await thread.send(embed=embed)
-        
-        if ctx.channel.id != TARGET_NEWS_THREAD_ID:
-            await ctx.send(f"✅ Новости опубликованы в ветку <#{TARGET_NEWS_THREAD_ID}>")
+            embed.description = "\n".join(lines) if len(lines) > 1 else "На сегодня важных новостей больше нет."
+            await thread.send(embed=embed)
+            
+            if ctx.channel.id != TARGET_NEWS_THREAD_ID:
+                await ctx.send(f"✅ Новости опубликованы в ветку <#{TARGET_NEWS_THREAD_ID}>")
+    except Exception as e:
+        logger.error(f"[NEWS COMMAND ERROR] {e}")
 
 # ---------------------------------------------------------------------------
-# MAIN EXECUTION
+# MAIN EXECUTION WITH ROBUST AUTO-RECOVERY & ERROR SHIELDING
 # ---------------------------------------------------------------------------
 async def main():
     await start_web_server()
+    
     while True:
         try:
-            logger.info("⚡️ Попытка подключения к Discord через встроенный прокси-адаптер...")
+            logger.info("⚡️ Попытка подключения к Discord через защищенный прокси-коннектор...")
             await bot.start(DISCORD_TOKEN)
         except discord.errors.HTTPException as e:
             if e.status == 429 or "1015" in str(e):
-                logger.warning("⚠️ Временный затык сети/Cloudflare. Ожидание 60 секунд...")
+                logger.warning("⚠️ Временная блокировка IP / Cloudflare (HTTP 429/1015). Ожидание 60 секунд...")
                 await asyncio.sleep(60)
             else:
                 logger.error(f"❌ Ошибка Discord HTTP ({e.status}): {e}")
                 await asyncio.sleep(30)
+        except asyncio.TimeoutError:
+            logger.warning("⚠️ Тайм-аут соединения. Повторная попытка через 15 секунд...")
+            await asyncio.sleep(15)
         except Exception as e:
-            logger.error(f"❌ Сбой сети: {e}")
+            logger.error(f"❌ Критический сбой сети/соединения: {e}")
             await asyncio.sleep(20)
 
 if __name__ == "__main__":
