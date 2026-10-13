@@ -68,7 +68,7 @@ PAIR_OVERTAKE_TIME = 0
 PAIR_OVERTAKE_COOLDOWN = 300  # 5 минут
 
 # ---------------------------------------------------------------------------
-# BOT CLASS WITH FORCED PROXY CONNECTOR
+# BOT CLASS WITH ASYNC PROXY HOOK
 # ---------------------------------------------------------------------------
 class LegacyBot(commands.Bot):
     def __init__(self):
@@ -76,17 +76,21 @@ class LegacyBot(commands.Bot):
         intents.message_content = True
         intents.guild_scheduled_events = True
         intents.members = True
-        
-        kwargs = {
-            "command_prefix": "!",
-            "intents": intents
-        }
-        if PROXY_URL:
-            connector = ProxyConnector.from_url(PROXY_URL)
-            kwargs["connector"] = connector
-            logger.info("🔒 SOCKS5 прокси успешно привязан через коннектор бота.")
+        super().__init__(command_prefix="!", intents=intents)
 
-        super().__init__(**kwargs)
+    async def setup_hook(self):
+        """Безопасная инициализация прокси-коннектора в запущенном event loop"""
+        if PROXY_URL:
+            try:
+                connector = ProxyConnector.from_url(PROXY_URL)
+                await self.http.close()
+                self.http._session = aiohttp.ClientSession(
+                    connector=connector,
+                    headers=self.http._session.headers
+                )
+                logger.info("🔒 SOCKS5 прокси успешно интегрирован через ProxyConnector в setup_hook.")
+            except Exception as e:
+                logger.error(f"❌ Ошибка инициализации прокси-коннектора: {e}")
 
 bot = LegacyBot()
 
@@ -630,7 +634,7 @@ async def main():
     
     while True:
         try:
-            logger.info("⚡️ Инициализация подключения через ProxyConnector...")
+            logger.info("⚡️ Инициализация подключения...")
             await bot.start(DISCORD_TOKEN)
         except discord.errors.HTTPException as e:
             if e.status == 429 or "1015" in str(e):
