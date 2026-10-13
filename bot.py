@@ -11,7 +11,7 @@ from aiohttp import web
 import discord
 from discord.ext import commands, tasks
 from curl_cffi import requests as async_requests
-from python_socks.asyncio.anyio import Proxy
+from aiohttp_socks import ProxyConnector
 
 # ---------------------------------------------------------------------------
 # LOGGING SETUP
@@ -68,19 +68,7 @@ PAIR_OVERTAKE_TIME = 0
 PAIR_OVERTAKE_COOLDOWN = 300  # 5 минут
 
 # ---------------------------------------------------------------------------
-# CUSTOM BYPASS CONNECTOR FOR SOCKS5 VIA PYTHON-ROCKS / AIOHTTP
-# ---------------------------------------------------------------------------
-class ProxyClientSession(aiohttp.ClientSession):
-    """Кастомная сессия с обходом Cloudflare-фильтров через python-socks"""
-    def __init__(self, proxy_url, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.proxy_url = proxy_url
-
-    async def _request(self, method, str_or_url, **kwargs):
-        return await super()._request(method, str_or_url, **kwargs)
-
-# ---------------------------------------------------------------------------
-# BOT CLASS WITH ROBUST CONNECTION SHIELD
+# BOT CLASS WITH SAFE PROXY SETUP
 # ---------------------------------------------------------------------------
 class LegacyBot(commands.Bot):
     def __init__(self):
@@ -91,12 +79,16 @@ class LegacyBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
+        """Интеграция SOCKS5 прокси в HTTP-сессию бота на старте event loop"""
         if PROXY_URL:
             try:
-                # Настраиваем прокси через python-socks для полного обхода блокировок
-                logger.info("🔒 Применяем обходной прокси-коннектор через python-socks...")
+                connector = ProxyConnector.from_url(PROXY_URL)
+                # Пересоздаем сессию бота с использованием прокси-коннектора
+                await self.http.close()
+                self.http._session = aiohttp.ClientSession(connector=connector, headers=self.http._session.headers)
+                logger.info("🔒 SOCKS5 прокси успешно интегрирован через ProxyConnector.")
             except Exception as e:
-                logger.error(f"❌ Ошибка настройки прокси: {e}")
+                logger.error(f"❌ Ошибка настройки прокси-коннектора: {e}")
 
 bot = LegacyBot()
 
@@ -633,47 +625,25 @@ async def cmd_news(ctx):
         logger.error(f"[NEWS] {e}")
 
 # ---------------------------------------------------------------------------
-# MAIN EXECUTION WITH SOCKS5 PROXY BYPASS (USING PYTHON-ROCKS)
+# MAIN EXECUTION
 # ---------------------------------------------------------------------------
 async def main():
     await start_web_server()
     
     while True:
         try:
-            logger.info("⚡️ Инициализация защищенного подключения к Discord...")
-            
-            if PROXY_URL:
-                # Разбираем строку прокси для обхода через python-socks
-                clean_url = PROXY_URL.replace("socks5://", "")
-                auth, server = clean_url.split("@") if "@" in clean_url else (None, clean_url)
-                username, password = auth.split(":") if auth and ":" in auth else (None, None)
-                host, port_str = server.split(":")
-                proxy_port = int(port_str)
-
-                proxy = Proxy.from_addr(host, proxy_port, username=username, password=password)
-                
-                # Создаем TCP-соединение с Discord через обходной туннель прокси
-                connector = aiohttp.TCPConnector(force_close=True)
-                
-                # Подменяем сессию бота на обходную
-                await bot.http.close()
-                bot.http._session = aiohttp.ClientSession(connector=connector)
-                
-                # Проксируем саму попытку входа
-                logger.info(f"🔒 Подключение через SOCKS5 прокси {host}:{proxy_port}...")
-
+            logger.info("⚡️ Попытка подключения к Discord через защищенный ProxyConnector...")
             await bot.start(DISCORD_TOKEN)
-            
         except discord.errors.HTTPException as e:
             if e.status == 429 or "1015" in str(e):
-                logger.warning("⚠️ Защита Cloudflare (HTTP 429/1015). Ожидание 30 секунд...")
-                await asyncio.sleep(30)
+                logger.warning("⚠️ Временная блокировка IP / Cloudflare (HTTP 429/1015). Ожидание 45 секунд...")
+                await asyncio.sleep(45)
             else:
                 logger.error(f"❌ Ошибка Discord HTTP ({e.status}): {e}")
-                await asyncio.sleep(15)
+                await asyncio.sleep(20)
         except Exception as e:
             logger.error(f"❌ Сбой сети/прокси: {e}")
-            await asyncio.sleep(15)
+            await asyncio.sleep(20)
 
 if __name__ == "__main__":
     try:
