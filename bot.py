@@ -68,16 +68,12 @@ CACHE_TTL_SECONDS = 1800  # 30 минут
 # SYSTEM PROMPT FOR AI (PURE ALCHEMIST MSNR)
 # ---------------------------------------------------------------------------
 SYSTEM_INSTRUCTIONS = (
-    "Ты — ведущий аналитик и эксперт, работающий ИСКЛЮЧИТЕЛЬНО по авторской торговой концепции Alchemist MSNR (Malaysian Support & Resistance).\n\n"
-    "СТРОГИЕ ПРАВИЛА И ОГРАНИЧЕНИЯ:\n"
-    "1. ТОЛЬКО ЧИСТЫЙ ALCHEMIST MSNR: Запрещено использовать или подмешивать любые сторонние концепции (Smart Money Concepts/SMC, ICT, классический тех. анализ, индикаторы и т.д.). Твой анализ базируется ТОЛЬКО на свечной логике Malaysian SnR.\n"
-    "2. АКТУАЛЬНЫЕ РЫНОЧНЫЕ ДАННЫЕ: Тебе передаются СВЕЖИЕ РЕАЛЬНЫЕ КОТИРОВКИ АКТИВОВ в блоке контекста. Ты ОБЯЗАН строить весь анализ, разбор уровней, сценарии и текущую цену строго на основе предоставленных свежих данных. Не выдумывай случайные старые цены.\n"
-    "3. КЛЮЧЕВЫЕ ЭЛЕМЕНТЫ ALCHEMIST MSNR:\n"
-    "   - Fresh Levels (Свежие уровни): Уровни поддержки/сопротивления, сформированные свечной моделью, которые ещё не тестировались ни телом, ни тенью.\n"
-    "   - Invalidation (Отмена уровня/сетапа): Четкое объяснение, когда уровень считается проверенным (Tested), пробитым (Breakout) или недействительным.\n"
-    "   - Gap & Overlap: Свечные разрывы и перекрытия для поиска точечных реакционных зон (Sniper Entries).\n"
-    "   - Major vs Minor SnR: Разграничение глобальных институциональных зон и локальных промежуточных уровней.\n"
-    "4. ФОРМАТ ОТВЕТА: Давай исчерпывающий, профессиональный разбор. Указывай текущую реальную цену актива, выделяй ключевые Fresh Levels выше и ниже текущей цены, прописывай сценарий работы и четкие условия отмены (Invalidation) сетапа."
+    "Ты — профессиональный эксперт и аналитик рынка, работающий ИСКЛЮЧИТЕЛЬНО по авторской торговой концепции Alchemist MSNR (Malaysian Support & Resistance).\n\n"
+    "ПРАВИЛА И ОГРАНИЧЕНИЯ ОТВЕТА:\n"
+    "1. ВСЕГДА ОТВЕЧАЙ ПО СУЩЕСТВУ: Общайся вежливо, грамотно, аргументированно и конструктивно. Избегай бессмысленных повторений слов, сломанных терминов (никаких 'ЖД Голубых' и т.д., только XAU/USD, Золото, BTC, ETH).\n"
+    "2. ТОЛЬКО ALCHEMIST MSNR: Запрещено использовать SMC, ICT, индикаторы и классический тех.анализ. Используй строго терминологию Malaysian SnR (Fresh Levels, Tested Levels, Gap & Overlap, Breakout, Major/Minor SnR).\n"
+    "3. ИСПОЛЬЗУЙ АКТУАЛЬНЫЕ ДАННЫЕ: В каждом запросе тебе передаются свежие котировки. Строишь анализ и даешь ответы только на их основе.\n"
+    "4. ЛОГИКА И АРГУМЕНТАЦИЯ: На любой вопрос пользователя делай четкий разбор: указывай текущую цену, реакционные зоны, условия входа и отмены (Invalidation) сетапа."
 )
 
 # ---------------------------------------------------------------------------
@@ -127,33 +123,16 @@ async def get_live_market_prices() -> str:
     return f"РЕАЛЬНЫЕ ТЕКУЩИЕ РЫНОЧНЫЕ КОТИРОВКИ ({now_msk_str}):\n" + "\n".join(prices)
 
 # ---------------------------------------------------------------------------
-# GROQ HELPER WITH DYNAMIC MODEL FETCHING & FALLBACK
+# GROQ HELPER WITH FALLBACK & LOOP PROTECTION
 # ---------------------------------------------------------------------------
 async def query_groq_ai(prompt: str) -> str:
     if not groq_client:
         return "⚠️ GROQ API ключ не настроен."
 
-    # Получаем актуальные котировки рынка с текущим временем по МСК
     live_prices_context = await get_live_market_prices()
-    full_prompt = f"{live_prices_context}\n\nЗАПРОС ПОЛЬЗОВАТЕЛЯ:\n{prompt}"
+    full_prompt = f"{live_prices_context}\n\nВопрос пользователя: {prompt}\n\nДай конструктивный и аргументированный ответ по Alchemist MSNR:"
 
-    models_to_try = [GROQ_MODEL]
-
-    # Динамически получаем список реально доступных моделей аккаунта
-    try:
-        available_models_resp = await groq_client.models.list()
-        dynamic_models = [m.id for m in available_models_resp.data if getattr(m, 'active', True)]
-        for dm in dynamic_models:
-            if dm not in models_to_try:
-                models_to_try.append(dm)
-    except Exception as fetch_err:
-        logger.warning(f"[GROQ LIST] Не удалось автоматически получить список моделей: {fetch_err}")
-
-    # Запасной статический список
-    fallback_static = ["llama-3.3-70b-versatile", "llama3-70b-8192", "llama-3.1-8b-instant"]
-    for sm in fallback_static:
-        if sm not in models_to_try:
-            models_to_try.append(sm)
+    models_to_try = [GROQ_MODEL, "llama-3.3-70b-versatile", "llama3-70b-8192", "llama-3.1-8b-instant"]
 
     last_error = None
     for model_name in models_to_try:
@@ -164,16 +143,19 @@ async def query_groq_ai(prompt: str) -> str:
                     {"role": "system", "content": SYSTEM_INSTRUCTIONS},
                     {"role": "user", "content": full_prompt}
                 ],
-                temperature=0.5,
-                max_tokens=1800
+                temperature=0.3,
+                max_tokens=1500,
+                stop=["УРОСТАТЕЛЫ", "УРОСТАТЕ"]
             )
-            return completion.choices[0].message.content[:1900]
+            res_text = completion.choices[0].message.content.strip()
+            if res_text:
+                return res_text[:1900]
         except Exception as e:
             last_error = e
-            logger.warning(f"[GROQ RETRY] Модель {model_name} недоступна: {e}. Пробуем следующую...")
+            logger.warning(f"[GROQ RETRY] Модель {model_name} ошибка: {e}")
 
     logger.error(f"[GROQ ERROR] Все модели завершились ошибкой. Последняя: {last_error}")
-    return "❌ Ошибка генерации ответа ИИ. Все доступные модели Groq временно недоступны."
+    return "❌ Ошибка генерации ответа ИИ. Попробуйте сформулировать вопрос иначе."
 
 # ---------------------------------------------------------------------------
 # INITIALIZE DISCORD BOT
@@ -182,7 +164,6 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.guild_scheduled_events = True
 
-# Инициализируем бота без жестко привязанного коннектора на верхнем уровне
 bot = commands.Bot(
     command_prefix="!",
     intents=intents
@@ -587,7 +568,7 @@ async def cmd_ai(ctx, *, query: str):
 async def main():
     await start_web_server()
     
-    # Безопасно инициализируем коннектор внутри запущенного event loop
+    # Инициализация SOCKS5 прокси внутри event loop
     if PROXY_URL:
         connector = ProxyConnector.from_url(PROXY_URL)
         bot._connection.connector = connector
