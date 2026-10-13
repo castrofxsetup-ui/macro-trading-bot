@@ -68,7 +68,7 @@ PAIR_OVERTAKE_TIME = 0
 PAIR_OVERTAKE_COOLDOWN = 300  # 5 минут
 
 # ---------------------------------------------------------------------------
-# BOT CLASS WITH ASYNC PROXY HOOK
+# BOT CLASS WITH STABLE PROXY SETUP
 # ---------------------------------------------------------------------------
 class LegacyBot(commands.Bot):
     def __init__(self):
@@ -79,18 +79,19 @@ class LegacyBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        """Безопасная инициализация прокси-коннектора в запущенном event loop"""
+        """Интеграция прокси в HTTP-сессию бота на старте с обработкой сессий"""
         if PROXY_URL:
             try:
                 connector = ProxyConnector.from_url(PROXY_URL)
-                await self.http.close()
+                if self.http._session:
+                    await self.http._session.close()
                 self.http._session = aiohttp.ClientSession(
                     connector=connector,
                     headers=self.http._session.headers
                 )
-                logger.info("🔒 SOCKS5 прокси успешно интегрирован через ProxyConnector в setup_hook.")
+                logger.info("🔒 SOCKS5 прокси успешно зафиксирован в сессии бота через ProxyConnector.")
             except Exception as e:
-                logger.error(f"❌ Ошибка инициализации прокси-коннектора: {e}")
+                logger.error(f"❌ Ошибка настройки прокси-коннектора: {e}")
 
 bot = LegacyBot()
 
@@ -634,7 +635,7 @@ async def main():
     
     while True:
         try:
-            logger.info("⚡️ Инициализация подключения...")
+            logger.info("⚡️ Инициализация подключения с защищенным ProxyConnector...")
             await bot.start(DISCORD_TOKEN)
         except discord.errors.HTTPException as e:
             if e.status == 429 or "1015" in str(e):
