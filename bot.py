@@ -365,18 +365,16 @@ def create_bot(connector=None):
                 await ctx.send("❌ Роль с именем **Legacy** не найдена на сервере!")
                 return
 
-            subs = await db_load_subs()
+            # ВАЖНО (фикс "выдаёт 60 дней вместо 30"):
+            # Раньше, если у участника уже была активная подписка, бот ПРИБАВЛЯЛ
+            # новые дни к оставшемуся сроку (30 старых + 30 новых = 60), из-за
+            # чего команда "!sub 30" могла визуально "выдать 60 дней" и сбивать
+            # с толку — выбранный срок (30/90/360) переставал совпадать с тем,
+            # что реально записывалось и показывалось. Теперь "!sub <дней>"
+            # всегда означает ровно столько дней от текущего момента —
+            # без скрытого накопления поверх старой подписки.
             now = datetime.now(timezone.utc)
-            user_id_str = str(member.id)
-
-            if user_id_str in subs:
-                current_end = datetime.fromisoformat(subs[user_id_str]["expires_at"])
-                if current_end > now:
-                    new_end = current_end + timedelta(days=days)
-                else:
-                    new_end = now + timedelta(days=days)
-            else:
-                new_end = now + timedelta(days=days)
+            new_end = now + timedelta(days=days)
 
             await db_save_sub(member.id, new_end.isoformat(), days, False)
 
@@ -400,6 +398,66 @@ def create_bot(connector=None):
         except Exception as e:
             logger.error(f"[SUB COMMAND ERROR] {e}")
             await ctx.send("❌ Произошла ошибка при выдаче подписки.")
+
+    @new_bot.command(name="subreset", aliases=["сбросподписки", "сброс_подписки"])
+    @commands.has_permissions(administrator=True)
+    async def cmd_subreset(ctx, member: discord.Member, days: int):
+        """
+        Сброс срока подписки до ровно 30 / 90 / 360 дней от текущего момента.
+        Нужна, если человеку по ошибке выдали больше (например, 60 вместо 30).
+        Пример: !subreset @user 30
+        """
+        try:
+            if days not in [30, 90, 360]:
+                await ctx.send("❌ Доступные сроки подписки: **30**, **90** или **360** дней.")
+                return
+
+            role = discord.utils.get(ctx.guild.roles, name="Legacy")
+            if not role:
+                await ctx.send("❌ Роль с именем **Legacy** не найдена на сервере!")
+                return
+
+            subs = await db_load_subs()
+            old_data = subs.get(str(member.id))
+            if not old_data:
+                await ctx.send(f"❌ У {member.mention} нет записи о подписке — сбрасывать нечего. Для выдачи используйте `!sub @участник {days}`.")
+                return
+
+            old_end = datetime.fromisoformat(old_data["expires_at"])
+            old_str = old_end.astimezone(MSK_TZ).strftime("%d.%m.%Y в %H:%M")
+
+            now = datetime.now(timezone.utc)
+            new_end = now + timedelta(days=days)
+            new_str = new_end.astimezone(MSK_TZ).strftime("%d.%m.%Y в %H:%M")
+
+            # notified_1day сбрасываем: срок новый, напоминание за сутки должно прийти снова
+            await db_save_sub(member.id, new_end.isoformat(), days, False)
+
+            if role not in member.roles:
+                await member.add_roles(role)
+
+            embed = discord.Embed(
+                title="🔄 Срок подписки Legacy сброшен",
+                description=(
+                    f"Участник: {member.mention}\n"
+                    f"Было до: **{old_str} (МСК)**\n"
+                    f"Теперь: **{days} дней** — активна до **{new_str} (МСК)**"
+                ),
+                color=discord.Color.orange()
+            )
+            await ctx.send(embed=embed)
+
+            try:
+                await member.send(
+                    f"ℹ️ Срок вашей подписки **Legacy** на сервере **{ctx.guild.name}** скорректирован: "
+                    f"{days} дней, активна до {new_str} (МСК)."
+                )
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.error(f"[SUBRESET COMMAND ERROR] {e}")
+            await ctx.send("❌ Произошла ошибка при сбросе срока подписки.")
 
     @new_bot.command(name="subinfo", aliases=["mysub", "мояподписка"])
     async def cmd_subinfo(ctx):
@@ -631,6 +689,35 @@ async def get_target_channel(channel_id: int, client_bot=None):
 def get_flag(currency: str) -> str:
     return COUNTRY_FLAGS.get(str(currency).upper(), "🌐")
 
+async def http_get_with_fallback(url: str, timeout: int = 15, headers: dict = None):
+    """
+    GET-запрос для внешних источников (новости Forex Factory, YouTube).
+    Сначала пробуем НАПРЯМУЮ (без прокси): прокси понадобился боту из-за
+    блокировки Discord, а его провайдер может отказывать в соединении к
+    другим доменам (curl: (97) cannot complete SOCKS5 connection).
+    Если прямой запрос не удался — пробуем через прокси (если он задан).
+    Возвращает response; если оба способа провалились — бросает исключение.
+    """
+    kwargs = {"impersonate": "chrome120", "timeout": timeout}
+    if headers:
+        kwargs["headers"] = headers
+
+    direct_error = None
+    try:
+        r = await asyncio.to_thread(async_requests.get, url, **kwargs)
+        if r.status_code == 200:
+            return r
+        direct_error = f"HTTP {r.status_code}"
+    except Exception as e:
+        direct_error = f"{type(e).__name__}: {e}"
+
+    if not PROXY_URL:
+        raise RuntimeError(f"Прямой запрос к {url} не удался ({direct_error}), прокси не задан.")
+
+    logger.warning(f"[FETCH] Прямой запрос к {url} не удался ({direct_error}) — пробую через прокси.")
+    proxies = {"http": PROXY_URL, "https": PROXY_URL}
+    return await asyncio.to_thread(async_requests.get, url, proxies=proxies, **kwargs)
+
 def parse_ff_xml_feed(xml_content: str) -> list:
     events = []
     try:
@@ -677,18 +764,13 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
         {"url": "https://www.forexfactory.com/ffcalendar.xml", "type": "xml"}
     ]
 
-    proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
-
     for src in sources:
         url = src["url"]
         stype = src["type"]
         try:
-            r = await asyncio.to_thread(
-                async_requests.get,
+            r = await http_get_with_fallback(
                 url,
-                impersonate="chrome120",
                 timeout=15,
-                proxies=proxies,
                 headers={
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.8",
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -758,15 +840,7 @@ async def check_youtube_streams_loop():
             return
 
         rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={YOUTUBE_CHANNEL_ID}"
-        proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
-
-        r = await asyncio.to_thread(
-            async_requests.get,
-            rss_url,
-            impersonate="chrome120",
-            timeout=10,
-            proxies=proxies
-        )
+        r = await http_get_with_fallback(rss_url, timeout=10)
 
         if r.status_code == 200:
             root = ET.fromstring(r.text)
@@ -778,13 +852,7 @@ async def check_youtube_streams_loop():
                 link = f"https://www.youtube.com/watch?v={video_id}"
 
                 if video_id and video_id not in SENT_YOUTUBE_STREAMS:
-                    video_page = await asyncio.to_thread(
-                        async_requests.get,
-                        link,
-                        impersonate="chrome120",
-                        timeout=10,
-                        proxies=proxies
-                    )
+                    video_page = await http_get_with_fallback(link, timeout=10)
 
                     if video_page.status_code == 200 and ('"isLive":true' in video_page.text or '"style":"LIVE"' in video_page.text):
                         SENT_YOUTUBE_STREAMS.add(video_id)
