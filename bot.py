@@ -191,7 +191,42 @@ async def test_proxy_connector(connector) -> bool:
                     return False
     except Exception as e:
         logger.error(
-            f"🔎 Тест прокси ПРОВАЛЕН [{type(e).__name__}]: {e or '(пустое сообщение об ошибке)'}\n"
+            f"🔎 Тест прокси (aiohttp_socks, 'голый' Python TLS) ПРОВАЛЕН [{type(e).__name__}]: "
+            f"{e or '(пустое сообщение об ошибке)'}\n"
+            f"{traceback.format_exc()}"
+        )
+        return False
+
+async def test_proxy_curl_cffi() -> bool:
+    """
+    Тот же самый прокси, но через curl_cffi с impersonate='chrome120' —
+    то есть с TLS-отпечатком (JA3) настоящего Chrome, а не 'голого' Python.
+    Если ЭТОТ тест проходит, а test_proxy_connector() выше — нет, значит
+    проблема не в прокси как таковом, а в том, что Discord/Cloudflare
+    режет хендшейк именно по TLS-отпечатку стандартного aiohttp/ssl.
+    Если падают оба — дело в самом прокси (или его политике по Discord).
+    """
+    if not PROXY_URL:
+        return False
+    try:
+        proxies = {"http": PROXY_URL, "https": PROXY_URL}
+        r = await asyncio.to_thread(
+            async_requests.get,
+            "https://discord.com/api/v10/gateway",
+            impersonate="chrome120",
+            timeout=12,
+            proxies=proxies,
+        )
+        if r.status_code == 200:
+            logger.info(f"🔎 Тест прокси (curl_cffi, TLS-отпечаток Chrome) ОК: статус {r.status_code}.")
+            return True
+        else:
+            logger.error(f"🔎 Тест прокси (curl_cffi, TLS-отпечаток Chrome): статус {r.status_code}, тело: {r.text[:200]!r}")
+            return False
+    except Exception as e:
+        logger.error(
+            f"🔎 Тест прокси (curl_cffi, TLS-отпечаток Chrome) ПРОВАЛЕН [{type(e).__name__}]: "
+            f"{e or '(пустое сообщение об ошибке)'}\n"
             f"{traceback.format_exc()}"
         )
         return False
@@ -1013,11 +1048,26 @@ async def main():
                 connector = ProxyConnector.from_url(PROXY_URL)
                 logger.info("🛡️ SOCKS5 прокси-коннектор создан — проверяю его перед подключением к Discord...")
                 proxy_ok = await test_proxy_connector(connector)
-                if not proxy_ok:
+                curl_ok = await test_proxy_curl_cffi()
+
+                if proxy_ok:
+                    logger.info("✅ Прокси + 'голый' Python TLS (aiohttp) — РАБОТАЕТ. Discord.py должен подключиться.")
+                elif curl_ok and not proxy_ok:
                     logger.error(
-                        "❌ Прокси НЕ смог достучаться до discord.com. Проверь PROXY_URL "
-                        "(формат socks5://user:pass@host:port), доступность и лимиты прокси-провайдера. "
-                        "Всё равно пробую подключиться с этим коннектором — но, скорее всего, снова упадёт."
+                        "🧩 ДИАГНОЗ: прокси сам по себе рабочий (curl_cffi с TLS-отпечатком Chrome прошёл), "
+                        "но 'голый' Python TLS (aiohttp/discord.py) через него режется — это похоже на блокировку "
+                        "по TLS-отпечатку (JA3) на стороне Discord/Cloudflare или на DPI-фильтр прокси-провайдера. "
+                        "discord.py жёстко завязан на aiohttp и не умеет подделывать TLS-отпечаток браузера — "
+                        "обойти это в коде discord.py нельзя. Нужен прокси/провайдер, который либо не триггерит "
+                        "такую блокировку, либо явно заявляет поддержку Discord-бот трафика."
+                    )
+                elif not curl_ok and not proxy_ok:
+                    logger.error(
+                        "🧩 ДИАГНОЗ: оба теста (и aiohttp, и curl_cffi с Chrome TLS) через этот прокси к discord.com "
+                        "провалились. Значит прокси/его провайдер режет соединения к Discord целиком, вне "
+                        "зависимости от клиента. Нужно уточнить у провайдера прокси, разрешён ли трафик к "
+                        "discord.com (многие прокси-сервисы блокируют Discord отдельной политикой даже на платных "
+                        "тарифах), либо взять другой прокси/IP."
                     )
             except Exception as e:
                 logger.error(
