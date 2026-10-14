@@ -4,6 +4,7 @@ import asyncio
 import logging
 import time
 import json
+import traceback
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
 
@@ -169,6 +170,33 @@ async def db_delete_sub(user_id: int):
             logger.error(f"[DB SUB DELETE ERROR] {e}")
 
 # ---------------------------------------------------------------------------
+# PROXY DIAGNOSTIC TEST (чтобы отличить "прокси не работает" от "discord.py
+# не может подружиться с этим коннектором")
+# ---------------------------------------------------------------------------
+async def test_proxy_connector(connector) -> bool:
+    if connector is None:
+        return False
+    try:
+        timeout = aiohttp.ClientTimeout(total=12)
+        # connector_owner=False — ВАЖНО: иначе aiohttp закроет коннектор
+        # вместе с этой тестовой сессией, и discord.py получит уже мёртвый коннектор.
+        async with aiohttp.ClientSession(connector=connector, connector_owner=False, timeout=timeout) as session:
+            async with session.get("https://discord.com/api/v10/gateway") as resp:
+                body = (await resp.text())[:200]
+                if resp.status == 200:
+                    logger.info(f"🔎 Тест прокси ОК: discord.com ответил {resp.status} через прокси.")
+                    return True
+                else:
+                    logger.error(f"🔎 Тест прокси: discord.com ответил статусом {resp.status}, тело: {body!r}")
+                    return False
+    except Exception as e:
+        logger.error(
+            f"🔎 Тест прокси ПРОВАЛЕН [{type(e).__name__}]: {e or '(пустое сообщение об ошибке)'}\n"
+            f"{traceback.format_exc()}"
+        )
+        return False
+
+# ---------------------------------------------------------------------------
 # FACTORY FUNCTION TO CREATE BOT INSTANCE
 # ---------------------------------------------------------------------------
 #
@@ -186,20 +214,11 @@ async def db_delete_sub(user_id: int):
 # конструктор commands.Bot(..., connector=connector). Он применяется
 # и к обычным REST-запросам, и к Gateway WebSocket-соединению.
 # ---------------------------------------------------------------------------
-def create_bot():
+def create_bot(connector=None):
     intents = discord.Intents.default()
     intents.message_content = True
     intents.guild_scheduled_events = True
     intents.members = True
-
-    connector = None
-    if PROXY_URL:
-        try:
-            connector = ProxyConnector.from_url(PROXY_URL)
-            logger.info("🛡️ SOCKS5 прокси-коннектор создан и будет передан напрямую в discord.py (REST + Gateway).")
-        except Exception as e:
-            logger.error(f"❌ Ошибка инициализации прокси-коннектора: {e}. Бот запустится БЕЗ прокси.")
-            connector = None
 
     new_bot = commands.Bot(
         command_prefix="!",
@@ -988,8 +1007,29 @@ async def main():
     await init_db()
 
     while True:
+        connector = None
+        if PROXY_URL:
+            try:
+                connector = ProxyConnector.from_url(PROXY_URL)
+                logger.info("🛡️ SOCKS5 прокси-коннектор создан — проверяю его перед подключением к Discord...")
+                proxy_ok = await test_proxy_connector(connector)
+                if not proxy_ok:
+                    logger.error(
+                        "❌ Прокси НЕ смог достучаться до discord.com. Проверь PROXY_URL "
+                        "(формат socks5://user:pass@host:port), доступность и лимиты прокси-провайдера. "
+                        "Всё равно пробую подключиться с этим коннектором — но, скорее всего, снова упадёт."
+                    )
+            except Exception as e:
+                logger.error(
+                    f"❌ Ошибка инициализации прокси-коннектора [{type(e).__name__}]: {e or '(пусто)'}\n"
+                    f"{traceback.format_exc()}\nБот попробует запуститься БЕЗ прокси."
+                )
+                connector = None
+        else:
+            logger.warning("⚠️ PROXY_URL не задан — подключаюсь напрямую, без прокси.")
+
         try:
-            bot = create_bot()
+            bot = create_bot(connector)
             logger.info("⚡️ Инициализация подключения к Discord API...")
             await bot.start(DISCORD_TOKEN)
         except discord.PrivilegedIntentsRequired as e:
@@ -1000,7 +1040,11 @@ async def main():
             )
             await asyncio.sleep(30)
         except Exception as e:
-            logger.error(f"❌ Ошибка соединения: {e}. Переподключение через 15 секунд...")
+            logger.error(
+                f"❌ Ошибка соединения [{type(e).__name__}]: {e or '(пустое сообщение об ошибке — см. traceback ниже)'}\n"
+                f"{traceback.format_exc()}\n"
+                f"Переподключение через 15 секунд..."
+            )
             try:
                 if bot:
                     await bot.close()
