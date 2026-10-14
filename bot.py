@@ -162,7 +162,7 @@ async def db_delete_sub(user_id: int):
             logger.error(f"[DB SUB DELETE ERROR] {e}")
 
 # ---------------------------------------------------------------------------
-# FACTORY FUNCTION TO CREATE BOT INSTANCE (С обходом через прокси)
+# FACTORY FUNCTION TO CREATE BOT INSTANCE
 # ---------------------------------------------------------------------------
 def create_bot():
     intents = discord.Intents.default()
@@ -170,9 +170,7 @@ def create_bot():
     intents.guild_scheduled_events = True
     intents.members = True
     
-    # Подключаемся к Discord через прокси для защиты от банов IP Render
-    proxy_val = PROXY_URL if PROXY_URL else None
-    new_bot = commands.Bot(command_prefix="!", intents=intents, proxy=proxy_val)
+    new_bot = commands.Bot(command_prefix="!", intents=intents)
 
     @new_bot.event
     async def on_ready():
@@ -957,7 +955,7 @@ async def main():
     while True:
         try:
             bot = create_bot()
-            logger.info("⚡️ Инициализация подключения к Discord API через прокси...")
+            logger.info("⚡️ Инициализация подключения к Discord API...")
             await bot.start(DISCORD_TOKEN)
         except Exception as e:
             logger.error(f"❌ Ошибка соединения: {e}. Переподключение через 10 секунд...")
