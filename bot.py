@@ -162,7 +162,7 @@ async def db_delete_sub(user_id: int):
             logger.error(f"[DB SUB DELETE ERROR] {e}")
 
 # ---------------------------------------------------------------------------
-# FACTORY FUNCTION TO CREATE BOT INSTANCE
+# FACTORY FUNCTION TO CREATE BOT INSTANCE (С обходом через прокси)
 # ---------------------------------------------------------------------------
 def create_bot():
     intents = discord.Intents.default()
@@ -170,7 +170,9 @@ def create_bot():
     intents.guild_scheduled_events = True
     intents.members = True
     
-    new_bot = commands.Bot(command_prefix="!", intents=intents)
+    # Подключаемся к Discord через прокси для защиты от банов IP Render
+    proxy_val = PROXY_URL if PROXY_URL else None
+    new_bot = commands.Bot(command_prefix="!", intents=intents, proxy=proxy_val)
 
     @new_bot.event
     async def on_ready():
@@ -949,40 +951,22 @@ async def scheduled_news_digests():
 # ---------------------------------------------------------------------------
 async def main():
     global bot
-    # Сначала запускаем веб-сервер и подключаемся к базе данных
     await start_web_server()
     await init_db()
     
     while True:
         try:
             bot = create_bot()
-            logger.info("⚡️ Инициализация подключения к Discord API...")
+            logger.info("⚡️ Инициализация подключения к Discord API через прокси...")
             await bot.start(DISCORD_TOKEN)
-        except discord.errors.HTTPException as e:
-            if e.status in (429, 1015) or "1015" in str(e):
-                logger.warning("⚠️ Временная блокировка IP / Cloudflare (HTTP 429/1015). Ожидание 5 минут для сброса...")
-                try:
-                    if bot:
-                        await bot.close()
-                except Exception:
-                    pass
-                await asyncio.sleep(300)
-            else:
-                logger.error(f"❌ Ошибка Discord HTTP ({e.status}): {e}")
-                try:
-                    if bot:
-                        await bot.close()
-                except Exception:
-                    pass
-                await asyncio.sleep(30)
         except Exception as e:
-            logger.error(f"❌ Сбой сети. Переподключение через 30 секунд...")
+            logger.error(f"❌ Ошибка соединения: {e}. Переподключение через 10 секунд...")
             try:
                 if bot:
                     await bot.close()
             except Exception:
                 pass
-            await asyncio.sleep(30)
+            await asyncio.sleep(10)
 
 if __name__ == "__main__":
     try:
