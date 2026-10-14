@@ -58,6 +58,12 @@ if not DISCORD_TOKEN:
     logger.critical("❌ Ошибка: Переменная окружения DISCORD_TOKEN не найдена!")
     sys.exit(1)
 
+if not PROXY_URL:
+    logger.warning(
+        "⚠️ PROXY_URL не указан. Если хостинг работает из дата-центра (Render/AWS/GCP), "
+        "Discord/Cloudflare может блокировать прямые подключения challenge-страницей."
+    )
+
 NEWS_CACHE = {"data": [], "last_fetch": 0}
 SENT_NEWS_ALERTS = set()
 SENT_DISCORD_EVENTS = set()
@@ -88,7 +94,7 @@ async def init_db():
     try:
         url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
         db_pool = await asyncpg.create_pool(dsn=url)
-        
+
         async with db_pool.acquire() as conn:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS user_xp (
@@ -102,10 +108,10 @@ async def init_db():
                     notified_1day BOOLEAN NOT NULL DEFAULT FALSE
                 );
             """)
-            
+
             rows = await conn.fetch("SELECT user_id, xp FROM user_xp;")
             USER_XP = {row["user_id"]: row["xp"] for row in rows}
-            
+
         logger.info("✅ Успешное подключение к PostgreSQL БД и загрузка данных!")
     except Exception as e:
         logger.error(f"❌ Ошибка подключения к базе данных: {e}")
@@ -163,30 +169,43 @@ async def db_delete_sub(user_id: int):
             logger.error(f"[DB SUB DELETE ERROR] {e}")
 
 # ---------------------------------------------------------------------------
-# FACTORY FUNCTION TO CREATE BOT INSTANCE (С правильным ProxyConnector)
+# FACTORY FUNCTION TO CREATE BOT INSTANCE
+# ---------------------------------------------------------------------------
+#
+# ВАЖНО (фикс нестабильного подключения):
+# Раньше здесь был класс ProxyClient с методом __http_client_factory__,
+# который ДОЛЖЕН был подменять aiohttp-сессию бота на сессию с прокси.
+# Проблема: discord.py не вызывает такой метод — это не часть его API,
+# метод никогда не вызывался, и бот реально всегда стучался в Discord
+# напрямую, без прокси. Из-за этого Cloudflare видел IP дата-центра
+# (Render) и отдавал challenge-страницу вместо ответа API — это и были
+# бесконечные "Ошибка соединения... Переподключение через 15 секунд".
+#
+# Правильный и официально поддерживаемый discord.py способ — передать
+# aiohttp-коннектор (в т.ч. SOCKS5 через aiohttp_socks) напрямую в
+# конструктор commands.Bot(..., connector=connector). Он применяется
+# и к обычным REST-запросам, и к Gateway WebSocket-соединению.
 # ---------------------------------------------------------------------------
 def create_bot():
     intents = discord.Intents.default()
     intents.message_content = True
     intents.guild_scheduled_events = True
     intents.members = True
-    
+
     connector = None
     if PROXY_URL:
         try:
             connector = ProxyConnector.from_url(PROXY_URL)
-            logger.info("🛡️ SOCKS5 прокси успешно подключен для трафика Discord API.")
+            logger.info("🛡️ SOCKS5 прокси-коннектор создан и будет передан напрямую в discord.py (REST + Gateway).")
         except Exception as e:
-            logger.error(f"❌ Ошибка инициализации прокси-коннектора: {e}")
+            logger.error(f"❌ Ошибка инициализации прокси-коннектора: {e}. Бот запустится БЕЗ прокси.")
+            connector = None
 
-    class ProxyClient(commands.Bot):
-        async def __http_client_factory__(self, *args, **kwargs):
-            if connector:
-                kwargs["connector"] = connector
-                kwargs["connector_owner"] = False
-            return aiohttp.ClientSession(*args, **kwargs)
-
-    new_bot = ProxyClient(command_prefix="!", intents=intents)
+    new_bot = commands.Bot(
+        command_prefix="!",
+        intents=intents,
+        connector=connector,
+    )
 
     @new_bot.event
     async def on_ready():
@@ -236,7 +255,7 @@ def create_bot():
                     overtaker_id = author_id
                     if overtaker_id in current_top_three:
                         new_pos = current_top_three.index(overtaker_id) + 1
-                        
+
                         overtaken_id = None
                         if overtaker_id in LAST_TOP_THREE:
                             old_pos = LAST_TOP_THREE.index(overtaker_id)
@@ -267,9 +286,9 @@ def create_bot():
                                     color=discord.Color.gold()
                                 )
                                 embed.set_footer(text="Рейтинг рассчитывается по сообщениям на сервере")
-                                
+
                                 await message.channel.send(embed=embed)
-                                
+
                                 LAST_OVERTAKE_TIME = now
                                 LAST_OVERTAKE_PAIR = current_pair
                                 PAIR_OVERTAKE_TIME = now
@@ -311,14 +330,14 @@ def create_bot():
                 await member.add_roles(role)
 
             expires_str = new_end.astimezone(MSK_TZ).strftime("%d.%m.%Y в %H:%M")
-            
+
             embed = discord.Embed(
                 title="✅ Подписка Legacy оформлена!",
                 description=f"Участнику {member.mention} выдана подписка на **{days} дней**.\n⏳ Активна до: **{expires_str} (МСК)**",
                 color=discord.Color.green()
             )
             await ctx.send(embed=embed)
-            
+
             try:
                 await member.send(f"🎉 Вам на сервере **{ctx.guild.name}** оформлена/продлена подписка **Legacy** на {days} дней! Она активна до {expires_str} (МСК).")
             except Exception:
@@ -381,14 +400,14 @@ def create_bot():
                 expires_at = datetime.fromisoformat(data["expires_at"])
                 if expires_at <= now:
                     continue
-                
+
                 user = ctx.guild.get_member(int(user_id_str))
                 name = user.mention if user else f"ID: {user_id_str}"
                 expires_str = expires_at.astimezone(MSK_TZ).strftime("%d.%m.%Y в %H:%M")
-                
+
                 remaining = expires_at - now
                 days_left = remaining.days
-                
+
                 lines.append(f"👤 {name} — активна до **{expires_str} МСК** (осталось {days_left} дн.)")
 
             if not lines:
@@ -512,7 +531,7 @@ def create_bot():
 
                 embed.description = "\n".join(lines) if len(lines) > 1 else "На сегодня важных новостей больше нет."
                 await thread.send(embed=embed)
-                
+
                 if ctx.channel.id != TARGET_NEWS_THREAD_ID:
                     await ctx.send(f"✅ Новости опубликованы в ветку <#{TARGET_NEWS_THREAD_ID}>")
         except Exception as e:
@@ -611,9 +630,9 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
         stype = src["type"]
         try:
             r = await asyncio.to_thread(
-                async_requests.get, 
-                url, 
-                impersonate="chrome120", 
+                async_requests.get,
+                url,
+                impersonate="chrome120",
                 timeout=15,
                 proxies=proxies,
                 headers={
@@ -621,7 +640,7 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
                 }
             )
-            
+
             if r.status_code == 200:
                 if "<html" in r.text.lower() or "<!doctype html" in r.text.lower():
                     continue
@@ -637,7 +656,7 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
                                 impact_level = "HIGH"
                             elif "MEDIUM" in imp or "ORANGE" in imp:
                                 impact_level = "MEDIUM"
-                            
+
                             if not impact_level:
                                 continue
 
@@ -686,7 +705,7 @@ async def check_youtube_streams_loop():
 
         rss_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={YOUTUBE_CHANNEL_ID}"
         proxies = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
-        
+
         r = await asyncio.to_thread(
             async_requests.get,
             rss_url,
@@ -698,7 +717,7 @@ async def check_youtube_streams_loop():
         if r.status_code == 200:
             root = ET.fromstring(r.text)
             ns = {"atom": "http://www.w3.org/2005/Atom", "yt": "http://www.youtube.com/xml/schemas/2015"}
-            
+
             for entry in root.findall("atom:entry", ns):
                 video_id = entry.findtext("yt:videoId", namespaces=ns)
                 title = entry.findtext("atom:title", namespaces=ns)
@@ -712,17 +731,17 @@ async def check_youtube_streams_loop():
                         timeout=10,
                         proxies=proxies
                     )
-                    
+
                     if video_page.status_code == 200 and ('"isLive":true' in video_page.text or '"style":"LIVE"' in video_page.text):
                         SENT_YOUTUBE_STREAMS.add(video_id)
-                        
+
                         embed = discord.Embed(
                             title="🔴 На YouTube начался прямой эфир!",
                             description=f"**[{title}]({link})**\n\nПрисоединяйтесь к трансляции!",
                             color=discord.Color.red()
                         )
                         embed.set_thumbnail(url=f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg")
-                        
+
                         await channel.send(content="@everyone", embed=embed)
                         break
     except Exception as e:
@@ -767,7 +786,7 @@ async def check_subscriptions_daily_loop():
                 role = discord.utils.get(guild.roles, name="Legacy")
                 if not role:
                     continue
-                
+
                 for user_id in to_remove:
                     member = guild.get_member(user_id)
                     if member and role in member.roles:
@@ -779,7 +798,7 @@ async def check_subscriptions_daily_loop():
                                 pass
                         except Exception as e:
                             logger.error(f"[SUB REMOVE ERROR] {e}")
-                    
+
                     await db_delete_sub(user_id)
     except Exception as e:
         logger.error(f"[SUBS LOOP ERROR] {e}")
@@ -800,7 +819,7 @@ async def check_30min_news_alerts():
 
         is_night_time = (0 <= now_msk.hour < 8)
         upcoming_events = []
-        
+
         for ev in news:
             if ev.get("impact") != "HIGH" or not ev.get("dt_utc"):
                 continue
@@ -852,7 +871,7 @@ async def check_discord_events_alerts():
                 for event in events:
                     if not event.start_time:
                         continue
-                    
+
                     time_diff = (event.start_time - now_utc).total_seconds() / 60.0
                     event_id = f"{event.id}_{event.start_time.isoformat()}"
 
@@ -904,7 +923,7 @@ async def scheduled_news_digests():
                     first_ev_msk = grouped[day_date][0][1]
                     day_name = DAYS_RU[first_ev_msk.weekday()]
                     month_name = MONTHS_RU[first_ev_msk.month]
-                    
+
                     lines.append(f"\n**📅 {day_name}, {first_ev_msk.day}, {month_name}**")
 
                     for ev, ev_msk in grouped[day_date]:
@@ -967,12 +986,19 @@ async def main():
     global bot
     await start_web_server()
     await init_db()
-    
+
     while True:
         try:
             bot = create_bot()
-            logger.info("⚡️ Инициализация подключения к Discord API через прокси-коннектор...")
+            logger.info("⚡️ Инициализация подключения к Discord API...")
             await bot.start(DISCORD_TOKEN)
+        except discord.PrivilegedIntentsRequired as e:
+            logger.critical(
+                f"❌ Не включены привилегированные Intents в Discord Developer Portal: {e}\n"
+                f"Зайди в https://discord.com/developers/applications -> твой бот -> Bot -> "
+                f"включи 'SERVER MEMBERS INTENT' и 'MESSAGE CONTENT INTENT'."
+            )
+            await asyncio.sleep(30)
         except Exception as e:
             logger.error(f"❌ Ошибка соединения: {e}. Переподключение через 15 секунд...")
             try:
