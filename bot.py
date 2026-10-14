@@ -27,7 +27,7 @@ logger = logging.getLogger("LegacyBot")
 # CONFIGURATION & ENVIRONMENT VARIABLES
 # ---------------------------------------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-PROXY_URL = os.getenv("PROXY_URL")
+PROXY_URL = os.getenv("PROXY_URL")  # Прокси используется ТОЛЬКО для парсинга новостей
 DATABASE_URL = os.getenv("DATABASE_URL")
 PORT = int(os.getenv("PORT", 10000))
 
@@ -162,7 +162,7 @@ async def db_delete_sub(user_id: int):
             logger.error(f"[DB SUB DELETE ERROR] {e}")
 
 # ---------------------------------------------------------------------------
-# FACTORY FUNCTION TO CREATE BOT INSTANCE (Прямое стабильное подключение)
+# FACTORY FUNCTION TO CREATE BOT INSTANCE (Прямое подключение к Discord)
 # ---------------------------------------------------------------------------
 def create_bot():
     intents = discord.Intents.default()
@@ -170,7 +170,7 @@ def create_bot():
     intents.guild_scheduled_events = True
     intents.members = True
     
-    # Подключаемся напрямую без прокси для стабильности шлюза Discord
+    # Бот подключается к Discord напрямую (без прокси)
     new_bot = commands.Bot(command_prefix="!", intents=intents)
 
     @new_bot.event
@@ -956,16 +956,17 @@ async def main():
     while True:
         try:
             bot = create_bot()
-            logger.info("⚡️ Инициализация подключения к Discord API...")
+            logger.info("⚡️ Инициализация подключения к Discord API (прямое подключение)...")
             await bot.start(DISCORD_TOKEN)
         except Exception as e:
-            logger.error(f"❌ Ошибка соединения: {e}. Переподключение через 10 секунд...")
+            logger.error(f"❌ Ошибка соединения: {e}. Ожидание 30 секунд перед повторным подключением...")
             try:
                 if bot:
                     await bot.close()
             except Exception:
                 pass
-            await asyncio.sleep(10)
+            # Увеличен задержка, чтобы Cloudflare Rate Limit успел сброситься
+            await asyncio.sleep(30)
 
 if __name__ == "__main__":
     try:
