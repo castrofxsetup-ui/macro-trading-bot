@@ -13,6 +13,7 @@ import discord
 from discord.ext import commands, tasks
 from curl_cffi import requests as async_requests
 import asyncpg
+from aiohttp_socks import ProxyConnector
 
 # ---------------------------------------------------------------------------
 # LOGGING SETUP
@@ -27,7 +28,7 @@ logger = logging.getLogger("LegacyBot")
 # CONFIGURATION & ENVIRONMENT VARIABLES
 # ---------------------------------------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-PROXY_URL = os.getenv("PROXY_URL")  # Прокси используется ТОЛЬКО для парсинга новостей
+PROXY_URL = os.getenv("PROXY_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
 PORT = int(os.getenv("PORT", 10000))
 
@@ -162,7 +163,7 @@ async def db_delete_sub(user_id: int):
             logger.error(f"[DB SUB DELETE ERROR] {e}")
 
 # ---------------------------------------------------------------------------
-# FACTORY FUNCTION TO CREATE BOT INSTANCE (Прямое подключение к Discord)
+# FACTORY FUNCTION TO CREATE BOT INSTANCE (С правильным ProxyConnector)
 # ---------------------------------------------------------------------------
 def create_bot():
     intents = discord.Intents.default()
@@ -170,8 +171,22 @@ def create_bot():
     intents.guild_scheduled_events = True
     intents.members = True
     
-    # Бот подключается к Discord напрямую (без прокси)
-    new_bot = commands.Bot(command_prefix="!", intents=intents)
+    connector = None
+    if PROXY_URL:
+        try:
+            connector = ProxyConnector.from_url(PROXY_URL)
+            logger.info("🛡️ SOCKS5 прокси успешно подключен для трафика Discord API.")
+        except Exception as e:
+            logger.error(f"❌ Ошибка инициализации прокси-коннектора: {e}")
+
+    class ProxyClient(commands.Bot):
+        async def __http_client_factory__(self, *args, **kwargs):
+            if connector:
+                kwargs["connector"] = connector
+                kwargs["connector_owner"] = False
+            return aiohttp.ClientSession(*args, **kwargs)
+
+    new_bot = ProxyClient(command_prefix="!", intents=intents)
 
     @new_bot.event
     async def on_ready():
@@ -956,17 +971,16 @@ async def main():
     while True:
         try:
             bot = create_bot()
-            logger.info("⚡️ Инициализация подключения к Discord API (прямое подключение)...")
+            logger.info("⚡️ Инициализация подключения к Discord API через прокси-коннектор...")
             await bot.start(DISCORD_TOKEN)
         except Exception as e:
-            logger.error(f"❌ Ошибка соединения: {e}. Ожидание 30 секунд перед повторным подключением...")
+            logger.error(f"❌ Ошибка соединения: {e}. Переподключение через 15 секунд...")
             try:
                 if bot:
                     await bot.close()
             except Exception:
                 pass
-            # Увеличен задержка, чтобы Cloudflare Rate Limit успел сброситься
-            await asyncio.sleep(30)
+            await asyncio.sleep(15)
 
 if __name__ == "__main__":
     try:
