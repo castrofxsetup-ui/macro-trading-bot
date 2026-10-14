@@ -28,7 +28,7 @@ logger = logging.getLogger("LegacyBot")
 # ---------------------------------------------------------------------------
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 PROXY_URL = os.getenv("PROXY_URL")
-DATABASE_URL = os.getenv("DATABASE_URL")  # PostgreSQL URL от Render
+DATABASE_URL = os.getenv("DATABASE_URL")
 PORT = int(os.getenv("PORT", 10000))
 
 TARGET_NEWS_THREAD_ID = 1528319066513604688
@@ -76,7 +76,7 @@ db_pool = None
 USER_XP = {}
 
 # ---------------------------------------------------------------------------
-# POSTGRESQL DATABASE HELPERS (PERSISTENT CLOUD STORAGE)
+# POSTGRESQL DATABASE HELPERS
 # ---------------------------------------------------------------------------
 async def init_db():
     global db_pool, USER_XP
@@ -85,7 +85,6 @@ async def init_db():
         return
 
     try:
-        # Корректировка протокола для asyncpg
         url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
         db_pool = await asyncpg.create_pool(dsn=url)
         
@@ -103,11 +102,10 @@ async def init_db():
                 );
             """)
             
-            # Загрузка XP в память для быстрой работы
             rows = await conn.fetch("SELECT user_id, xp FROM user_xp;")
             USER_XP = {row["user_id"]: row["xp"] for row in rows}
             
-        logger.info("✅ Успешное подключение к PostgreSQL БД!")
+        logger.info("✅ Успешное подключение к PostgreSQL БД и загрузка данных!")
     except Exception as e:
         logger.error(f"❌ Ошибка подключения к базе данных: {e}")
 
@@ -177,7 +175,6 @@ def create_bot():
     @new_bot.event
     async def on_ready():
         logger.info(f"✅ Успешный вход: {new_bot.user} (ID: {new_bot.user.id})")
-        await init_db()
         try:
             await fetch_economic_news(force_refresh=True)
 
@@ -352,7 +349,7 @@ def create_bot():
         except Exception as e:
             logger.error(f"[SUBINFO ERROR] {e}")
 
-    @new_bot.command(name="subslist", aliases=["списокподписок"])
+    @new_bot.command(name="subslist", aliases=["списокподписок", "список_подписок"])
     @commands.has_permissions(administrator=True)
     async def cmd_subslist(ctx):
         try:
@@ -952,7 +949,9 @@ async def scheduled_news_digests():
 # ---------------------------------------------------------------------------
 async def main():
     global bot
+    # Сначала запускаем веб-сервер и подключаемся к базе данных
     await start_web_server()
+    await init_db()
     
     while True:
         try:
