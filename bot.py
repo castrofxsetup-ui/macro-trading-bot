@@ -65,7 +65,10 @@ if not PROXY_URL:
         "Discord/Cloudflare может блокировать прямые подключения challenge-страницей."
     )
 
-NEWS_CACHE = {"data": [], "last_fetch": 0}
+NEWS_CACHE = {"data": [], "last_fetch": 0, "last_attempt": 0}
+# После неудачной загрузки новостей не долбим источники каждую минуту
+# (цикл алертов вызывает fetch раз в минуту) — иначе faireconomy отвечает 429.
+NEWS_FAIL_COOLDOWN_SECONDS = 600
 SENT_NEWS_ALERTS = set()
 SENT_DISCORD_EVENTS = set()
 SENT_YOUTUBE_STREAMS = set()
@@ -759,6 +762,14 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
     if not force_refresh and NEWS_CACHE["data"] and (now - NEWS_CACHE["last_fetch"] < CACHE_TTL_SECONDS):
         return NEWS_CACHE["data"]
 
+    # Если прошлая попытка была неудачной (last_attempt новее last_fetch) —
+    # ждём паузу, чтобы не получать 429/403 из-за слишком частых запросов.
+    last_attempt_failed = NEWS_CACHE["last_attempt"] > NEWS_CACHE["last_fetch"]
+    cooldown = 60 if force_refresh else NEWS_FAIL_COOLDOWN_SECONDS
+    if last_attempt_failed and (now - NEWS_CACHE["last_attempt"] < cooldown):
+        return NEWS_CACHE["data"]
+    NEWS_CACHE["last_attempt"] = now
+
     sources = [
         {"url": "https://nfs.faireconomy.media/ff_calendar_thisweek.json", "type": "json"},
         {"url": "https://www.forexfactory.com/ffcalendar.xml", "type": "xml"}
@@ -822,6 +833,10 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
         except Exception as e:
             logger.error(f"[NEWS API ERROR] {e}")
 
+    logger.warning(
+        f"⚠️ Все источники новостей недоступны. Следующая попытка не раньше чем через "
+        f"{NEWS_FAIL_COOLDOWN_SECONDS // 60} мин."
+    )
     return NEWS_CACHE["data"]
 
 # ---------------------------------------------------------------------------
