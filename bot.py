@@ -1053,6 +1053,25 @@ async def main():
             await asyncio.sleep(15)
 
 if __name__ == "__main__":
+    # ВАЖНО (фикс "ConnectionResetError" при TLS-рукопожатии через прокси):
+    # Render запускает бота на Python 3.11.0 — в ранних сборках 3.11 есть
+    # известный баг в asyncio.start_tls() (спонтанный ConnectionResetError
+    # при оборачивании TLS поверх уже открытого сокета — а именно так
+    # python_socks поднимает HTTPS поверх уже установленного SOCKS5-туннеля).
+    # uvloop использует собственный SSL-транспорт и этот баг не затрагивает.
+    # Если пакет не установлен — просто продолжаем на стандартном event loop
+    # (сработает обычный asyncio.run), но тогда баг с прокси, скорее всего,
+    # вернётся — тогда нужно добавить "uvloop" в requirements.txt.
+    try:
+        import uvloop
+        uvloop.install()
+        logger.info("⚡ uvloop включен как event loop (обходит баг asyncio.start_tls() в Python 3.11 при TLS через прокси).")
+    except ImportError:
+        logger.warning(
+            "⚠️ uvloop не установлен — добавь 'uvloop' в requirements.txt. "
+            "Без него возможен ConnectionResetError при TLS-рукопожатии через прокси (баг Python 3.11.0)."
+        )
+
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
