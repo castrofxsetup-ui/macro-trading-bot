@@ -111,6 +111,11 @@ async def init_db():
                     days_total INT NOT NULL,
                     notified_1day BOOLEAN NOT NULL DEFAULT FALSE
                 );
+                CREATE TABLE IF NOT EXISTS news_cache (
+                    id INT PRIMARY KEY,
+                    fetched_at DOUBLE PRECISION NOT NULL,
+                    data TEXT NOT NULL
+                );
             """)
 
             rows = await conn.fetch("SELECT user_id, xp FROM user_xp;")
@@ -119,6 +124,52 @@ async def init_db():
         logger.info("✅ Успешное подключение к PostgreSQL БД и загрузка данных!")
     except Exception as e:
         logger.error(f"❌ Ошибка подключения к базе данных: {e}")
+        return
+
+    await db_load_news_cache()
+
+# --- Кэш новостей в БД: переживает перезапуски/деплои, чтобы бот не долбил
+# --- источники (faireconomy отвечает 429 при частых запросах с одного IP).
+def _news_to_json(events: list) -> str:
+    return json.dumps([
+        {**ev, "dt_utc": ev["dt_utc"].isoformat() if ev.get("dt_utc") else None}
+        for ev in events
+    ])
+
+def _news_from_json(text: str) -> list:
+    events = []
+    for ev in json.loads(text):
+        raw = ev.get("dt_utc")
+        ev["dt_utc"] = datetime.fromisoformat(raw) if raw else None
+        events.append(ev)
+    return events
+
+async def db_save_news_cache(events: list, fetched_at: float):
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO news_cache (id, fetched_at, data) VALUES (1, $1, $2)
+                ON CONFLICT (id) DO UPDATE SET fetched_at = $1, data = $2;
+            """, fetched_at, _news_to_json(events))
+    except Exception as e:
+        logger.error(f"[DB NEWS CACHE SAVE ERROR] {e}")
+
+async def db_load_news_cache():
+    if not db_pool:
+        return
+    try:
+        async with db_pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT fetched_at, data FROM news_cache WHERE id = 1;")
+        if row:
+            NEWS_CACHE["data"] = _news_from_json(row["data"])
+            NEWS_CACHE["last_fetch"] = row["fetched_at"]
+            NEWS_CACHE["last_attempt"] = row["fetched_at"]
+            age_min = int((time.time() - row["fetched_at"]) / 60)
+            logger.info(f"📰 Кэш новостей загружен из БД ({len(NEWS_CACHE['data'])} событий, возраст {age_min} мин).")
+    except Exception as e:
+        logger.error(f"[DB NEWS CACHE LOAD ERROR] {e}")
 
 async def add_user_xp(user_id: int, amount: int = 5):
     global USER_XP
@@ -268,7 +319,9 @@ def create_bot(connector=None):
     async def on_ready():
         logger.info(f"✅ Успешный вход: {new_bot.user} (ID: {new_bot.user.id})")
         try:
-            await fetch_economic_news(force_refresh=True)
+            # Без force_refresh: если в БД свежий кэш новостей — берём его и
+            # не дёргаем источники при каждом перезапуске бота.
+            await fetch_economic_news()
 
             if not check_30min_news_alerts.is_running():
                 check_30min_news_alerts.start()
@@ -461,6 +514,35 @@ def create_bot(connector=None):
         except Exception as e:
             logger.error(f"[SUBRESET COMMAND ERROR] {e}")
             await ctx.send("❌ Произошла ошибка при сбросе срока подписки.")
+
+    @new_bot.command(name="subremove", aliases=["снятьподписку", "снять_подписку"])
+    @commands.has_permissions(administrator=True)
+    async def cmd_subremove(ctx, member: discord.Member):
+        """
+        Полностью снимает подписку: удаляет запись из БД и роль Legacy.
+        Пример: !subremove @user
+        """
+        try:
+            subs = await db_load_subs()
+            if str(member.id) not in subs:
+                await ctx.send(f"❌ У {member.mention} нет записи о подписке.")
+                return
+
+            await db_delete_sub(member.id)
+
+            role = discord.utils.get(ctx.guild.roles, name="Legacy")
+            if role and role in member.roles:
+                await member.remove_roles(role)
+
+            embed = discord.Embed(
+                title="🗑 Подписка Legacy снята",
+                description=f"У участника {member.mention} удалена подписка и роль **Legacy**.",
+                color=discord.Color.red()
+            )
+            await ctx.send(embed=embed)
+        except Exception as e:
+            logger.error(f"[SUBREMOVE COMMAND ERROR] {e}")
+            await ctx.send("❌ Произошла ошибка при снятии подписки.")
 
     @new_bot.command(name="subinfo", aliases=["mysub", "мояподписка"])
     async def cmd_subinfo(ctx):
@@ -770,8 +852,13 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
         return NEWS_CACHE["data"]
     NEWS_CACHE["last_attempt"] = now
 
+    # Запасные адреса той же ленты (faireconomy) добавлены на случай, если
+    # основной отвечает 429/403. Работоспособность запасных НЕ проверена —
+    # если не сработают, бот просто перейдёт к следующему и уйдёт на паузу.
     sources = [
         {"url": "https://nfs.faireconomy.media/ff_calendar_thisweek.json", "type": "json"},
+        {"url": "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json", "type": "json"},
+        {"url": "https://nfs.faireconomy.media/ff_calendar_thisweek.xml", "type": "xml"},
         {"url": "https://www.forexfactory.com/ffcalendar.xml", "type": "xml"}
     ]
 
@@ -828,6 +915,7 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
                 if parsed:
                     NEWS_CACHE["data"] = parsed
                     NEWS_CACHE["last_fetch"] = now
+                    await db_save_news_cache(parsed, now)
                     logger.info("✅ Новости Forex Factory успешно обновлены!")
                     return parsed
         except Exception as e:
