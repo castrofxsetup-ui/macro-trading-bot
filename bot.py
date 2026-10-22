@@ -338,12 +338,33 @@ def create_bot(connector=None):
 
     @new_bot.event
     async def on_member_join(member: discord.Member):
-        try:
-            role = discord.utils.get(member.guild.roles, name="Trader")
-            if role:
-                await member.add_roles(role)
-        except Exception as e:
-            logger.error(f"[AUTO-ROLE] {e}")
+        if member.bot:
+            return
+        role = discord.utils.get(member.guild.roles, name="Trader")
+        if not role:
+            logger.error(f"[AUTO-ROLE] Роль 'Trader' не найдена на сервере — {member} ({member.id}) остался без роли. Проверь точное название роли.")
+            return
+
+        # Через SOCKS5-прокси REST-запросы изредка рвутся (Connection reset /
+        # timeout) — поэтому несколько попыток с нарастающей паузой.
+        delays = [0, 3, 10, 30, 90]
+        last_err = None
+        for attempt, delay in enumerate(delays, start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                if role in member.roles:
+                    return
+                await member.add_roles(role, reason="Авто-роль при входе")
+                logger.info(f"[AUTO-ROLE] ✅ Роль Trader выдана: {member} ({member.id}), попытка {attempt}")
+                return
+            except discord.Forbidden as e:
+                logger.error(f"[AUTO-ROLE] Нет прав выдать роль Trader ({e}). Подними роль бота выше Trader и включи 'Управление ролями'.")
+                return
+            except Exception as e:
+                last_err = e
+                logger.warning(f"[AUTO-ROLE] попытка {attempt}/{len(delays)} для {member} не удалась: {type(e).__name__}: {e}")
+        logger.error(f"[AUTO-ROLE] ❌ Не удалось выдать Trader {member} ({member.id}) после {len(delays)} попыток: {last_err}")
 
     @new_bot.event
     async def on_message(message: discord.Message):
@@ -852,12 +873,10 @@ async def fetch_economic_news(force_refresh: bool = False) -> list:
         return NEWS_CACHE["data"]
     NEWS_CACHE["last_attempt"] = now
 
-    # Запасные адреса той же ленты (faireconomy) добавлены на случай, если
-    # основной отвечает 429/403. Работоспособность запасных НЕ проверена —
-    # если не сработают, бот просто перейдёт к следующему и уйдёт на паузу.
+    # Запасной адрес той же ленты (XML на nfs.faireconomy.media) — по логам
+    # он отдаёт данные, когда JSON отвечает 429.
     sources = [
         {"url": "https://nfs.faireconomy.media/ff_calendar_thisweek.json", "type": "json"},
-        {"url": "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json", "type": "json"},
         {"url": "https://nfs.faireconomy.media/ff_calendar_thisweek.xml", "type": "xml"},
         {"url": "https://www.forexfactory.com/ffcalendar.xml", "type": "xml"}
     ]
