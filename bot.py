@@ -33,6 +33,31 @@ PROXY_URL = os.getenv("PROXY_URL")
 DATABASE_URL = os.getenv("DATABASE_URL")
 PORT = int(os.getenv("PORT", 10000))
 
+# --- Автопереключение способа подключения к Discord -------------------------
+# Порядок: платные прокси (PROXY_URL, затем PROXY_URLS через запятую) ->
+# прямое подключение -> бесплатные публичные прокси (самый ненадёжный вариант,
+# только чтобы бот не лежал совсем). Отключить части можно переменными:
+#   USE_DIRECT_FALLBACK=0   — не пробовать подключение напрямую
+#   USE_FREE_PROXIES=0      — не пробовать бесплатные прокси
+#   FAILOVER_AFTER_SECONDS  — сколько секунд без связи терпеть до переключения (по умолчанию 120)
+PROXY_URLS_RAW = os.getenv("PROXY_URLS", "")
+PAID_PROXIES = []
+for _p in [PROXY_URL or ""] + PROXY_URLS_RAW.replace("\n", ",").split(","):
+    _p = _p.strip()
+    if _p and _p not in PAID_PROXIES:
+        PAID_PROXIES.append(_p)
+USE_DIRECT_FALLBACK = os.getenv("USE_DIRECT_FALLBACK", "1") != "0"
+USE_FREE_PROXIES = os.getenv("USE_FREE_PROXIES", "1") != "0"
+FAILOVER_AFTER_SECONDS = int(os.getenv("FAILOVER_AFTER_SECONDS", "120"))
+PRIMARY_RECHECK_SECONDS = 600
+FREE_PROXY_SOURCES = [
+    ("socks5", "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=6000&country=all"),
+    ("socks5", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt"),
+    ("socks5", "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt"),
+    ("http", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"),
+]
+CONN_STATE = {"down_since": None}
+
 TARGET_NEWS_THREAD_ID = 1528319066513604688
 TARGET_EVENTS_THREAD_ID = 1528506824687485118
 TARGET_STREAMS_CHANNEL_ID = 1528319066513604688
@@ -316,7 +341,19 @@ def create_bot(connector=None):
     )
 
     @new_bot.event
+    async def on_disconnect():
+        # Запоминаем момент потери связи — по нему сторож в main() решает,
+        # пора ли переключаться на другой прокси.
+        if CONN_STATE["down_since"] is None:
+            CONN_STATE["down_since"] = time.time()
+
+    @new_bot.event
+    async def on_resumed():
+        CONN_STATE["down_since"] = None
+
+    @new_bot.event
     async def on_ready():
+        CONN_STATE["down_since"] = None
         logger.info(f"✅ Успешный вход: {new_bot.user} (ID: {new_bot.user.id})")
         try:
             # Без force_refresh: если в БД свежий кэш новостей — берём его и
@@ -1226,52 +1263,164 @@ async def scheduled_news_digests():
 # ---------------------------------------------------------------------------
 # MAIN EXECUTION
 # ---------------------------------------------------------------------------
-async def main():
+def mask_proxy(url) -> str:
+    """Прячет логин/пароль из адреса прокси для логов."""
+    if not url:
+        return "прямое подключение"
+    try:
+        scheme, rest = url.split("://", 1)
+        host = rest.split("@", 1)[-1]
+        return f"{scheme}://{host}"
+    except Exception:
+        return "прокси"
+
+async def probe_discord(proxy_url, timeout: int = 10) -> bool:
+    """Проверяет, отвечает ли Discord API через данный прокси (или напрямую, если proxy_url=None)."""
+    try:
+        connector = ProxyConnector.from_url(proxy_url) if proxy_url else None
+        to = aiohttp.ClientTimeout(total=timeout)
+        async with aiohttp.ClientSession(connector=connector, timeout=to) as session:
+            async with session.get("https://discord.com/api/v10/gateway") as resp:
+                if resp.status != 200:
+                    logger.warning(f"[PROBE] {mask_proxy(proxy_url)}: HTTP {resp.status}")
+                    return False
+                data = await resp.json(content_type=None)
+                return isinstance(data, dict) and "url" in data
+    except Exception as e:
+        logger.warning(f"[PROBE] {mask_proxy(proxy_url)}: {type(e).__name__}: {str(e)[:120] or '(пусто)'}")
+        return False
+
+async def fetch_free_proxy_candidates(limit: int = 120) -> list:
+    """Скачивает публичные списки бесплатных прокси (ip:port) и возвращает случайную выборку URL."""
+    import random
+    import re
+    found = []
+    timeout = aiohttp.ClientTimeout(total=15)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for scheme, src in FREE_PROXY_SOURCES:
+                try:
+                    async with session.get(src) as resp:
+                        if resp.status != 200:
+                            continue
+                        text = await resp.text()
+                        for ip, port in re.findall(r"(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})", text):
+                            found.append(f"{scheme}://{ip}:{port}")
+                except Exception as e:
+                    logger.warning(f"[FREE PROXY] источник недоступен: {src} ({type(e).__name__})")
+    except Exception as e:
+        logger.warning(f"[FREE PROXY] ошибка загрузки списков: {e}")
+    random.shuffle(found)
+    return found[:limit]
+
+async def find_working_free_proxy(concurrency: int = 25):
+    """Быстро проверяет бесплатные прокси параллельно и возвращает первый рабочий (или None)."""
+    candidates = await fetch_free_proxy_candidates()
+    if not candidates:
+        logger.warning("[FREE PROXY] не удалось получить список бесплатных прокси.")
+        return None
+    logger.info(f"[FREE PROXY] проверяю {len(candidates)} бесплатных прокси...")
+    sem = asyncio.Semaphore(concurrency)
+
+    async def check(url):
+        async with sem:
+            ok = await probe_discord(url, timeout=8)
+            return url if ok else None
+
+    tasks_ = [asyncio.create_task(check(u)) for u in candidates]
+    try:
+        for fut in asyncio.as_completed(tasks_):
+            res = await fut
+            if res:
+                return res
+    finally:
+        for t in tasks_:
+            if not t.done():
+                t.cancel()
+    return None
+
+async def choose_connection():
+    """
+    Выбирает, как подключаться к Discord. Возвращает (метка, proxy_url|None, это_основной_прокси)
+    или None, если ничего не работает. Порядок: платные прокси -> напрямую -> бесплатные.
+    """
+    for i, p in enumerate(PAID_PROXIES):
+        if await probe_discord(p):
+            return (f"платный прокси #{i + 1} ({mask_proxy(p)})", p, i == 0)
+        logger.warning(f"⚠️ Платный прокси #{i + 1} ({mask_proxy(p)}) не отвечает.")
+    if USE_DIRECT_FALLBACK:
+        if await probe_discord(None):
+            return ("прямое подключение (без прокси)", None, False)
+        logger.warning("⚠️ Прямое подключение к Discord не работает.")
+    if USE_FREE_PROXIES:
+        free = await find_working_free_proxy()
+        if free:
+            return (f"бесплатный прокси ({mask_proxy(free)}) — ВРЕМЕННО", free, False)
+        logger.warning("⚠️ Рабочих бесплатных прокси не нашлось.")
+    return None
+
+async def run_bot_once(label: str, proxy_url, is_primary: bool):
+    """
+    Запускает бота через выбранное подключение и следит за ним. Возвращает причину
+    переключения (строка), либо None, если бот завершился сам.
+    """
     global bot
+    connector = ProxyConnector.from_url(proxy_url) if proxy_url else None
+    bot = create_bot(connector)
+    CONN_STATE["down_since"] = time.time()
+    logger.info(f"⚡️ Подключаюсь к Discord: {label}")
+    start_task = asyncio.create_task(bot.start(DISCORD_TOKEN))
+    reason = None
+    last_primary_check = time.time()
+    try:
+        while not start_task.done():
+            await asyncio.sleep(15)
+            ds = CONN_STATE["down_since"]
+            if ds and time.time() - ds > FAILOVER_AFTER_SECONDS:
+                reason = f"нет связи с Discord уже {int(time.time() - ds)} с"
+                break
+            if (not is_primary) and PAID_PROXIES and time.time() - last_primary_check > PRIMARY_RECHECK_SECONDS:
+                last_primary_check = time.time()
+                if await probe_discord(PAID_PROXIES[0]):
+                    reason = "основной платный прокси снова работает — возвращаюсь на него"
+                    break
+    finally:
+        if reason:
+            logger.warning(f"🔁 Переключение подключения: {reason}.")
+        try:
+            if bot and not bot.is_closed():
+                await bot.close()
+        except Exception:
+            pass
+        try:
+            # после close() discord.py может ещё секунд до 60 досыпать паузу
+            # реконнекта — не ждём дольше 30 с, потом снимаем задачу.
+            await asyncio.wait_for(asyncio.shield(start_task), timeout=30)
+        except asyncio.TimeoutError:
+            start_task.cancel()
+        except asyncio.CancelledError:
+            pass
+    return reason
+
+async def main():
     await start_web_server()
     await init_db()
 
+    if not PAID_PROXIES:
+        logger.warning("⚠️ Платный прокси не задан (PROXY_URL) — будут пробоваться запасные способы.")
+
     while True:
-        connector = None
-        if PROXY_URL:
-            try:
-                connector = ProxyConnector.from_url(PROXY_URL)
-                logger.info("🛡️ SOCKS5 прокси-коннектор создан — проверяю его перед подключением к Discord...")
-                proxy_ok = await test_proxy_connector(connector)
-                curl_ok = await test_proxy_curl_cffi()
+        choice = await choose_connection()
+        if not choice:
+            logger.error("❌ Ни один способ подключения к Discord сейчас не работает. Повторная проверка через 60 секунд.")
+            await asyncio.sleep(60)
+            continue
 
-                if proxy_ok:
-                    logger.info("✅ Прокси + 'голый' Python TLS (aiohttp) — РАБОТАЕТ. Discord.py должен подключиться.")
-                elif curl_ok and not proxy_ok:
-                    logger.error(
-                        "🧩 ДИАГНОЗ: прокси сам по себе рабочий (curl_cffi с TLS-отпечатком Chrome прошёл), "
-                        "но 'голый' Python TLS (aiohttp/discord.py) через него режется — это похоже на блокировку "
-                        "по TLS-отпечатку (JA3) на стороне Discord/Cloudflare или на DPI-фильтр прокси-провайдера. "
-                        "discord.py жёстко завязан на aiohttp и не умеет подделывать TLS-отпечаток браузера — "
-                        "обойти это в коде discord.py нельзя. Нужен прокси/провайдер, который либо не триггерит "
-                        "такую блокировку, либо явно заявляет поддержку Discord-бот трафика."
-                    )
-                elif not curl_ok and not proxy_ok:
-                    logger.error(
-                        "🧩 ДИАГНОЗ: оба теста (и aiohttp, и curl_cffi с Chrome TLS) через этот прокси к discord.com "
-                        "провалились. Значит прокси/его провайдер режет соединения к Discord целиком, вне "
-                        "зависимости от клиента. Нужно уточнить у провайдера прокси, разрешён ли трафик к "
-                        "discord.com (многие прокси-сервисы блокируют Discord отдельной политикой даже на платных "
-                        "тарифах), либо взять другой прокси/IP."
-                    )
-            except Exception as e:
-                logger.error(
-                    f"❌ Ошибка инициализации прокси-коннектора [{type(e).__name__}]: {e or '(пусто)'}\n"
-                    f"{traceback.format_exc()}\nБот попробует запуститься БЕЗ прокси."
-                )
-                connector = None
-        else:
-            logger.warning("⚠️ PROXY_URL не задан — подключаюсь напрямую, без прокси.")
-
+        label, proxy_url, is_primary = choice
         try:
-            bot = create_bot(connector)
-            logger.info("⚡️ Инициализация подключения к Discord API...")
-            await bot.start(DISCORD_TOKEN)
+            reason = await run_bot_once(label, proxy_url, is_primary)
+            if not reason:
+                await asyncio.sleep(10)
         except discord.PrivilegedIntentsRequired as e:
             logger.critical(
                 f"❌ Не включены привилегированные Intents в Discord Developer Portal: {e}\n"
@@ -1279,17 +1428,14 @@ async def main():
                 f"включи 'SERVER MEMBERS INTENT' и 'MESSAGE CONTENT INTENT'."
             )
             await asyncio.sleep(30)
+        except discord.LoginFailure as e:
+            logger.critical(f"❌ Неверный DISCORD_TOKEN: {e}. Проверь токен в переменных окружения.")
+            await asyncio.sleep(60)
         except Exception as e:
             logger.error(
-                f"❌ Ошибка соединения [{type(e).__name__}]: {e or '(пустое сообщение об ошибке — см. traceback ниже)'}\n"
-                f"{traceback.format_exc()}\n"
-                f"Переподключение через 15 секунд..."
+                f"❌ Ошибка соединения [{type(e).__name__}]: {e or '(пустое сообщение)'}\n"
+                f"{traceback.format_exc()}\nПереподключение через 15 секунд..."
             )
-            try:
-                if bot:
-                    await bot.close()
-            except Exception:
-                pass
             await asyncio.sleep(15)
 
 if __name__ == "__main__":
