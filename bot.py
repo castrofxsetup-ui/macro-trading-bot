@@ -73,16 +73,46 @@ PAYWALL_PRICES = [("1 месяц", 75, 30), ("3 месяца", 180, 90), ("12 м
 # Роли без подписки: видят только открытые каналы (как @everyone). Полный доступ — только у Legacy.
 RESTRICTED_ROLE_NAMES = ["Trader", "Girl trader", "student by Castro", "macro-trader"]
 ANNOUNCE_CHANNEL_ID = 1449056905988149454
-# Каналы, которые остаются видимыми для всех без подписки: id -> (название, только чтение)
+# Каналы, полностью открытые для всех ролей (@everyone, Trader и т.д.): видны, права на запись бот не меняет.
 PAYWALL_OPEN = {
-    1566025906340761761: ("подписка / оплата", True),
-    1534103088099496058: ("результаты", True),
+    1518256216684363806: ("общий канал", False),
+    1518257153792675981: ("общий канал", False),
+    1525895149194838016: ("общий канал", False),
+    1520513827412639779: ("общий канал", False),
+    1534103088099496058: ("результаты", False),
+    1504295294441881701: ("общий канал", False),
+    1549033740078944277: ("общий канал", False),
     1502292137889501235: ("lounge", False),
-    1449056905988149454: ("announcement", True),
+    1447281439044272310: ("общий канал", False),
+    1566025906340761761: ("подписка / оплата", False),
+    1447286311760302150: ("общий канал", False),
+    1449056905988149454: ("announcement", False),
+    1466152271787331705: ("общий канал", False),
+    1528319066513604688: ("общий канал", False),
+    1528506824687485118: ("общий канал", False),
+    1526614096361947366: ("общий канал", False),
     1551834834639261766: ("фидбек", False),
-    1493200920304160891: ("Open Hall (общие стримы)", False),
+    1493200920304160891: ("Open Hall", False),
+    1525154114982383777: ("общий канал", False),
+    1504615808708513793: ("общий канал", False),
+    1518216222838095955: ("общий канал", False),
+    1520372745819525192: ("общий канал", False),
     1447282181297672314: ("медиа", False),
 }
+# Каналы только для роли Legacy (и ролей PAYWALL_EXTRA_ROLES). Всё, чего нет в списках, тоже закрыто.
+PAYWALL_LEGACY_ONLY = [
+    1518210055286165534,
+    1510987525295177878,
+    1518211014418497677,
+    1518211587524005999,
+    1518212119756017905,
+    1518212414825562112,
+    1452682289422139493,
+    1551462897320730724,
+    1551463382417154179,
+    1552283434339016734,
+    1517911591818100837,
+]
 PAYWALL_STATE = {"enabled": False}
 PAYWALL_BACKUP = []          # снимок прав каналов до включения paywall (для отката !paywall off)
 PAID_REQUEST_COOLDOWN = {}
@@ -556,7 +586,13 @@ async def paywall_plan(guild, client_bot) -> dict:
                 without += 1
     admin_roles = [r for r in guild.roles if r.permissions.administrator and not r.managed
                    and r != guild.default_role and r not in keep_roles]
-    return {"legacy": legacy, "restricted": restricted, "missing_roles": missing_roles,
+    legacy_items = []
+    for cid in PAYWALL_LEGACY_ONLY:
+        ch = await get_target_channel(cid, client_bot)
+        tgt = ch.parent if isinstance(ch, discord.Thread) else ch
+        legacy_items.append({"id": cid, "obj": ch, "target": tgt,
+                             "conflict": bool(tgt is not None and tgt.id in open_targets)})
+    return {"legacy_items": legacy_items, "legacy": legacy, "restricted": restricted, "missing_roles": missing_roles,
             "admin_roles": admin_roles, "open": open_items, "keep_roles": keep_roles,
             "explicit": explicit, "without": without, "channels": len(guild.channels)}
 
@@ -662,7 +698,8 @@ def build_closed_announcement_embed() -> discord.Embed:
     embed.add_field(name="✅ Остаётся открытым", value=(
         f"• <#1534103088099496058> — результаты\n• <#1502292137889501235> — общий чат\n"
         f"• <#1551834834639261766> — фидбек\n• <#1493200920304160891> — Open Hall (общие стримы)\n• <#1447282181297672314> — медиа\n"
-        f"• <#{ANNOUNCE_CHANNEL_ID}> — анонсы и важная информация"), inline=False)
+        f"• <#{ANNOUNCE_CHANNEL_ID}> — анонсы и важная информация\n"
+        "• и другие общие каналы сервера"), inline=False)
     embed.add_field(name="Как оформить подписку", value=(
         f"Свяжись лично с админом сервера: **{PAYMENT_CONTACT}**. Ссылки на оплату он отправляет только в личных сообщениях — "
         "прямых оплат на сервере и в боте нет."), inline=False)
@@ -1259,14 +1296,35 @@ def create_bot(connector=None):
                 lines = []
                 for it in plan["open"]:
                     if it["obj"] is None:
-                        lines.append(f"❌ {it['label']} — не найден (ID {it['id']})")
+                        lines.append(f"❌ не найден: {it['id']} ({it['label']})")
                     else:
-                        extra = " (ветка: права задаются на родительском канале)" if it["is_thread"] else ""
+                        extra = ""
+                        if it["is_thread"]:
+                            extra = " ⚠️ ветка"
                         if isinstance(it["target"], discord.CategoryChannel):
-                            extra = f" (категория, каналов внутри: {len(it['target'].channels)})"
-                        mode_txt = "только чтение" if it["readonly"] else "можно писать"
-                        lines.append(f"• {it['obj'].mention} — {it['label']}, {mode_txt}{extra}")
-                embed.add_field(name="Останется открытым для всех", value="\n".join(lines), inline=False)
+                            extra = f" (категория, каналов: {len(it['target'].channels)})"
+                        lines.append(f"{it['obj'].mention}{extra}")
+                def _add_chunks(title, parts):
+                    chunk, n = "", 0
+                    for p in parts:
+                        if len(chunk) + len(p) + 3 > 1000:
+                            embed.add_field(name=title if n == 0 else "…продолжение", value=chunk, inline=False)
+                            chunk, n = "", n + 1
+                        chunk += (" · " if chunk else "") + p
+                    if chunk:
+                        embed.add_field(name=title if n == 0 else "…продолжение", value=chunk, inline=False)
+                _add_chunks(f"✅ Открыто для всех ({len(lines)})", lines)
+                lg = []
+                for it in plan["legacy_items"]:
+                    if it["obj"] is None:
+                        lg.append(f"❌ не найден: {it['id']}")
+                    else:
+                        lg.append(it["obj"].mention + (" ⚠️" if it["conflict"] else ""))
+                _add_chunks(f"🔒 Только для Legacy ({len(lg)})", lg)
+                if any(it["conflict"] for it in plan["legacy_items"]):
+                    embed.add_field(name="⚠️ Конфликт", value=(
+                        "Отмеченные ⚠️ каналы из списка «только Legacy» — ветки внутри открытого канала. "
+                        "Ветку нельзя скрыть отдельно от родителя: она останется видимой. Сделай её приватной в Discord или перенеси."), inline=False)
                 keep = ", ".join(r.name for r in plan["keep_roles"]) or "—"
                 embed.add_field(name="Что сделает `!paywall confirm`", value=(
                     f"• Скроет остальные каналы и категории (всего на сервере {plan['channels']}) от всех без Legacy\n"
