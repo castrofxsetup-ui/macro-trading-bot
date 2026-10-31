@@ -58,6 +58,30 @@ FREE_PROXY_SOURCES = [
 ]
 CONN_STATE = {"down_since": None}
 
+# --- Платный доступ (paywall) ----------------------------------------------
+# Ветка/канал, куда бот пишет приветствие-оповещение о платной подписке.
+PAYWALL_THREAD_ID = 1566025906340761761
+# Ссылка на оплату (необязательно). Если задана — у сообщения появится кнопка «Оплатить».
+PAYMENT_URL = ""   # прямых оплат в боте нет: ссылки на оплату владелец отправляет только лично в ЛС
+# Как связаться для оплаты, если ссылки нет (например "@username в Telegram").
+PAYMENT_CONTACT = "@alchemistcastro"   # Discord владельца сервера
+# Кого пингуем, когда человек жмёт «Я оплатил(а)» (ID через запятую). Владелец сервера пингуется всегда.
+PAYWALL_ADMIN_IDS = [int(x) for x in os.getenv("PAYWALL_ADMIN_IDS", "").replace(" ", "").split(",") if x.isdigit()]
+# Роли (имена через запятую), которые сохраняют доступ ко всем разделам помимо Legacy (модераторы и т.п.).
+PAYWALL_EXTRA_ROLES = [x.strip() for x in os.getenv("PAYWALL_EXTRA_ROLES", "Lite Moderator").split(",") if x.strip()]
+PAYWALL_PRICES = [("1 месяц", 75, 30), ("3 месяца", 180, 90), ("12 месяцев", 550, 360)]
+ANNOUNCE_CHANNEL_ID = 1449056905988149454
+# Каналы, которые остаются видимыми для всех без подписки: id -> (название, только чтение)
+PAYWALL_OPEN = {
+    1566025906340761761: ("подписка / оплата", True),
+    1534103088099496058: ("результаты", True),
+    1502292137889501235: ("lounge", False),
+    1449056905988149454: ("announcement", True),
+}
+PAYWALL_STATE = {"enabled": False}
+PAYWALL_BACKUP = []          # снимок прав каналов до включения paywall (для отката !paywall off)
+PAID_REQUEST_COOLDOWN = {}
+
 TARGET_NEWS_THREAD_ID = 1528319066513604688
 TARGET_EVENTS_THREAD_ID = 1528506824687485118
 TARGET_STREAMS_CHANNEL_ID = 1528319066513604688
@@ -141,7 +165,26 @@ async def init_db():
                     fetched_at DOUBLE PRECISION NOT NULL,
                     data TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS paywall_backup (
+                    channel_id BIGINT NOT NULL,
+                    target_id BIGINT NOT NULL,
+                    target_type TEXT NOT NULL,
+                    allow_bits BIGINT NOT NULL,
+                    deny_bits BIGINT NOT NULL,
+                    existed BOOLEAN NOT NULL,
+                    PRIMARY KEY (channel_id, target_id)
+                );
             """)
+
+            val = await conn.fetchval("SELECT value FROM settings WHERE key = 'paywall_enabled';")
+            PAYWALL_STATE["enabled"] = (val == "1")
+            brows = await conn.fetch("SELECT * FROM paywall_backup;")
+            PAYWALL_BACKUP.clear()
+            PAYWALL_BACKUP.extend(dict(r) for r in brows)
 
             rows = await conn.fetch("SELECT user_id, xp FROM user_xp;")
             USER_XP = {row["user_id"]: row["xp"] for row in rows}
@@ -311,6 +354,339 @@ async def test_proxy_curl_cffi() -> bool:
         return False
 
 # ---------------------------------------------------------------------------
+# PAYWALL: платный доступ к серверу (оповещение в ветке, кнопки, закрытие каналов)
+# ---------------------------------------------------------------------------
+async def db_set_setting(key: str, value: str):
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO settings (key, value) VALUES ($1, $2) "
+                    "ON CONFLICT (key) DO UPDATE SET value = $2;", key, value)
+        except Exception as e:
+            logger.error(f"[DB SETTING ERROR] {e}")
+
+async def db_replace_paywall_backup(rows: list):
+    """Полностью заменяет сохранённый снимок прав (rows=[] — очистить)."""
+    PAYWALL_BACKUP.clear()
+    PAYWALL_BACKUP.extend(rows)
+    if db_pool:
+        try:
+            async with db_pool.acquire() as conn:
+                async with conn.transaction():
+                    await conn.execute("DELETE FROM paywall_backup;")
+                    if rows:
+                        await conn.executemany(
+                            "INSERT INTO paywall_backup (channel_id, target_id, target_type, allow_bits, deny_bits, existed) "
+                            "VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (channel_id, target_id) DO NOTHING;",
+                            [(r["channel_id"], r["target_id"], r["target_type"], r["allow_bits"], r["deny_bits"], r["existed"]) for r in rows])
+        except Exception as e:
+            logger.error(f"[DB PAYWALL BACKUP ERROR] {e}")
+
+def build_paywall_embed(member=None, guild=None) -> discord.Embed:
+    owner_id = (guild.owner_id if guild else None)
+    owner = f"<@{owner_id}> (**{PAYMENT_CONTACT}**)" if owner_id else f"**{PAYMENT_CONTACT}**"
+    lines = []
+    if member is not None:
+        lines.append(f"{member.mention}, ты попал(а) на сервер **Discord-комьюнити по трейдингу The Legacy**.")
+    else:
+        lines.append("Добро пожаловать на сервер **Discord-комьюнити по трейдингу The Legacy**.")
+    lines.append("")
+    lines.append("Чтобы получить доступ к **полноценному функционалу сервера**, нужно оформить подписку **Legacy**. "
+                 "До этого остальные разделы закрыты.")
+    embed = discord.Embed(title="🔒 Доступ к The Legacy — по подписке", description="\n".join(lines),
+                          color=discord.Color.from_rgb(214, 178, 116))
+    base_month = PAYWALL_PRICES[0][1]
+    price_lines = []
+    for title, price, days in PAYWALL_PRICES:
+        months = max(1, round(days / 30))
+        saving = base_month * months - price
+        extra = f"  ·  выгода **{saving}$**" if saving > 0 else ""
+        price_lines.append(f"• **{title}** — **{price}$**{extra}")
+    embed.add_field(name="💎 Тарифы", value="\n".join(price_lines), inline=False)
+    embed.add_field(name="Как получить доступ", value=(
+        f"1️⃣ Свяжись с админом сервера: {owner}\n"
+        "2️⃣ Выбери срок — ссылку на оплату админ отправит **лично в личных сообщениях**\n"
+        "3️⃣ После оплаты нажми **«Я оплатил(а)»** — админ выдаст роль Legacy и откроет все разделы"), inline=False)
+    embed.add_field(name="⚠️ Важно", value=(
+        "В боте и на сервере **нет прямых оплат**. Ссылки на оплату выдаёт только владелец сервера в личных сообщениях. "
+        "По всем вопросам пиши **лично ему** — не доверяй никому другому."), inline=False)
+    embed.set_footer(text="Подписка на 30 / 90 / 360 дней · с ролью Legacy открывается доступ ко всему Discord-серверу")
+    return embed
+
+class PaywallView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        if PAYMENT_URL:
+            self.add_item(discord.ui.Button(label="💳 Оплатить подписку", style=discord.ButtonStyle.link, url=PAYMENT_URL))
+
+    @discord.ui.button(label="✅ Я оплатил(а)", style=discord.ButtonStyle.success, custom_id="legacy_paywall_paid")
+    async def paid_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        user = interaction.user
+        now = time.time()
+        if now - PAID_REQUEST_COOLDOWN.get(user.id, 0) < 600:
+            await interaction.response.send_message(
+                "⏳ Заявка уже отправлена — администратор скоро проверит оплату.", ephemeral=True)
+            return
+        PAID_REQUEST_COOLDOWN[user.id] = now
+        await interaction.response.send_message(
+            "✅ Спасибо! Админ проверит оплату и откроет доступ. Если вопросы — пиши лично @alchemistcastro.",
+            ephemeral=True)
+        try:
+            ids = []
+            if interaction.guild and interaction.guild.owner_id:
+                ids.append(interaction.guild.owner_id)
+            for i in PAYWALL_ADMIN_IDS:
+                if i not in ids:
+                    ids.append(i)
+            mentions = " ".join(f"<@{i}>" for i in ids)
+            mod = discord.utils.get(interaction.guild.roles, name="Lite Moderator") if interaction.guild else None
+            if mod:
+                mentions += f" {mod.mention}"
+            await interaction.channel.send(
+                f"{mentions}\n💰 {user.mention} сообщает об оплате. Проверьте платёж и выдайте доступ: "
+                f"`!sub {user.id} 30` / `90` / `360`")
+        except Exception as e:
+            logger.error(f"[PAYWALL PAID BUTTON] {e}")
+
+async def send_paywall_notice(client_bot, member=None, attempts=(0, 5, 20)) -> bool:
+    """Пишет оповещение о платной подписке в ветку PAYWALL_THREAD_ID (с повторами — прокси иногда рвёт запросы)."""
+    last_err = None
+    for delay in attempts:
+        if delay:
+            await asyncio.sleep(delay)
+        try:
+            ch = await get_target_channel(PAYWALL_THREAD_ID, client_bot)
+            if ch is None:
+                last_err = "ветка не найдена"
+                continue
+            if isinstance(ch, discord.Thread) and ch.archived:
+                await ch.edit(archived=False)
+            await ch.send(
+                content=member.mention if member else None,
+                embed=build_paywall_embed(member, getattr(ch, "guild", None)),
+                view=PaywallView(),
+            )
+            return True
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            logger.warning(f"[PAYWALL NOTICE] попытка не удалась: {last_err}")
+    logger.error(f"[PAYWALL NOTICE] не удалось отправить оповещение: {last_err}")
+    return False
+
+async def paywall_resolve(guild, client_bot) -> list:
+    """Находит открытые каналы. Если ID — ветка (thread), права задаются на её родительском канале."""
+    out = []
+    for cid, (label, readonly) in PAYWALL_OPEN.items():
+        ch = await get_target_channel(cid, client_bot)
+        item = {"id": cid, "label": label, "readonly": readonly, "obj": ch, "target": None, "is_thread": False}
+        if ch is not None:
+            if isinstance(ch, discord.Thread):
+                item["is_thread"] = True
+                item["target"] = ch.parent
+            else:
+                item["target"] = ch
+        out.append(item)
+    return out
+
+def _copy_overwrite(ows: dict, target) -> discord.PermissionOverwrite:
+    if target in ows:
+        return discord.PermissionOverwrite.from_pair(*ows[target].pair())
+    return discord.PermissionOverwrite()
+
+def _paywall_keep_roles(guild) -> list:
+    roles = []
+    legacy = discord.utils.get(guild.roles, name="Legacy")
+    if legacy:
+        roles.append(legacy)
+    for name in PAYWALL_EXTRA_ROLES:
+        r = discord.utils.get(guild.roles, name=name)
+        if r and r not in roles:
+            roles.append(r)
+    return roles
+
+async def paywall_plan(guild, client_bot) -> dict:
+    keep_roles = _paywall_keep_roles(guild)
+    legacy = discord.utils.get(guild.roles, name="Legacy")
+    trader = discord.utils.get(guild.roles, name="Trader")
+    open_items = await paywall_resolve(guild, client_bot)
+    open_targets = {it["target"].id for it in open_items if it["target"] is not None}
+    explicit = {}
+    for ch in guild.channels:
+        if ch.id in open_targets:
+            continue
+        for target, ow in ch.overwrites.items():
+            if (isinstance(target, discord.Role) and target != guild.default_role
+                    and target not in keep_roles and target != trader
+                    and not target.managed and ow.view_channel is True):
+                explicit[target] = explicit.get(target, 0) + 1
+    without = 0
+    if legacy:
+        for m in guild.members:
+            if not m.bot and legacy not in m.roles and not m.guild_permissions.administrator:
+                without += 1
+    return {"legacy": legacy, "trader": trader, "open": open_items, "keep_roles": keep_roles,
+            "explicit": explicit, "without": without, "channels": len(guild.channels)}
+
+async def paywall_apply(guild, client_bot, strict: bool = False) -> dict:
+    plan = await paywall_plan(guild, client_bot)
+    if not plan["legacy"]:
+        return {"ok": False, "error": "Роль **Legacy** не найдена на сервере."}
+    missing = [it["label"] + f" ({it['id']})" for it in plan["open"] if it["target"] is None]
+    if missing:
+        return {"ok": False, "error": "Не найдены открытые каналы: " + ", ".join(missing) + ". Проверь ID и доступ бота."}
+    open_map = {it["target"].id: it for it in plan["open"]}
+    trader = plan["trader"]
+    me = guild.me
+    everyone = guild.default_role
+    all_backup, failed, done = [], [], 0
+
+    for ch in guild.channels:
+        ows = dict(ch.overwrites)
+        snaps = []
+
+        def snap(target):
+            existed = target in ows
+            if existed:
+                allow, deny = (p.value for p in ows[target].pair())
+            else:
+                allow = deny = 0
+            snaps.append({"channel_id": ch.id, "target_id": target.id,
+                          "target_type": "role" if isinstance(target, discord.Role) else "member",
+                          "allow_bits": allow, "deny_bits": deny, "existed": existed})
+
+        item = open_map.get(ch.id)
+
+        snap(everyone)
+        ow = _copy_overwrite(ows, everyone)
+        if item:
+            ow.view_channel = True
+            if item["readonly"]:
+                ow.send_messages = False
+                ow.send_messages_in_threads = False
+                ow.create_public_threads = False
+                ow.create_private_threads = False
+                ow.add_reactions = False
+        else:
+            ow.view_channel = False
+        ows[everyone] = ow
+
+        # Trader: явно видит только открытые каналы (если у роли были прямые разрешения — перекрываем).
+        # Подписчики с Legacy всё равно видят всё: allow роли Legacy сильнее deny роли Trader.
+        if trader is not None:
+            snap(trader)
+            o = _copy_overwrite(ows, trader)
+            o.view_channel = True if item else False
+            ows[trader] = o
+
+        for r in plan["keep_roles"]:
+            snap(r)
+            o = _copy_overwrite(ows, r)
+            o.view_channel = True
+            ows[r] = o
+
+        if me is not None:
+            snap(me)
+            o = _copy_overwrite(ows, me)
+            o.view_channel = True
+            ows[me] = o
+
+        if strict and not item:
+            for r in plan["explicit"]:
+                if r in ows and ows[r].view_channel is True:
+                    snap(r)
+                    o = _copy_overwrite(ows, r)
+                    o.view_channel = None
+                    ows[r] = o
+
+        try:
+            await ch.edit(overwrites=ows, reason="Paywall: доступ только по подписке Legacy")
+            all_backup.extend(snaps)
+            done += 1
+        except Exception as e:
+            failed.append(f"{ch.name} ({type(e).__name__})")
+            logger.error(f"[PAYWALL] не удалось изменить права канала {ch.name}: {e}")
+        await asyncio.sleep(0.4)
+
+    await db_replace_paywall_backup(all_backup)
+    PAYWALL_STATE["enabled"] = True
+    await db_set_setting("paywall_enabled", "1")
+    return {"ok": True, "done": done, "failed": failed, "total": len(guild.channels)}
+
+def build_closed_announcement_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="🔒 Бесплатный формат сервера закрыт",
+        description=(
+            "Discord-сервер **The Legacy** в бесплатном формате закрыт.\n\n"
+            f"Чтобы продолжить пользоваться **всеми разделами и ветками** сервера, перейди в <#{PAYWALL_THREAD_ID}> "
+            "и оформи или продли подписку **Legacy**."),
+        color=discord.Color.from_rgb(214, 178, 116))
+    embed.add_field(name="💎 Тарифы", value="\n".join(
+        f"• **{t}** — **{p}$**" for t, p, _ in PAYWALL_PRICES), inline=False)
+    embed.add_field(name="✅ Остаётся открытым", value=(
+        f"• <#1534103088099496058> — результаты\n• <#1502292137889501235> — общий чат\n"
+        f"• <#{ANNOUNCE_CHANNEL_ID}> — анонсы и важная информация"), inline=False)
+    embed.add_field(name="Как оформить подписку", value=(
+        f"Свяжись лично с админом сервера: **{PAYMENT_CONTACT}**. Ссылки на оплату он отправляет только в личных сообщениях — "
+        "прямых оплат на сервере и в боте нет."), inline=False)
+    embed.set_footer(text="С ролью Legacy открывается доступ ко всему Discord-серверу")
+    return embed
+
+async def send_closed_announcement(client_bot, ping_everyone: bool = True) -> bool:
+    try:
+        ch = await get_target_channel(ANNOUNCE_CHANNEL_ID, client_bot)
+        if ch is None:
+            return False
+        if isinstance(ch, discord.Thread) and ch.archived:
+            await ch.edit(archived=False)
+        content = None
+        if ping_everyone:
+            content = "@everyone"
+            trader = discord.utils.get(ch.guild.roles, name="Trader")
+            if trader:
+                content += f" {trader.mention}"
+        await ch.send(
+            content=content,
+            embed=build_closed_announcement_embed(),
+            allowed_mentions=discord.AllowedMentions(everyone=ping_everyone, roles=ping_everyone),
+        )
+        return True
+    except Exception as e:
+        logger.error(f"[PAYWALL ANNOUNCE] {type(e).__name__}: {e}")
+        return False
+
+async def paywall_restore(guild) -> dict:
+    by_channel = {}
+    for r in PAYWALL_BACKUP:
+        by_channel.setdefault(r["channel_id"], []).append(r)
+    done, failed = 0, []
+    for ch_id, rows in by_channel.items():
+        ch = guild.get_channel(ch_id)
+        if ch is None:
+            continue
+        ows = dict(ch.overwrites)
+        for r in rows:
+            target = guild.get_role(r["target_id"]) if r["target_type"] == "role" else guild.get_member(r["target_id"])
+            if target is None:
+                continue
+            if r["existed"]:
+                ows[target] = discord.PermissionOverwrite.from_pair(
+                    discord.Permissions(r["allow_bits"]), discord.Permissions(r["deny_bits"]))
+            else:
+                ows.pop(target, None)
+        try:
+            await ch.edit(overwrites=ows, reason="Paywall отключён: возврат прав")
+            done += 1
+        except Exception as e:
+            failed.append(f"{ch.name} ({type(e).__name__})")
+            logger.error(f"[PAYWALL RESTORE] {ch.name}: {e}")
+        await asyncio.sleep(0.4)
+    await db_replace_paywall_backup([])
+    PAYWALL_STATE["enabled"] = False
+    await db_set_setting("paywall_enabled", "0")
+    return {"done": done, "failed": failed}
+
+# ---------------------------------------------------------------------------
 # FACTORY FUNCTION TO CREATE BOT INSTANCE
 # ---------------------------------------------------------------------------
 #
@@ -355,6 +731,9 @@ def create_bot(connector=None):
     async def on_ready():
         CONN_STATE["down_since"] = None
         logger.info(f"✅ Успешный вход: {new_bot.user} (ID: {new_bot.user.id})")
+        if not getattr(new_bot, "_paywall_view_added", False):
+            new_bot.add_view(PaywallView())   # чтобы кнопка «Я оплатил(а)» работала и после перезапуска
+            new_bot._paywall_view_added = True
         try:
             # Без force_refresh: если в БД свежий кэш новостей — берём его и
             # не дёргаем источники при каждом перезапуске бота.
@@ -377,6 +756,22 @@ def create_bot(connector=None):
     async def on_member_join(member: discord.Member):
         if member.bot:
             return
+        # Платный режим: Trader выдаётся как обычно, плюс оповещение с тарифами в канал оплаты.
+        if PAYWALL_STATE["enabled"]:
+            # Если у человека ещё действует подписка (вышел и вернулся) — просто возвращаем роль Legacy.
+            try:
+                subs = await db_load_subs()
+                data = subs.get(str(member.id))
+                if data and datetime.fromisoformat(data["expires_at"]) > datetime.now(timezone.utc):
+                    legacy_role = discord.utils.get(member.guild.roles, name="Legacy")
+                    if legacy_role:
+                        await member.add_roles(legacy_role, reason="Активная подписка при повторном входе")
+                        logger.info(f"[PAYWALL] подписка активна, Legacy возвращена: {member} ({member.id})")
+                        return
+            except Exception as e:
+                logger.error(f"[PAYWALL REJOIN] {type(e).__name__}: {e}")
+            # Новичок получает Trader как обычно, а оповещение о подписке уходит в фоне.
+            asyncio.create_task(send_paywall_notice(new_bot, member))
         role = discord.utils.get(member.guild.roles, name="Trader")
         if not role:
             logger.error(f"[AUTO-ROLE] Роль 'Trader' не найдена на сервере — {member} ({member.id}) остался без роли. Проверь точное название роли.")
@@ -405,11 +800,18 @@ def create_bot(connector=None):
 
     @new_bot.event
     async def on_message(message: discord.Message):
-        global LAST_TOP_THREE, LAST_OVERTAKE_TIME, LAST_OVERTAKE_PAIR, PAIR_OVERTAKE_TIME
-
+        if message.author.bot or not message.guild:
+            return
         try:
-            if message.author.bot or not message.guild:
-                return
+            await _handle_activity(message)
+        except Exception as e:
+            logger.error(f"[ON_MESSAGE] {e}")
+        # Команды обрабатываем всегда, даже если подсчёт активности дал ошибку
+        await new_bot.process_commands(message)
+
+    async def _handle_activity(message: discord.Message):
+        global LAST_TOP_THREE, LAST_OVERTAKE_TIME, LAST_OVERTAKE_PAIR, PAIR_OVERTAKE_TIME
+        if True:
 
             author_id = message.author.id
             await add_user_xp(author_id, 5)
@@ -462,9 +864,19 @@ def create_bot(connector=None):
                                 PAIR_OVERTAKE_TIME = now
 
             LAST_TOP_THREE = current_top_three
-            await new_bot.process_commands(message)
-        except Exception as e:
-            logger.error(f"[ON_MESSAGE] {e}")
+
+    @new_bot.event
+    async def on_command_error(ctx, error):
+        if isinstance(error, commands.CommandNotFound):
+            return
+        if isinstance(error, commands.MissingPermissions):
+            await ctx.send("🚫 Эта команда доступна только администратору.")
+        elif isinstance(error, (commands.MemberNotFound, commands.BadArgument)):
+            await ctx.send("❌ Неверные данные. Укажи участника (упоминание или ID) и срок, например: `!sub @user 30`")
+        elif isinstance(error, commands.MissingRequiredArgument):
+            await ctx.send(f"❌ Не хватает параметра: `{error.param.name}`. Смотри `!sub`, `!paywall` в списке команд.")
+        else:
+            logger.error(f"[COMMAND ERROR] {ctx.command}: {type(error).__name__}: {error}")
 
     @new_bot.command(name="sub", aliases=["подписка"])
     @commands.has_permissions(administrator=True)
@@ -678,6 +1090,90 @@ def create_bot(connector=None):
         except Exception as e:
             logger.error(f"[SUBSLIST ERROR] {e}")
             await ctx.send(f"❌ Ошибка при чтении подписок: {e}")
+
+    @new_bot.command(name="paywall", aliases=["платный_доступ"])
+    @commands.has_permissions(administrator=True)
+    async def cmd_paywall(ctx, action: str = "", mode: str = ""):
+        """!paywall — предпросмотр | !paywall confirm [strict] — включить | !paywall off — выключить и вернуть права | !paywall test — тест оповещения"""
+        action = (action or "").lower()
+        try:
+            if action in ("", "preview", "status"):
+                plan = await paywall_plan(ctx.guild, new_bot)
+                state = "🟢 ВКЛЮЧЁН" if PAYWALL_STATE["enabled"] else "⚪ выключен"
+                embed = discord.Embed(title="🔒 Платный доступ (paywall)", color=discord.Color.gold(),
+                                      description=f"Сейчас: **{state}**")
+                lines = []
+                for it in plan["open"]:
+                    if it["obj"] is None:
+                        lines.append(f"❌ {it['label']} — не найден (ID {it['id']})")
+                    else:
+                        extra = " (ветка: права задаются на родительском канале)" if it["is_thread"] else ""
+                        mode_txt = "только чтение" if it["readonly"] else "можно писать"
+                        lines.append(f"• {it['obj'].mention} — {it['label']}, {mode_txt}{extra}")
+                embed.add_field(name="Останется открытым для всех", value="\n".join(lines), inline=False)
+                keep = ", ".join(r.name for r in plan["keep_roles"]) or "—"
+                embed.add_field(name="Что сделает `!paywall confirm`", value=(
+                    f"• Скроет остальные каналы и категории (всего на сервере {plan['channels']}) от всех без Legacy\n"
+                    f"• Роль **Trader** по-прежнему выдаётся при входе, но видит только открытые каналы\n"
+                    f"• Полный доступ у ролей: **{keep}**\n"
+                    f"• Без Legacy сейчас **{plan['without']}** участников — они потеряют доступ до оплаты\n"
+                    f"• Бот сам напишет анонс-embed в канал анонсов и оповещение в канал подписки"), inline=False)
+                if plan["explicit"]:
+                    items = "\n".join(f"• **{r.name}** — явный доступ в {n} каналах" for r, n in plan["explicit"].items())
+                    embed.add_field(name="⚠️ Роли с прямым доступом к каналам", value=(
+                        items + "\nЭти роли продолжат видеть свои каналы. Если их тоже нужно закрыть — "
+                        "используй `!paywall confirm strict` (доступ для этих ролей в каналах будет снят; "
+                        "откатывается `!paywall off`)."), inline=False)
+                embed.add_field(name="Команды", value=(
+                    "`!paywall confirm` — включить\n`!paywall confirm strict` — включить и закрыть роли с прямым доступом\n"
+                    "`!paywall off` — выключить и вернуть прежние права\n`!paywall test` — тестовое оповещение в канал подписки\n"
+                    "`!paywall announce` — повторить анонс о закрытии сервера"),
+                    inline=False)
+                await ctx.send(embed=embed)
+
+            elif action == "confirm":
+                me = ctx.guild.me
+                if not (me.guild_permissions.administrator or (me.guild_permissions.manage_roles and me.guild_permissions.manage_channels)):
+                    await ctx.send("❌ Боту нужны права **Управление ролями** и **Управление каналами** (или Администратор).")
+                    return
+                strict = (mode or "").lower() == "strict"
+                await ctx.send("⏳ Применяю платный доступ — это займёт около минуты...")
+                res = await paywall_apply(ctx.guild, new_bot, strict=strict)
+                if not res["ok"]:
+                    await ctx.send(f"❌ {res['error']}")
+                    return
+                msg = f"✅ Платный доступ включён. Каналов обновлено: **{res['done']}** из **{res['total']}**."
+                if res["failed"]:
+                    msg += "\n⚠️ Не удалось изменить: " + ", ".join(res["failed"][:15])
+                await ctx.send(msg)
+                ok_ann = await send_closed_announcement(new_bot)
+                ok_pay = await send_paywall_notice(new_bot, None)
+                await ctx.send(("✅ Анонс отправлен в канал анонсов. " if ok_ann else "⚠️ Анонс отправить не удалось (проверь права бота). ")
+                               + ("✅ Сообщение с тарифами отправлено в канал подписки." if ok_pay else "⚠️ Сообщение в канал подписки не отправилось."))
+
+            elif action == "off":
+                if not PAYWALL_BACKUP and not PAYWALL_STATE["enabled"]:
+                    await ctx.send("ℹ️ Платный доступ и так выключен.")
+                    return
+                await ctx.send("⏳ Возвращаю прежние права каналов...")
+                res = await paywall_restore(ctx.guild)
+                msg = f"✅ Платный доступ выключен, права возвращены в **{res['done']}** каналах."
+                if res["failed"]:
+                    msg += "\n⚠️ Не удалось вернуть: " + ", ".join(res["failed"][:15])
+                await ctx.send(msg)
+
+            elif action == "announce":
+                ok = await send_closed_announcement(new_bot)
+                await ctx.send("✅ Анонс отправлен." if ok else "❌ Не удалось отправить анонс — смотри логи.")
+
+            elif action == "test":
+                ok = await send_paywall_notice(new_bot, ctx.author)
+                await ctx.send("✅ Тестовое оповещение отправлено в ветку." if ok else "❌ Не удалось отправить — смотри логи.")
+            else:
+                await ctx.send("Использование: `!paywall`, `!paywall confirm [strict]`, `!paywall off`, `!paywall test`, `!paywall announce`")
+        except Exception as e:
+            logger.error(f"[PAYWALL COMMAND] {type(e).__name__}: {e}\n{traceback.format_exc()}")
+            await ctx.send(f"❌ Ошибка: {type(e).__name__}: {e}")
 
     @new_bot.command(name="rank", aliases=["level", "активность"])
     async def cmd_rank(ctx):
@@ -1028,7 +1524,7 @@ async def check_youtube_streams_loop():
     except Exception as e:
         logger.error(f"[YOUTUBE LOOP ERROR] {e}")
 
-@tasks.loop(hours=24)
+@tasks.loop(hours=1)
 async def check_subscriptions_daily_loop():
     if not bot:
         return
@@ -1056,7 +1552,7 @@ async def check_subscriptions_daily_loop():
                             expires_str = expires_at.astimezone(MSK_TZ).strftime("%d.%m.%Y в %H:%M")
                             await member.send(
                                 f"⚠️ Напоминание: Срок действия вашей подписки **Legacy** на сервере **{guild.name}** истекает завтра (**{expires_str} МСК**).\n"
-                                f"Для продления подписки напишите администратору **Castro**."
+                                f"Для продления подписки напишите администратору **@alchemistcastro**."
                             )
                             await db_save_sub(int(user_id_str), data["expires_at"], data["days_total"], True)
                         except Exception as e:
@@ -1074,7 +1570,7 @@ async def check_subscriptions_daily_loop():
                         try:
                             await member.remove_roles(role)
                             try:
-                                await member.send(f"⚠️ Срок действия вашей подписки **Legacy** на сервере **{guild.name}** истек. Для продления напишите **Castro**.")
+                                await member.send(f"⚠️ Срок действия вашей подписки **Legacy** на сервере **{guild.name}** истек. Для продления напишите **@alchemistcastro**.")
                             except Exception:
                                 pass
                         except Exception as e:
