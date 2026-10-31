@@ -465,24 +465,21 @@ class PaywallView(discord.ui.View):
             return
         PAID_REQUEST_COOLDOWN[user.id] = now
         await interaction.response.send_message(
-            "✅ Спасибо! Админ проверит оплату и откроет доступ. Если вопросы — пиши лично @alchemistcastro.",
+            "✅ Спасибо! Заявка отправлена админу — он проверит оплату и откроет доступ. Если вопросы — пиши лично @alchemistcastro.",
             ephemeral=True)
+        # Заявка уходит только владельцу сервера в личные сообщения — в канале ничего не публикуется.
         try:
-            ids = []
-            if interaction.guild and interaction.guild.owner_id:
-                ids.append(interaction.guild.owner_id)
-            for i in PAYWALL_ADMIN_IDS:
-                if i not in ids:
-                    ids.append(i)
-            mentions = " ".join(f"<@{i}>" for i in ids)
-            mod = discord.utils.get(interaction.guild.roles, name="Lite Moderator") if interaction.guild else None
-            if mod:
-                mentions += f" {mod.mention}"
-            await interaction.channel.send(
-                f"{mentions}\n💰 {user.mention} сообщает об оплате. Проверьте платёж и выдайте доступ: "
-                f"`!sub {user.id} 30` / `90` / `360`")
+            owner_id = interaction.guild.owner_id if interaction.guild else None
+            if not owner_id:
+                logger.error("[PAYWALL PAID BUTTON] не удалось определить владельца сервера")
+                return
+            owner = interaction.client.get_user(owner_id) or await interaction.client.fetch_user(owner_id)
+            await owner.send(
+                f"💰 {user.mention} (**{discord.utils.escape_markdown(user.display_name)}**) сообщает об оплате подписки "
+                f"на сервере **{interaction.guild.name}**.\n"
+                f"Проверьте платёж и выдайте доступ: `!sub {user.id} 30` / `90` / `360`")
         except Exception as e:
-            logger.error(f"[PAYWALL PAID BUTTON] {e}")
+            logger.error(f"[PAYWALL PAID BUTTON] не удалось отправить ЛС владельцу: {type(e).__name__}: {e}")
 
 async def send_paywall_notice(client_bot, member=None, attempts=(0, 5, 20)) -> bool:
     """Пишет оповещение о платной подписке в ветку PAYWALL_THREAD_ID (с повторами — прокси иногда рвёт запросы)."""
