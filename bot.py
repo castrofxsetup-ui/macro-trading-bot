@@ -77,6 +77,8 @@ PAYWALL_OPEN = {
     1534103088099496058: ("результаты", True),
     1502292137889501235: ("lounge", False),
     1449056905988149454: ("announcement", True),
+    1551834834639261766: ("фидбек", False),
+    1493200920304160891: ("Open Hall (общие стримы)", False),
 }
 PAYWALL_STATE = {"enabled": False}
 PAYWALL_BACKUP = []          # снимок прав каналов до включения paywall (для отката !paywall off)
@@ -625,6 +627,7 @@ def build_closed_announcement_embed() -> discord.Embed:
         f"• **{t}** — **{p}$**" for t, p, _ in PAYWALL_PRICES), inline=False)
     embed.add_field(name="✅ Остаётся открытым", value=(
         f"• <#1534103088099496058> — результаты\n• <#1502292137889501235> — общий чат\n"
+        f"• <#1551834834639261766> — фидбек\n• <#1493200920304160891> — Open Hall (общие стримы)\n"
         f"• <#{ANNOUNCE_CHANNEL_ID}> — анонсы и важная информация"), inline=False)
     embed.add_field(name="Как оформить подписку", value=(
         f"Свяжись лично с админом сервера: **{PAYMENT_CONTACT}**. Ссылки на оплату он отправляет только в личных сообщениях — "
