@@ -724,6 +724,110 @@ async def paywall_restore(guild) -> dict:
     return {"done": done, "failed": failed}
 
 # ---------------------------------------------------------------------------
+# ТОП АКТИВНОСТИ: кликабельные участники, страницы и выбор человека
+# ---------------------------------------------------------------------------
+XP_PER_MESSAGE = 5
+LEADERBOARD_PAGE_SIZE = 10
+
+def get_ranking(guild) -> list:
+    """[(user_id, xp)] по убыванию XP. Вышедших с сервера скрываем (если список участников загружен)."""
+    items = sorted(USER_XP.items(), key=lambda it: it[1], reverse=True)
+    if guild.chunked:
+        items = [(uid, xp) for uid, xp in items if guild.get_member(uid) is not None]
+    return items
+
+def build_user_rank_embed(guild, user_id: int) -> discord.Embed:
+    ranking = get_ranking(guild)
+    xp = USER_XP.get(user_id, 0)
+    place = next((i for i, (uid, _) in enumerate(ranking, start=1) if uid == user_id), None)
+    member = guild.get_member(user_id)
+    embed = discord.Embed(title="📊 Активность участника", color=discord.Color.gold())
+    embed.description = f"Участник: <@{user_id}>"
+    embed.add_field(name="🏅 Место", value=(f"**{place}** из {len(ranking)}" if place else "—"), inline=True)
+    embed.add_field(name="⚡️ Опыт", value=f"**{xp} XP**", inline=True)
+    embed.add_field(name="💬 Сообщений", value=f"≈ **{xp // XP_PER_MESSAGE}**", inline=True)
+    if place and place > 1:
+        above_xp = ranking[place - 2][1]
+        embed.add_field(name="⬆️ До места выше", value=f"{above_xp - xp + 1} XP (~{max(1, (above_xp - xp) // XP_PER_MESSAGE + 1)} сообщ.)", inline=False)
+    elif place == 1:
+        embed.add_field(name="👑", value="Лидер рейтинга!", inline=False)
+    if member is not None:
+        embed.set_thumbnail(url=member.display_avatar.url)
+    return embed
+
+class LeaderboardSelect(discord.ui.Select):
+    def __init__(self, view_ref):
+        super().__init__(placeholder="👤 Выбери участника — посмотреть его статистику", min_values=1, max_values=1,
+                         options=[discord.SelectOption(label="…", value="0")])
+        self.view_ref = view_ref
+
+    async def callback(self, interaction: discord.Interaction):
+        try:
+            uid = int(self.values[0])
+            await interaction.response.send_message(
+                embed=build_user_rank_embed(self.view_ref.guild, uid), ephemeral=True)
+        except Exception as e:
+            logger.error(f"[LEADERBOARD SELECT] {e}")
+
+class LeaderboardView(discord.ui.View):
+    def __init__(self, guild, ranking, author_id):
+        super().__init__(timeout=600)
+        self.guild = guild
+        self.ranking = ranking
+        self.author_id = author_id
+        self.page = 0
+        self.pages = max(1, (len(ranking) + LEADERBOARD_PAGE_SIZE - 1) // LEADERBOARD_PAGE_SIZE)
+        self.select = LeaderboardSelect(self)
+        self.add_item(self.select)
+        self._sync()
+
+    def _slice(self):
+        start = self.page * LEADERBOARD_PAGE_SIZE
+        return start, self.ranking[start:start + LEADERBOARD_PAGE_SIZE]
+
+    def _sync(self):
+        start, chunk = self._slice()
+        opts = []
+        for offset, (uid, xp) in enumerate(chunk):
+            m = self.guild.get_member(uid)
+            name = (m.display_name if m else f"Участник {uid}")[:70]
+            opts.append(discord.SelectOption(label=f"{start + offset + 1}. {name}", value=str(uid),
+                                             description=f"{xp} XP · ≈{xp // XP_PER_MESSAGE} сообщ."))
+        self.select.options = opts or [discord.SelectOption(label="Пусто", value="0")]
+        self.prev_btn.disabled = self.page <= 0
+        self.next_btn.disabled = self.page >= self.pages - 1
+        self.page_btn.label = f"{self.page + 1}/{self.pages}"
+
+    def make_embed(self) -> discord.Embed:
+        start, chunk = self._slice()
+        medals = ["🥇", "🥈", "🥉"]
+        lines = []
+        for offset, (uid, xp) in enumerate(chunk):
+            idx = start + offset + 1
+            prefix = medals[idx - 1] if idx <= 3 else f"**{idx}.**"
+            lines.append(f"{prefix} <@{uid}> — **{xp} XP** · ≈{xp // XP_PER_MESSAGE} сообщ.")
+        embed = discord.Embed(title="🏆 Рейтинг активности участников", description="\n".join(lines),
+                              color=discord.Color.gold())
+        embed.set_footer(text=f"Страница {self.page + 1}/{self.pages} · участников: {len(self.ranking)} · нажми на имя или выбери в списке")
+        return embed
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, row=1)
+    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = max(0, self.page - 1)
+        self._sync()
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
+    @discord.ui.button(label="1/1", style=discord.ButtonStyle.secondary, disabled=True, row=1)
+    async def page_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, row=1)
+    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.page = min(self.pages - 1, self.page + 1)
+        self._sync()
+        await interaction.response.edit_message(embed=self.make_embed(), view=self)
+
+# ---------------------------------------------------------------------------
 # FACTORY FUNCTION TO CREATE BOT INSTANCE
 # ---------------------------------------------------------------------------
 #
@@ -1220,63 +1324,24 @@ def create_bot(connector=None):
             await ctx.send(f"❌ Ошибка: {type(e).__name__}: {e}")
 
     @new_bot.command(name="rank", aliases=["level", "активность"])
-    async def cmd_rank(ctx):
+    async def cmd_rank(ctx, member: discord.Member = None):
         try:
-            xp = USER_XP.get(ctx.author.id, 0)
-            embed = discord.Embed(
-                title="📊 Статистика активности",
-                description=f"Участник: {ctx.author.mention}\n⚡️ Накоплено опыта (XP): **{xp}**",
-                color=discord.Color.blue()
-            )
-            await ctx.send(embed=embed)
+            target = member or ctx.author
+            await ctx.send(embed=build_user_rank_embed(ctx.guild, target.id))
         except Exception as e:
             logger.error(f"[RANK] {e}")
 
     @new_bot.command(name="leaderboard", aliases=["top", "топ", "рейтинг"])
     async def cmd_leaderboard(ctx):
         try:
-            if not USER_XP:
+            ranking = get_ranking(ctx.guild)
+            if not ranking:
                 await ctx.send("📉 База активности пока пуста. Участники еще не отправляли сообщения.")
                 return
-
-            sorted_users = sorted(USER_XP.items(), key=lambda item: item[1], reverse=True)
-            lines = []
-            medals = ["🥇", "🥈", "🥉"]
-
-            for idx, (user_id, xp) in enumerate(sorted_users, start=1):
-                user = ctx.guild.get_member(user_id)
-                name = user.mention if user else f"Пользователь (ID: {user_id})"
-                prefix = medals[idx - 1] if idx <= 3 else f"**{idx}.**"
-                lines.append(f"{prefix} {name} — **{xp} XP**")
-
-            current_chunk = ""
-            embeds_to_send = []
-
-            for line in lines:
-                if len(current_chunk) + len(line) + 1 > 3800:
-                    embeds_to_send.append(discord.Embed(
-                        title="🏆 Рейтинг активности участников",
-                        description=current_chunk,
-                        color=discord.Color.gold()
-                    ))
-                    current_chunk = line
-                else:
-                    current_chunk += "\n" + line if current_chunk else line
-
-            if current_chunk:
-                embeds_to_send.append(discord.Embed(
-                    title="🏆 Рейтинг активности участников",
-                    description=current_chunk,
-                    color=discord.Color.gold()
-                ))
-
-            for idx, emb in enumerate(embeds_to_send):
-                if idx == len(embeds_to_send) - 1:
-                    emb.set_footer(text=f"Всего участников в списке: {len(sorted_users)} | Активность за сообщения")
-                await ctx.send(embed=emb)
-
+            view = LeaderboardView(ctx.guild, ranking, ctx.author.id)
+            await ctx.send(embed=view.make_embed(), view=view)
         except Exception as e:
-            logger.error(f"[LEADERBOARD] {e}")
+            logger.error(f"[LEADERBOARD] {type(e).__name__}: {e}\n{traceback.format_exc()}")
 
     @new_bot.command(name="clear", aliases=["purge", "очистить"])
     @commands.has_permissions(manage_messages=True)
