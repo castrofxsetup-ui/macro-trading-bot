@@ -70,6 +70,8 @@ PAYWALL_ADMIN_IDS = [int(x) for x in os.getenv("PAYWALL_ADMIN_IDS", "").replace(
 # Роли (имена через запятую), которые сохраняют доступ ко всем разделам помимо Legacy (модераторы и т.п.).
 PAYWALL_EXTRA_ROLES = [x.strip() for x in os.getenv("PAYWALL_EXTRA_ROLES", "Lite Moderator").split(",") if x.strip()]
 PAYWALL_PRICES = [("1 месяц", 75, 30), ("3 месяца", 180, 90), ("12 месяцев", 550, 360)]
+# Роли без подписки: видят только открытые каналы (как @everyone). Полный доступ — только у Legacy.
+RESTRICTED_ROLE_NAMES = ["Trader", "Girl trader", "student by Castro", "macro-trader"]
 ANNOUNCE_CHANNEL_ID = 1449056905988149454
 # Каналы, которые остаются видимыми для всех без подписки: id -> (название, только чтение)
 PAYWALL_OPEN = {
@@ -496,6 +498,17 @@ def _copy_overwrite(ows: dict, target) -> discord.PermissionOverwrite:
         return discord.PermissionOverwrite.from_pair(*ows[target].pair())
     return discord.PermissionOverwrite()
 
+def _paywall_restricted_roles(guild) -> tuple:
+    """(найденные роли, не найденные имена) — поиск без учёта регистра."""
+    found, missing = [], []
+    for name in RESTRICTED_ROLE_NAMES:
+        r = next((x for x in guild.roles if x.name.lower() == name.lower()), None)
+        if r:
+            found.append(r)
+        else:
+            missing.append(name)
+    return found, missing
+
 def _paywall_keep_roles(guild) -> list:
     roles = []
     legacy = discord.utils.get(guild.roles, name="Legacy")
@@ -510,7 +523,7 @@ def _paywall_keep_roles(guild) -> list:
 async def paywall_plan(guild, client_bot) -> dict:
     keep_roles = _paywall_keep_roles(guild)
     legacy = discord.utils.get(guild.roles, name="Legacy")
-    trader = discord.utils.get(guild.roles, name="Trader")
+    restricted, missing_roles = _paywall_restricted_roles(guild)
     open_items = await paywall_resolve(guild, client_bot)
     open_targets = {it["target"].id for it in open_items if it["target"] is not None}
     explicit = {}
@@ -519,7 +532,7 @@ async def paywall_plan(guild, client_bot) -> dict:
             continue
         for target, ow in ch.overwrites.items():
             if (isinstance(target, discord.Role) and target != guild.default_role
-                    and target not in keep_roles and target != trader
+                    and target not in keep_roles and target not in restricted
                     and not target.managed and ow.view_channel is True):
                 explicit[target] = explicit.get(target, 0) + 1
     without = 0
@@ -527,10 +540,13 @@ async def paywall_plan(guild, client_bot) -> dict:
         for m in guild.members:
             if not m.bot and legacy not in m.roles and not m.guild_permissions.administrator:
                 without += 1
-    return {"legacy": legacy, "trader": trader, "open": open_items, "keep_roles": keep_roles,
+    admin_roles = [r for r in guild.roles if r.permissions.administrator and not r.managed
+                   and r != guild.default_role and r not in keep_roles]
+    return {"legacy": legacy, "restricted": restricted, "missing_roles": missing_roles,
+            "admin_roles": admin_roles, "open": open_items, "keep_roles": keep_roles,
             "explicit": explicit, "without": without, "channels": len(guild.channels)}
 
-async def paywall_apply(guild, client_bot, strict: bool = False) -> dict:
+async def paywall_apply(guild, client_bot, strict: bool = True) -> dict:
     plan = await paywall_plan(guild, client_bot)
     if not plan["legacy"]:
         return {"ok": False, "error": "Роль **Legacy** не найдена на сервере."}
@@ -538,7 +554,7 @@ async def paywall_apply(guild, client_bot, strict: bool = False) -> dict:
     if missing:
         return {"ok": False, "error": "Не найдены открытые каналы: " + ", ".join(missing) + ". Проверь ID и доступ бота."}
     open_map = {it["target"].id: it for it in plan["open"]}
-    trader = plan["trader"]
+    restricted = plan["restricted"]
     me = guild.me
     everyone = guild.default_role
     all_backup, failed, done = [], [], 0
@@ -573,13 +589,13 @@ async def paywall_apply(guild, client_bot, strict: bool = False) -> dict:
             ow.view_channel = False
         ows[everyone] = ow
 
-        # Trader: явно видит только открытые каналы (если у роли были прямые разрешения — перекрываем).
-        # Подписчики с Legacy всё равно видят всё: allow роли Legacy сильнее deny роли Trader.
-        if trader is not None:
-            snap(trader)
-            o = _copy_overwrite(ows, trader)
+        # Роли без подписки (Trader, Girl trader, student by Castro, macro-trader): явно видят только открытые каналы.
+        # Подписчики с Legacy всё равно видят всё: allow роли Legacy сильнее deny этих ролей.
+        for r in restricted:
+            snap(r)
+            o = _copy_overwrite(ows, r)
             o.view_channel = True if item else False
-            ows[trader] = o
+            ows[r] = o
 
         for r in plan["keep_roles"]:
             snap(r)
@@ -594,12 +610,16 @@ async def paywall_apply(guild, client_bot, strict: bool = False) -> dict:
             ows[me] = o
 
         if strict and not item:
-            for r in plan["explicit"]:
-                if r in ows and ows[r].view_channel is True:
-                    snap(r)
-                    o = _copy_overwrite(ows, r)
+            for t in list(ows.keys()):
+                if t == everyone or t == me or t in restricted or t in plan["keep_roles"]:
+                    continue
+                if isinstance(t, discord.Role) and t.managed:
+                    continue
+                if ows[t].view_channel is True:
+                    snap(t)
+                    o = _copy_overwrite(ows, t)
                     o.view_channel = None
-                    ows[r] = o
+                    ows[t] = o
 
         try:
             await ch.edit(overwrites=ows, reason="Paywall: доступ только по подписке Legacy")
@@ -1097,7 +1117,7 @@ def create_bot(connector=None):
     @new_bot.command(name="paywall", aliases=["платный_доступ"])
     @commands.has_permissions(administrator=True)
     async def cmd_paywall(ctx, action: str = "", mode: str = ""):
-        """!paywall — предпросмотр | !paywall confirm [strict] — включить | !paywall off — выключить и вернуть права | !paywall test — тест оповещения"""
+        """!paywall — предпросмотр | !paywall confirm — включить | !paywall off — выключить и вернуть права | !paywall test — тест оповещения"""
         action = (action or "").lower()
         try:
             if action in ("", "preview", "status"):
@@ -1117,18 +1137,23 @@ def create_bot(connector=None):
                 keep = ", ".join(r.name for r in plan["keep_roles"]) or "—"
                 embed.add_field(name="Что сделает `!paywall confirm`", value=(
                     f"• Скроет остальные каналы и категории (всего на сервере {plan['channels']}) от всех без Legacy\n"
-                    f"• Роль **Trader** по-прежнему выдаётся при входе, но видит только открытые каналы\n"
+                    f"• Роли без подписки видят только открытые каналы: **{', '.join(r.name for r in plan['restricted']) or '—'}** (и @everyone)\n"
+                    f"• Все остальные роли, а также прямые доступы участников к закрытым каналам снимаются — полный доступ только у Legacy\n"
+                    f"• **Trader** по-прежнему выдаётся при входе\n"
                     f"• Полный доступ у ролей: **{keep}**\n"
                     f"• Без Legacy сейчас **{plan['without']}** участников — они потеряют доступ до оплаты\n"
                     f"• Бот сам напишет анонс-embed в канал анонсов и оповещение в канал подписки"), inline=False)
+                if plan["missing_roles"]:
+                    embed.add_field(name="⚠️ Роли не найдены", value=", ".join(plan["missing_roles"]) + "\nПроверь точное название роли.", inline=False)
                 if plan["explicit"]:
-                    items = "\n".join(f"• **{r.name}** — явный доступ в {n} каналах" for r, n in plan["explicit"].items())
-                    embed.add_field(name="⚠️ Роли с прямым доступом к каналам", value=(
-                        items + "\nЭти роли продолжат видеть свои каналы. Если их тоже нужно закрыть — "
-                        "используй `!paywall confirm strict` (доступ для этих ролей в каналах будет снят; "
-                        "откатывается `!paywall off`)."), inline=False)
+                    items = "\n".join(f"• **{r.name}** — прямой доступ в {n} каналах (будет снят)" for r, n in plan["explicit"].items())
+                    embed.add_field(name="Роли с прямым доступом к каналам", value=items, inline=False)
+                if plan["admin_roles"]:
+                    embed.add_field(name="🚨 Роли с правом Администратор", value=(
+                        ", ".join(r.name for r in plan["admin_roles"]) +
+                        "\nАдминистратора нельзя ограничить каналами: эти роли будут видеть всё. Если это не должно так быть — убери у них право «Администратор»."), inline=False)
                 embed.add_field(name="Команды", value=(
-                    "`!paywall confirm` — включить\n`!paywall confirm strict` — включить и закрыть роли с прямым доступом\n"
+                    "`!paywall confirm` — включить\n"
                     "`!paywall off` — выключить и вернуть прежние права\n`!paywall test` — тестовое оповещение в канал подписки\n"
                     "`!paywall announce` — повторить анонс о закрытии сервера"),
                     inline=False)
@@ -1139,7 +1164,7 @@ def create_bot(connector=None):
                 if not (me.guild_permissions.administrator or (me.guild_permissions.manage_roles and me.guild_permissions.manage_channels)):
                     await ctx.send("❌ Боту нужны права **Управление ролями** и **Управление каналами** (или Администратор).")
                     return
-                strict = (mode or "").lower() == "strict"
+                strict = True
                 await ctx.send("⏳ Применяю платный доступ — это займёт около минуты...")
                 res = await paywall_apply(ctx.guild, new_bot, strict=strict)
                 if not res["ok"]:
@@ -1173,7 +1198,7 @@ def create_bot(connector=None):
                 ok = await send_paywall_notice(new_bot, ctx.author)
                 await ctx.send("✅ Тестовое оповещение отправлено в ветку." if ok else "❌ Не удалось отправить — смотри логи.")
             else:
-                await ctx.send("Использование: `!paywall`, `!paywall confirm [strict]`, `!paywall off`, `!paywall test`, `!paywall announce`")
+                await ctx.send("Использование: `!paywall`, `!paywall confirm`, `!paywall off`, `!paywall test`, `!paywall announce`")
         except Exception as e:
             logger.error(f"[PAYWALL COMMAND] {type(e).__name__}: {e}\n{traceback.format_exc()}")
             await ctx.send(f"❌ Ошибка: {type(e).__name__}: {e}")
