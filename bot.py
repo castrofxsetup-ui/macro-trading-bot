@@ -81,6 +81,7 @@ PAYWALL_OPEN = {
     1449056905988149454: ("announcement", True),
     1551834834639261766: ("фидбек", False),
     1493200920304160891: ("Open Hall (общие стримы)", False),
+    1447282181297672314: ("медиа", False),
 }
 PAYWALL_STATE = {"enabled": False}
 PAYWALL_BACKUP = []          # снимок прав каналов до включения paywall (для отката !paywall off)
@@ -493,6 +494,19 @@ async def paywall_resolve(guild, client_bot) -> list:
         out.append(item)
     return out
 
+def _expand_open(items: list) -> dict:
+    """id канала -> описание. Если открыта категория, открываются и все её каналы."""
+    out = {}
+    for it in items:
+        t = it["target"]
+        if t is None:
+            continue
+        out[t.id] = it
+        if isinstance(t, discord.CategoryChannel):
+            for child in t.channels:
+                out.setdefault(child.id, it)
+    return out
+
 def _copy_overwrite(ows: dict, target) -> discord.PermissionOverwrite:
     if target in ows:
         return discord.PermissionOverwrite.from_pair(*ows[target].pair())
@@ -525,7 +539,7 @@ async def paywall_plan(guild, client_bot) -> dict:
     legacy = discord.utils.get(guild.roles, name="Legacy")
     restricted, missing_roles = _paywall_restricted_roles(guild)
     open_items = await paywall_resolve(guild, client_bot)
-    open_targets = {it["target"].id for it in open_items if it["target"] is not None}
+    open_targets = set(_expand_open(open_items).keys())
     explicit = {}
     for ch in guild.channels:
         if ch.id in open_targets:
@@ -553,7 +567,7 @@ async def paywall_apply(guild, client_bot, strict: bool = True) -> dict:
     missing = [it["label"] + f" ({it['id']})" for it in plan["open"] if it["target"] is None]
     if missing:
         return {"ok": False, "error": "Не найдены открытые каналы: " + ", ".join(missing) + ". Проверь ID и доступ бота."}
-    open_map = {it["target"].id: it for it in plan["open"]}
+    open_map = _expand_open(plan["open"])
     restricted = plan["restricted"]
     me = guild.me
     everyone = guild.default_role
@@ -647,7 +661,7 @@ def build_closed_announcement_embed() -> discord.Embed:
         f"• **{t}** — **{p}$**" for t, p, _ in PAYWALL_PRICES), inline=False)
     embed.add_field(name="✅ Остаётся открытым", value=(
         f"• <#1534103088099496058> — результаты\n• <#1502292137889501235> — общий чат\n"
-        f"• <#1551834834639261766> — фидбек\n• <#1493200920304160891> — Open Hall (общие стримы)\n"
+        f"• <#1551834834639261766> — фидбек\n• <#1493200920304160891> — Open Hall (общие стримы)\n• <#1447282181297672314> — медиа\n"
         f"• <#{ANNOUNCE_CHANNEL_ID}> — анонсы и важная информация"), inline=False)
     embed.add_field(name="Как оформить подписку", value=(
         f"Свяжись лично с админом сервера: **{PAYMENT_CONTACT}**. Ссылки на оплату он отправляет только в личных сообщениях — "
@@ -1131,6 +1145,8 @@ def create_bot(connector=None):
                         lines.append(f"❌ {it['label']} — не найден (ID {it['id']})")
                     else:
                         extra = " (ветка: права задаются на родительском канале)" if it["is_thread"] else ""
+                        if isinstance(it["target"], discord.CategoryChannel):
+                            extra = f" (категория, каналов внутри: {len(it['target'].channels)})"
                         mode_txt = "только чтение" if it["readonly"] else "можно писать"
                         lines.append(f"• {it['obj'].mention} — {it['label']}, {mode_txt}{extra}")
                 embed.add_field(name="Останется открытым для всех", value="\n".join(lines), inline=False)
