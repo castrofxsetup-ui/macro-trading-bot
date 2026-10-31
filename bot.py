@@ -729,6 +729,19 @@ async def paywall_restore(guild) -> dict:
 XP_PER_MESSAGE = 5
 LEADERBOARD_PAGE_SIZE = 10
 
+def member_label(guild, uid: int) -> str:
+    """Имя обычным текстом (упоминания <@id> у клиента Discord не всегда подгружаются и показываются цифрами)."""
+    m = guild.get_member(uid)
+    if m is None:
+        return f"Участник {str(uid)[-4:]} (не на сервере)"
+    name = discord.utils.escape_markdown(discord.utils.escape_mentions(m.display_name))
+    return name[:28]
+
+def member_link(guild, uid: int) -> str:
+    """Имя как кликабельная ссылка на профиль: открывает профиль в приложении Discord, цифры не показываются."""
+    name = member_label(guild, uid).replace("[", "(").replace("]", ")")
+    return f"[{name}](https://discord.com/users/{uid})"
+
 def get_ranking(guild) -> list:
     """[(user_id, xp)] по убыванию XP. Вышедших с сервера скрываем (если список участников загружен)."""
     items = sorted(USER_XP.items(), key=lambda it: it[1], reverse=True)
@@ -742,7 +755,7 @@ def build_user_rank_embed(guild, user_id: int) -> discord.Embed:
     place = next((i for i, (uid, _) in enumerate(ranking, start=1) if uid == user_id), None)
     member = guild.get_member(user_id)
     embed = discord.Embed(title="📊 Активность участника", color=discord.Color.gold())
-    embed.description = f"Участник: <@{user_id}>"
+    embed.description = f"Участник: **{member_link(guild, user_id)}**"
     embed.add_field(name="🏅 Место", value=(f"**{place}** из {len(ranking)}" if place else "—"), inline=True)
     embed.add_field(name="⚡️ Опыт", value=f"**{xp} XP**", inline=True)
     embed.add_field(name="💬 Сообщений", value=f"≈ **{xp // XP_PER_MESSAGE}**", inline=True)
@@ -805,7 +818,7 @@ class LeaderboardView(discord.ui.View):
         for offset, (uid, xp) in enumerate(chunk):
             idx = start + offset + 1
             prefix = medals[idx - 1] if idx <= 3 else f"**{idx}.**"
-            lines.append(f"{prefix} <@{uid}> — **{xp} XP** · ≈{xp // XP_PER_MESSAGE} сообщ.")
+            lines.append(f"{prefix} **{member_link(self.guild, uid)}** — {xp} XP · ≈{xp // XP_PER_MESSAGE} сообщ.")
         embed = discord.Embed(title="🏆 Рейтинг активности участников", description="\n".join(lines),
                               color=discord.Color.gold())
         embed.set_footer(text=f"Страница {self.page + 1}/{self.pages} · участников: {len(self.ranking)} · нажми на имя или выбери в списке")
@@ -1334,6 +1347,11 @@ def create_bot(connector=None):
     @new_bot.command(name="leaderboard", aliases=["top", "топ", "рейтинг"])
     async def cmd_leaderboard(ctx):
         try:
+            if not ctx.guild.chunked:
+                try:
+                    await ctx.guild.chunk()   # подгружаем всех участников, чтобы корректно скрыть вышедших
+                except Exception as e:
+                    logger.warning(f"[LEADERBOARD] chunk: {e}")
             ranking = get_ranking(ctx.guild)
             if not ranking:
                 await ctx.send("📉 База активности пока пуста. Участники еще не отправляли сообщения.")
