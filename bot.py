@@ -4,6 +4,8 @@ import asyncio
 import logging
 import time
 import json
+import io
+import hashlib
 import traceback
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
@@ -113,6 +115,14 @@ PAYWALL_LEGACY_ONLY = [
     1552283434339016734,
     1517911591818100837,
 ]
+PAYWALL_BENEFITS = [
+    "2-4 лайва в неделю — живая торговля",
+    "3 брифинга (пн, ср, пт) с разбором рынка",
+    "Помощь в прохождении проп-фирм",
+    "Ветка mistakes — разбор ошибок и многое другое",
+]
+BENEFITS_TEXT = "\n".join(f"• {b}" for b in PAYWALL_BENEFITS)
+CLOSE_DATE_TEXT = "09.11.2026"
 PAYWALL_STATE = {"enabled": False}
 PAYWALL_BACKUP = []          # снимок прав каналов до включения paywall (для отката !paywall off)
 PAID_REQUEST_COOLDOWN = {}
@@ -204,6 +214,14 @@ async def init_db():
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS poll_responses (
+                    voter_hash TEXT PRIMARY KEY,
+                    data TEXT NOT NULL,
+                    created_at DOUBLE PRECISION NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS poll_contacts (
+                    user_id BIGINT PRIMARY KEY
+                );
                 CREATE TABLE IF NOT EXISTS paywall_backup (
                     channel_id BIGINT NOT NULL,
                     target_id BIGINT NOT NULL,
@@ -220,6 +238,17 @@ async def init_db():
             brows = await conn.fetch("SELECT * FROM paywall_backup;")
             PAYWALL_BACKUP.clear()
             PAYWALL_BACKUP.extend(dict(r) for r in brows)
+
+            POLL_RESPONSES.clear()
+            for r in await conn.fetch("SELECT voter_hash, data FROM poll_responses;"):
+                try:
+                    POLL_RESPONSES[r["voter_hash"]] = json.loads(r["data"])
+                except Exception:
+                    pass
+            POLL_CONTACTS.clear()
+            POLL_CONTACTS.update(r["user_id"] for r in await conn.fetch("SELECT user_id FROM poll_contacts;"))
+            pv = await conn.fetchval("SELECT value FROM settings WHERE key = 'poll_open';")
+            POLL_STATE["open"] = (pv != "0")
 
             rows = await conn.fetch("SELECT user_id, xp FROM user_xp;")
             USER_XP = {row["user_id"]: row["xp"] for row in rows}
@@ -418,9 +447,16 @@ async def db_replace_paywall_backup(rows: list):
         except Exception as e:
             logger.error(f"[DB PAYWALL BACKUP ERROR] {e}")
 
+def owner_contact_link(guild) -> str:
+    """Кликабельный контакт владельца: ссылка открывает его профиль, откуда одной кнопкой пишется личное сообщение."""
+    owner_id = guild.owner_id if guild else None
+    if owner_id:
+        return f"[**{PAYMENT_CONTACT}**](https://discord.com/users/{owner_id})"
+    return f"**{PAYMENT_CONTACT}**"
+
 def build_paywall_embed(member=None, guild=None) -> discord.Embed:
     owner_id = (guild.owner_id if guild else None)
-    owner = f"<@{owner_id}> (**{PAYMENT_CONTACT}**)" if owner_id else f"**{PAYMENT_CONTACT}**"
+    owner = owner_contact_link(guild)
     lines = []
     if member is not None:
         lines.append(f"{member.mention}, ты попал(а) на сервер **Discord-комьюнити по трейдингу The Legacy**.")
@@ -438,6 +474,7 @@ def build_paywall_embed(member=None, guild=None) -> discord.Embed:
         saving = base_month * months - price
         extra = f"  ·  выгода **{saving}$**" if saving > 0 else ""
         price_lines.append(f"• **{title}** — **{price}$**{extra}")
+    embed.add_field(name="✨ Что входит в подписку", value=BENEFITS_TEXT, inline=False)
     embed.add_field(name="💎 Тарифы", value="\n".join(price_lines), inline=False)
     embed.add_field(name="Как получить доступ", value=(
         f"1️⃣ Свяжись с админом сервера: {owner}\n"
@@ -682,7 +719,7 @@ async def paywall_apply(guild, client_bot, strict: bool = True) -> dict:
     await db_set_setting("paywall_enabled", "1")
     return {"ok": True, "done": done, "failed": failed, "total": len(guild.channels)}
 
-def build_closed_announcement_embed() -> discord.Embed:
+def build_closed_announcement_embed(guild=None) -> discord.Embed:
     embed = discord.Embed(
         title="🔒 Бесплатный формат сервера закрыт",
         description=(
@@ -690,6 +727,7 @@ def build_closed_announcement_embed() -> discord.Embed:
             f"Чтобы продолжить пользоваться **всеми разделами и ветками** сервера, перейди в <#{PAYWALL_THREAD_ID}> "
             "и оформи или продли подписку **Legacy**."),
         color=discord.Color.from_rgb(214, 178, 116))
+    embed.add_field(name="✨ Что входит в подписку", value=BENEFITS_TEXT, inline=False)
     embed.add_field(name="💎 Тарифы", value="\n".join(
         f"• **{t}** — **{p}$**" for t, p, _ in PAYWALL_PRICES), inline=False)
     embed.add_field(name="✅ Остаётся открытым", value=(
@@ -698,7 +736,7 @@ def build_closed_announcement_embed() -> discord.Embed:
         f"• <#{ANNOUNCE_CHANNEL_ID}> — анонсы и важная информация\n"
         "• и другие общие каналы сервера"), inline=False)
     embed.add_field(name="Как оформить подписку", value=(
-        f"Свяжись лично с админом сервера: **{PAYMENT_CONTACT}**. Ссылки на оплату он отправляет только в личных сообщениях — "
+        f"Свяжись лично с админом сервера: {owner_contact_link(guild)} (нажми на имя → «Сообщение»). Ссылки на оплату он отправляет только в личных сообщениях — "
         "прямых оплат на сервере и в боте нет."), inline=False)
     embed.set_footer(text="С ролью Legacy открывается доступ ко всему Discord-серверу")
     return embed
@@ -718,7 +756,7 @@ async def send_closed_announcement(client_bot, ping_everyone: bool = True) -> bo
                 content += f" {trader.mention}"
         await ch.send(
             content=content,
-            embed=build_closed_announcement_embed(),
+            embed=build_closed_announcement_embed(ch.guild),
             allowed_mentions=discord.AllowedMentions(everyone=ping_everyone, roles=ping_everyone),
         )
         return True
@@ -875,6 +913,228 @@ class LeaderboardView(discord.ui.View):
         await interaction.response.edit_message(embed=self.make_embed(), view=self)
 
 # ---------------------------------------------------------------------------
+# ОПРОС УЧАСТНИКОВ (анонимный): кнопка в посте -> вопросы в личном (ephemeral) сообщении
+# ---------------------------------------------------------------------------
+POLL_RESPONSES = {}          # voter_hash -> {"q1": [...], "q2": "...", ..., "text": "...", "ready": "..."}
+POLL_CONTACTS = set()        # кто попросил написать лично
+POLL_STATE = {"open": True}
+
+POLL_STEPS = [
+    {"key": "q1", "multi": True,
+     "text": ("Наш сервер и вся работа команды переходит на закрытый формат. Личные позиции и обучения от нашей команды "
+              "теперь в **«Gold Desk»**. Что бы ты хотел, чтобы мы изменили для более комфортного нахождения "
+              "на нашем закрытом сервере?\n*Можно выбрать несколько вариантов*"),
+     "short": "Что хотят изменить",
+     "options": ["Более доступная цена", "Больше лайвов в неделю", "Больше обучения для новичков",
+                 "Больше личной обратной связи", "Больше помощи с проп-фирмами", "Удобнее способ оплаты",
+                 "Чёткие правила и структура каналов", "Другое"]},
+    {"key": "q2", "multi": False, "text": "Что из платного тебе интереснее всего?", "short": "Самое интересное",
+     "options": ["Лайвы с торговлей", "Брифинги с разбором рынка", "Помощь с проп-фирмами", "Разбор ошибок (mistakes)"]},
+    {"key": "q3", "multi": False, "text": "Какая цена за месяц тебе комфортна?", "short": "Комфортная цена за месяц",
+     "options": ["До 30$", "30–50$", "50–75$", "75–100$", "Больше 100$"]},
+    {"key": "q4", "multi": False, "text": "Как тебе удобнее платить?", "short": "Способ оплаты",
+     "options": ["Банковская карта", "Криптовалюта", "Другой способ"]},
+    {"key": "q5", "multi": False, "text": "Какой у тебя опыт в трейдинге?", "short": "Опыт",
+     "options": ["Новичок", "До года", "1–3 года", "Больше 3 лет"]},
+    {"key": "text", "multi": False, "kind": "text",
+     "text": ("Если бы ты решил оплатить подписку на нашем сервере, что бы ты хотел получить взамен от нашей команды?\n"
+              "*Нажми «Написать ответ» (необязательно) и затем «Далее»*")},
+    {"key": "ready", "multi": False, "short": "Готовы перейти на «Gold Desk»",
+     "text": (f"Готов перейти с нами на новый формат сервера **«Gold Desk»**?\n"
+              f"Бесплатный формат сервера полностью закрывается **{CLOSE_DATE_TEXT}**"),
+     "options": ["Да, готов", "Пока думаю", "Нет, не готов"]},
+]
+
+def _voter_hash(uid: int) -> str:
+    return hashlib.sha256(f"{DISCORD_TOKEN or 'legacy'}:{uid}".encode()).hexdigest()
+
+def build_poll_post_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="📋 Опрос: помоги сделать сервер лучше",
+        description=("За год мы вместе построили сильное комьюнити. Теперь я хочу понять, что для тебя важно, и сделать "
+                     "работу на сервере для всех вас удобной и понятной. Опрос займёт **1 минуту**, ответы **анонимные**. "
+                     "Я лично читаю каждый."),
+        color=discord.Color.from_rgb(214, 178, 116))
+    embed.add_field(name="Что входит в подписку на нашем дискорд сервере The Legacy?", value=BENEFITS_TEXT, inline=False)
+    return embed
+
+class PollStartView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="📝 Пройти опрос (1 минута)", style=discord.ButtonStyle.primary, custom_id="legacy_poll_start")
+    async def start_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            if not POLL_STATE["open"]:
+                await interaction.response.send_message("Опрос уже завершён. Спасибо за интерес!", ephemeral=True)
+                return
+            if _voter_hash(interaction.user.id) in POLL_RESPONSES:
+                await interaction.response.send_message("✅ Ты уже прошёл(ла) опрос — спасибо!", ephemeral=True)
+                return
+            flow = PollFlowView(interaction.user.id)
+            await interaction.response.send_message(embed=flow.embed(), view=flow, ephemeral=True)
+        except Exception as e:
+            logger.error(f"[POLL START] {type(e).__name__}: {e}")
+
+class PollSelect(discord.ui.Select):
+    def __init__(self, flow, step):
+        chosen = flow.answers.get(step["key"])
+        chosen_set = set(chosen) if isinstance(chosen, list) else ({chosen} if chosen else set())
+        opts = [discord.SelectOption(label=o, value=o, default=(o in chosen_set)) for o in step["options"]]
+        super().__init__(placeholder="Выбери вариант" + ("ы" if step["multi"] else ""),
+                         min_values=1, max_values=(len(opts) if step["multi"] else 1), options=opts)
+        self.flow = flow
+        self.step = step
+
+    async def callback(self, interaction: discord.Interaction):
+        self.flow.answers[self.step["key"]] = list(self.values) if self.step["multi"] else self.values[0]
+        self.flow.rebuild()
+        await interaction.response.edit_message(embed=self.flow.embed(), view=self.flow)
+
+class PollTextModal(discord.ui.Modal, title="Твой ответ"):
+    answer = discord.ui.TextInput(label="Твой ответ", style=discord.TextStyle.paragraph, required=False,
+                                  max_length=1000, placeholder="Напиши своими словами (можно пропустить)")
+
+    def __init__(self, flow):
+        super().__init__()
+        self.flow = flow
+        self.answer.default = flow.text or None
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self.flow.text = str(self.answer.value or "").strip()
+        self.flow.rebuild()
+        await interaction.response.edit_message(embed=self.flow.embed(), view=self.flow)
+
+class PollFlowView(discord.ui.View):
+    def __init__(self, user_id: int):
+        super().__init__(timeout=900)
+        self.user_id = user_id
+        self.step_i = 0
+        self.answers = {}
+        self.text = ""
+        self.contact = False
+        self.rebuild()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("Это чужой опрос — нажми кнопку под постом, чтобы пройти свой.", ephemeral=True)
+            return False
+        return True
+
+    @property
+    def step(self):
+        return POLL_STEPS[self.step_i]
+
+    def embed(self) -> discord.Embed:
+        st = self.step
+        total = len(POLL_STEPS)
+        emb = discord.Embed(title=f"📋 Вопрос {self.step_i + 1} из {total}", description=st["text"],
+                            color=discord.Color.from_rgb(214, 178, 116))
+        if st["key"] == "text" and self.text:
+            emb.add_field(name="Твой ответ", value=self.text[:1000], inline=False)
+        if st["key"] == "ready":
+            emb.set_footer(text="Ответы анонимные. Галочка ниже — только если хочешь, чтобы я написал(а) тебе лично.")
+        return emb
+
+    def rebuild(self):
+        self.clear_items()
+        st = self.step
+        key = st["key"]
+        if key == "text":
+            b = discord.ui.Button(label="✍️ Написать ответ", style=discord.ButtonStyle.secondary)
+            async def open_modal(interaction: discord.Interaction):
+                await interaction.response.send_modal(PollTextModal(self))
+            b.callback = open_modal
+            self.add_item(b)
+            self._add_next(disabled=False)
+            return
+        self.add_item(PollSelect(self, st))
+        answered = key in self.answers
+        if key == "ready":
+            c = discord.ui.Button(
+                label=("☑ " if self.contact else "☐ ") + "Хочу, чтобы Денис написал мне лично",
+                style=(discord.ButtonStyle.success if self.contact else discord.ButtonStyle.secondary))
+            async def toggle(interaction: discord.Interaction):
+                self.contact = not self.contact
+                self.rebuild()
+                await interaction.response.edit_message(embed=self.embed(), view=self)
+            c.callback = toggle
+            self.add_item(c)
+            s = discord.ui.Button(label="✅ Отправить", style=discord.ButtonStyle.success, disabled=not answered)
+            s.callback = self._submit
+            self.add_item(s)
+        else:
+            self._add_next(disabled=not answered)
+
+    def _add_next(self, disabled: bool):
+        n = discord.ui.Button(label="Далее →", style=discord.ButtonStyle.primary, disabled=disabled)
+        async def go(interaction: discord.Interaction):
+            self.step_i += 1
+            self.rebuild()
+            await interaction.response.edit_message(embed=self.embed(), view=self)
+        n.callback = go
+        self.add_item(n)
+
+    async def _submit(self, interaction: discord.Interaction):
+        h = _voter_hash(self.user_id)
+        if h in POLL_RESPONSES or not POLL_STATE["open"]:
+            await interaction.response.edit_message(content="Опрос уже завершён или ответ уже принят.", embed=None, view=None)
+            return
+        record = dict(self.answers)
+        record["text"] = self.text
+        POLL_RESPONSES[h] = record
+        if self.contact:
+            POLL_CONTACTS.add(self.user_id)
+        if db_pool:
+            try:
+                async with db_pool.acquire() as conn:
+                    await conn.execute("INSERT INTO poll_responses (voter_hash, data, created_at) VALUES ($1, $2, $3) "
+                                       "ON CONFLICT (voter_hash) DO NOTHING;", h, json.dumps(record, ensure_ascii=False), time.time())
+                    if self.contact:
+                        await conn.execute("INSERT INTO poll_contacts (user_id) VALUES ($1) ON CONFLICT DO NOTHING;", self.user_id)
+            except Exception as e:
+                logger.error(f"[POLL SAVE] {type(e).__name__}: {e}")
+        done = discord.Embed(
+            title="🙏 Спасибо!",
+            description="Ответы приняты. Я лично прочитаю каждый." + ("\nЯ напишу тебе в личные сообщения." if self.contact else ""),
+            color=discord.Color.green())
+        await interaction.response.edit_message(embed=done, view=None)
+        self.stop()
+
+def _bar(p: float) -> str:
+    filled = int(round(p / 10))
+    return "█" * filled + "░" * (10 - filled)
+
+def build_poll_results(guild):
+    """(embed, текстовый файл с ответами)"""
+    n = len(POLL_RESPONSES)
+    emb = discord.Embed(title="📊 Результаты опроса", color=discord.Color.gold(),
+                        description=f"Прошли опрос: **{n}** · просят написать лично: **{len(POLL_CONTACTS)}**\n"
+                                    f"Статус: **{'открыт' if POLL_STATE['open'] else 'закрыт'}**")
+    for st in POLL_STEPS:
+        if st.get("kind") == "text":
+            continue
+        counts = {o: 0 for o in st["options"]}
+        for rec in POLL_RESPONSES.values():
+            v = rec.get(st["key"])
+            for o in (v if isinstance(v, list) else ([v] if v else [])):
+                if o in counts:
+                    counts[o] += 1
+        lines = []
+        for o, c in sorted(counts.items(), key=lambda kv: kv[1], reverse=True):
+            p = (c * 100 / n) if n else 0
+            lines.append(f"`{_bar(p)}` **{p:.0f}%** · {o} ({c})")
+        emb.add_field(name=st["short"], value="\n".join(lines)[:1024], inline=False)
+    texts = [r["text"] for r in POLL_RESPONSES.values() if r.get("text")]
+    body = [f"Ответы на вопрос «что бы ты хотел получить взамен от команды» — {len(texts)} шт.\n"]
+    body += [f"{i}. {t}\n" for i, t in enumerate(texts, start=1)]
+    body.append("\nПросят написать лично:\n")
+    for uid in POLL_CONTACTS:
+        m = guild.get_member(uid) if guild else None
+        body.append(f"- {m.display_name if m else 'не на сервере'} · https://discord.com/users/{uid}\n")
+    return emb, "".join(body)
+
+# ---------------------------------------------------------------------------
 # FACTORY FUNCTION TO CREATE BOT INSTANCE
 # ---------------------------------------------------------------------------
 #
@@ -921,6 +1181,7 @@ def create_bot(connector=None):
         logger.info(f"✅ Успешный вход: {new_bot.user} (ID: {new_bot.user.id})")
         if not getattr(new_bot, "_paywall_view_added", False):
             new_bot.add_view(PaywallView())   # чтобы кнопка «Я оплатил(а)» работала и после перезапуска
+            new_bot.add_view(PollStartView())  # и кнопка опроса
             new_bot._paywall_view_added = True
         try:
             # Без force_refresh: если в БД свежий кэш новостей — берём его и
@@ -1389,6 +1650,38 @@ def create_bot(connector=None):
                 await ctx.send("Использование: `!paywall`, `!paywall confirm`, `!paywall off`, `!paywall test`, `!paywall announce`")
         except Exception as e:
             logger.error(f"[PAYWALL COMMAND] {type(e).__name__}: {e}\n{traceback.format_exc()}")
+            await ctx.send(f"❌ Ошибка: {type(e).__name__}: {e}")
+
+    @new_bot.command(name="poll", aliases=["опрос"])
+    @commands.has_permissions(administrator=True)
+    async def cmd_poll(ctx, action: str = "", channel: discord.TextChannel = None):
+        """!poll post [#канал] — выложить опрос | !poll results — результаты в личку | !poll close / open — закрыть / открыть опрос"""
+        action = (action or "").lower()
+        try:
+            if action == "post":
+                target = channel or ctx.channel
+                await target.send(embed=build_poll_post_embed(), view=PollStartView())
+                POLL_STATE["open"] = True
+                await db_set_setting("poll_open", "1")
+                if target.id != ctx.channel.id:
+                    await ctx.send(f"✅ Опрос опубликован в {target.mention}.")
+            elif action == "results":
+                emb, text = build_poll_results(ctx.guild)
+                file = discord.File(io.BytesIO(text.encode("utf-8")), filename="poll_answers.txt")
+                try:
+                    await ctx.author.send(embed=emb, file=file)
+                    if ctx.guild:
+                        await ctx.send("📩 Результаты отправил тебе в личные сообщения.")
+                except Exception:
+                    await ctx.send("❌ Не получилось написать в личку — открой личные сообщения от участников сервера и повтори.")
+            elif action in ("close", "open"):
+                POLL_STATE["open"] = (action == "open")
+                await db_set_setting("poll_open", "1" if action == "open" else "0")
+                await ctx.send("✅ Опрос открыт." if action == "open" else "✅ Опрос закрыт: новые ответы не принимаются.")
+            else:
+                await ctx.send("Использование: `!poll post [#канал]`, `!poll results`, `!poll close`, `!poll open`")
+        except Exception as e:
+            logger.error(f"[POLL COMMAND] {type(e).__name__}: {e}\n{traceback.format_exc()}")
             await ctx.send(f"❌ Ошибка: {type(e).__name__}: {e}")
 
     @new_bot.command(name="rank", aliases=["level", "активность"])
