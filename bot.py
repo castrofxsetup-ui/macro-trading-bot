@@ -57,7 +57,16 @@ FREE_PROXY_SOURCES = [
     ("socks5", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt"),
     ("socks5", "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt"),
     ("http", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt"),
+    ("socks4", "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt"),
+    ("socks5", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt"),
+    ("http", "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"),
+    ("socks5", "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt"),
+    ("http", "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=6000&country=all"),
 ]
+# Если связи с Discord нет дольше этого времени (минут) — процесс сам перезапускается
+# (Render поднимет контейнер заново; это иногда даёт другой исходящий IP). 0 = выключить.
+RESTART_AFTER_DOWN_MINUTES = int(os.getenv("RESTART_AFTER_DOWN_MINUTES", "30"))
+LAST_GOOD_PROXY = {"url": None}   # последний рабочий бесплатный прокси — пробуем первым
 CONN_STATE = {"down_since": None}
 
 # --- Платный доступ (paywall) ----------------------------------------------
@@ -1172,10 +1181,12 @@ def create_bot(connector=None):
     @new_bot.event
     async def on_resumed():
         CONN_STATE["down_since"] = None
+        CONN_STATE["last_up"] = time.time()
 
     @new_bot.event
     async def on_ready():
         CONN_STATE["down_since"] = None
+        CONN_STATE["last_up"] = time.time()
         logger.info(f"✅ Успешный вход: {new_bot.user} (ID: {new_bot.user.id})")
         if not getattr(new_bot, "_paywall_view_added", False):
             new_bot.add_view(PaywallView())   # чтобы кнопка «Я оплатил(а)» работала и после перезапуска
@@ -2251,7 +2262,10 @@ async def probe_discord(proxy_url, timeout: int = 10) -> bool:
         async with aiohttp.ClientSession(connector=connector, timeout=to) as session:
             async with session.get("https://discord.com/api/v10/gateway") as resp:
                 if resp.status != 200:
-                    logger.warning(f"[PROBE] {mask_proxy(proxy_url)}: HTTP {resp.status}")
+                    hint = ""
+                    if resp.status in (403, 429, 1015):
+                        hint = " (IP заблокирован/ограничен Discord-Cloudflare — нужно подождать или сменить IP)"
+                    logger.warning(f"[PROBE] {mask_proxy(proxy_url)}: HTTP {resp.status}{hint}")
                     return False
                 data = await resp.json(content_type=None)
                 return isinstance(data, dict) and "url" in data
@@ -2259,7 +2273,7 @@ async def probe_discord(proxy_url, timeout: int = 10) -> bool:
         logger.warning(f"[PROBE] {mask_proxy(proxy_url)}: {type(e).__name__}: {str(e)[:120] or '(пусто)'}")
         return False
 
-async def fetch_free_proxy_candidates(limit: int = 120) -> list:
+async def fetch_free_proxy_candidates(limit: int = 300) -> list:
     """Скачивает публичные списки бесплатных прокси (ip:port) и возвращает случайную выборку URL."""
     import random
     import re
@@ -2282,7 +2296,7 @@ async def fetch_free_proxy_candidates(limit: int = 120) -> list:
     random.shuffle(found)
     return found[:limit]
 
-async def find_working_free_proxy(concurrency: int = 25):
+async def find_working_free_proxy(concurrency: int = 40):
     """Быстро проверяет бесплатные прокси параллельно и возвращает первый рабочий (или None)."""
     candidates = await fetch_free_proxy_candidates()
     if not candidates:
@@ -2322,8 +2336,12 @@ async def choose_connection():
             return ("прямое подключение (без прокси)", None, False)
         logger.warning("⚠️ Прямое подключение к Discord не работает.")
     if USE_FREE_PROXIES:
-        free = await find_working_free_proxy()
+        lg = LAST_GOOD_PROXY["url"]
+        free = lg if (lg and await probe_discord(lg, timeout=8)) else None
+        if not free:
+            free = await find_working_free_proxy()
         if free:
+            LAST_GOOD_PROXY["url"] = free
             return (f"бесплатный прокси ({mask_proxy(free)}) — ВРЕМЕННО", free, False)
         logger.warning("⚠️ Рабочих бесплатных прокси не нашлось.")
     return None
@@ -2345,13 +2363,18 @@ async def run_bot_once(label: str, proxy_url, is_primary: bool):
         while not start_task.done():
             await asyncio.sleep(15)
             ds = CONN_STATE["down_since"]
+            if ds is None:
+                CONN_STATE["last_up"] = time.time()   # пока связь есть — обновляем «последний раз был онлайн»
             if ds and time.time() - ds > FAILOVER_AFTER_SECONDS:
                 reason = f"нет связи с Discord уже {int(time.time() - ds)} с"
                 break
-            if (not is_primary) and PAID_PROXIES and time.time() - last_primary_check > PRIMARY_RECHECK_SECONDS:
+            if (not is_primary) and time.time() - last_primary_check > PRIMARY_RECHECK_SECONDS:
                 last_primary_check = time.time()
-                if await probe_discord(PAID_PROXIES[0]):
+                if PAID_PROXIES and await probe_discord(PAID_PROXIES[0]):
                     reason = "основной платный прокси снова работает — возвращаюсь на него"
+                    break
+                if proxy_url is not None and USE_DIRECT_FALLBACK and await probe_discord(None):
+                    reason = "прямое подключение к Discord снова работает — возвращаюсь на него"
                     break
     finally:
         if reason:
@@ -2378,12 +2401,29 @@ async def main():
     if not PAID_PROXIES:
         logger.warning("⚠️ Платный прокси не задан (PROXY_URL) — будут пробоваться запасные способы.")
 
+    import random
+    fail_streak = 0
+    started_at = time.time()
     while True:
+        last_ok = CONN_STATE.get("last_up") or started_at
+        if RESTART_AFTER_DOWN_MINUTES and time.time() - last_ok > RESTART_AFTER_DOWN_MINUTES * 60 \
+                and time.time() - started_at > RESTART_AFTER_DOWN_MINUTES * 60:
+            logger.critical(f"♻️ Нет связи с Discord больше {RESTART_AFTER_DOWN_MINUTES} мин — перезапускаю процесс (новый контейнер может получить другой IP).")
+            logging.shutdown()
+            os._exit(1)
         choice = await choose_connection()
         if not choice:
-            logger.error("❌ Ни один способ подключения к Discord сейчас не работает. Повторная проверка через 60 секунд.")
-            await asyncio.sleep(60)
+            # Экспоненциальная пауза 30с -> 1м -> 2м -> 4м -> 5м (+ случайная добавка).
+            # Частые проверки/входы с заблокированного IP только продлевают бан.
+            fail_streak += 1
+            delay = min(30 * (2 ** min(fail_streak - 1, 4)), 300) + random.randint(0, 20)
+            logger.error(
+                f"❌ Ни один способ подключения к Discord сейчас не работает (попытка {fail_streak}). "
+                f"Повторная проверка через {delay} с. Если IP хостинга заблокирован — подождите, не перезапускайте сервис."
+            )
+            await asyncio.sleep(delay)
             continue
+        fail_streak = 0
 
         label, proxy_url, is_primary = choice
         try:
