@@ -493,6 +493,56 @@ def build_paywall_embed(member=None, guild=None) -> discord.Embed:
     embed.set_footer(text="Подписка на 30 / 90 / 360 дней · с ролью Legacy открывается доступ ко всему Discord-серверу")
     return embed
 
+
+# --- Оповещения о сроке подписки (ЛС участнику + отчёт владельцу) ------------
+SUB_NOTIFY_FAILED = set()   # (user_id, expires_at) — о недоставке владельцу уже сообщили
+
+def _renew_fields(embed: discord.Embed, guild) -> discord.Embed:
+    base_month = PAYWALL_PRICES[0][1]
+    price_lines = []
+    for title, price, days in PAYWALL_PRICES:
+        months = max(1, round(days / 30))
+        saving = base_month * months - price
+        extra = f"  ·  выгода **{saving}$**" if saving > 0 else ""
+        price_lines.append(f"• **{title}** — **{price}$**{extra}")
+    embed.add_field(name="💎 Тарифы продления", value="\n".join(price_lines), inline=False)
+    embed.add_field(name="Как продлить", value=(
+        f"Напиши лично администратору: {owner_contact_link(guild)}\n"
+        "Ссылку на оплату он отправит **только в личных сообщениях** — в боте и на сервере прямых оплат нет."), inline=False)
+    return embed
+
+def build_sub_reminder_embed(guild, expires_at: datetime, hours_left: float) -> discord.Embed:
+    expires_str = expires_at.astimezone(MSK_TZ).strftime("%d.%m.%Y в %H:%M")
+    when = "завтра" if hours_left >= 12 else "сегодня"
+    embed = discord.Embed(
+        title="⏳ Подписка Legacy скоро закончится",
+        description=(f"Твоя подписка **Legacy** на сервере **{guild.name}** истекает **{when}** — **{expires_str} МСК**.\n\n"
+                     "Чтобы не потерять доступ к закрытым веткам **Gold Desk**, лайвам, брифингам и разбору ошибок — продли подписку заранее."),
+        color=discord.Color.from_rgb(214, 178, 116))
+    _renew_fields(embed, guild)
+    embed.set_footer(text="После окончания срока роль Legacy снимается автоматически")
+    return embed
+
+def build_sub_expired_embed(guild) -> discord.Embed:
+    embed = discord.Embed(
+        title="🔒 Подписка Legacy закончилась",
+        description=(f"Срок твоей подписки **Legacy** на сервере **{guild.name}** истёк, роль снята.\n\n"
+                     "Закрытые ветки **Gold Desk** сейчас недоступны. Вернуть доступ можно в любой момент — продли подписку."),
+        color=discord.Color.from_rgb(214, 178, 116))
+    _renew_fields(embed, guild)
+    return embed
+
+async def notify_owner_dm(guild, text: str):
+    """Короткое сообщение владельцу сервера в личку (ошибки доставки и т.п.)."""
+    try:
+        owner_id = guild.owner_id if guild else None
+        if not owner_id or not bot:
+            return
+        owner = bot.get_user(owner_id) or await bot.fetch_user(owner_id)
+        await owner.send(text)
+    except Exception as e:
+        logger.error(f"[OWNER DM] не удалось написать владельцу: {type(e).__name__}: {e}")
+
 class PaywallView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -2028,19 +2078,29 @@ async def check_subscriptions_daily_loop():
 
             if expires_at <= now:
                 to_remove.append(int(user_id_str))
-            elif 20 <= hours_left <= 26 and not data.get("notified_1day", False):
+            elif 0 < hours_left <= 26 and not data.get("notified_1day", False):
+                # Окно «до 26 часов» (а не «20–26»): если бот лежал и пропустил момент, напоминание всё равно уйдёт.
+                delivered = False
                 for guild in bot.guilds:
                     member = guild.get_member(int(user_id_str))
-                    if member:
-                        try:
-                            expires_str = expires_at.astimezone(MSK_TZ).strftime("%d.%m.%Y в %H:%M")
-                            await member.send(
-                                f"⚠️ Напоминание: Срок действия вашей подписки **Legacy** на сервере **{guild.name}** истекает завтра (**{expires_str} МСК**).\n"
-                                f"Для продления подписки напишите администратору **@alchemistcastro**."
-                            )
-                            await db_save_sub(int(user_id_str), data["expires_at"], data["days_total"], True)
-                        except Exception as e:
-                            logger.error(f"[SUB NOTIFY ERROR] {e}")
+                    if not member:
+                        continue
+                    try:
+                        await member.send(embed=build_sub_reminder_embed(guild, expires_at, hours_left))
+                        delivered = True
+                    except discord.Forbidden:
+                        key = (int(user_id_str), data["expires_at"])
+                        if key not in SUB_NOTIFY_FAILED:
+                            SUB_NOTIFY_FAILED.add(key)
+                            exp = expires_at.astimezone(MSK_TZ).strftime("%d.%m.%Y в %H:%M")
+                            await notify_owner_dm(guild,
+                                f"⚠️ Не удалось отправить напоминание о подписке: у {member.mention} "
+                                f"(**{discord.utils.escape_markdown(member.display_name)}**) закрыты личные сообщения.\n"
+                                f"Подписка истекает **{exp} МСК** — напишите ему сами.")
+                    except Exception as e:
+                        logger.error(f"[SUB NOTIFY ERROR] {type(e).__name__}: {e}")
+                if delivered:
+                    await db_save_sub(int(user_id_str), data["expires_at"], data["days_total"], True)
 
         if to_remove:
             for guild in bot.guilds:
@@ -2054,7 +2114,11 @@ async def check_subscriptions_daily_loop():
                         try:
                             await member.remove_roles(role)
                             try:
-                                await member.send(f"⚠️ Срок действия вашей подписки **Legacy** на сервере **{guild.name}** истек. Для продления напишите **@alchemistcastro**.")
+                                await member.send(embed=build_sub_expired_embed(guild))
+                            except discord.Forbidden:
+                                await notify_owner_dm(guild,
+                                    f"⚠️ У {member.mention} (**{discord.utils.escape_markdown(member.display_name)}**) закончилась подписка Legacy, "
+                                    f"роль снята, но личные сообщения закрыты — уведомление не доставлено.")
                             except Exception:
                                 pass
                         except Exception as e:
