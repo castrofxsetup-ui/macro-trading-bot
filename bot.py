@@ -1599,6 +1599,75 @@ def create_bot(connector=None):
             logger.error(f"[SUBSLIST ERROR] {e}")
             await ctx.send(f"❌ Ошибка при чтении подписок: {e}")
 
+    # --- Сообщения от имени бота (только администраторы) ---------------------------
+    @new_bot.command(name="expired", aliases=["закончилась", "окончание"])
+    @commands.has_permissions(administrator=True)
+    async def cmd_expired(ctx, member: discord.Member = None):
+        """!expired @участник — отправить в ЛС плашку «Подписка Legacy закончилась» (роль не трогает)."""
+        if member is None:
+            await ctx.send("Использование: `!expired @участник`")
+            return
+        try:
+            await member.send(embed=build_sub_expired_embed(ctx.guild))
+            await ctx.send(f"✅ Уведомление об окончании подписки отправлено {member.mention} в личные сообщения.")
+        except discord.Forbidden:
+            await ctx.send(f"❌ У {member.mention} закрыты личные сообщения — бот не может написать. Напишите ему сами.")
+        except Exception as e:
+            await ctx.send(f"❌ Не удалось отправить: {type(e).__name__}: {e}")
+
+    @new_bot.command(name="remind", aliases=["напомнить"])
+    @commands.has_permissions(administrator=True)
+    async def cmd_remind(ctx, member: discord.Member = None):
+        """!remind @участник — отправить в ЛС плашку «Подписка скоро закончится» (по сроку из базы)."""
+        if member is None:
+            await ctx.send("Использование: `!remind @участник`")
+            return
+        try:
+            subs = await db_load_subs()
+            data = subs.get(str(member.id))
+            if not data:
+                await ctx.send(f"❌ У {member.mention} нет записи о подписке (выдавалась не через `!sub`).")
+                return
+            expires_at = datetime.fromisoformat(data["expires_at"])
+            hours_left = (expires_at - datetime.now(timezone.utc)).total_seconds() / 3600.0
+            await member.send(embed=build_sub_reminder_embed(ctx.guild, expires_at, max(hours_left, 12)))
+            await ctx.send(f"✅ Напоминание отправлено {member.mention} в личные сообщения.")
+        except discord.Forbidden:
+            await ctx.send(f"❌ У {member.mention} закрыты личные сообщения — бот не может написать.")
+        except Exception as e:
+            await ctx.send(f"❌ Не удалось отправить: {type(e).__name__}: {e}")
+
+    @new_bot.command(name="dm", aliases=["лс"])
+    @commands.has_permissions(administrator=True)
+    async def cmd_dm(ctx, member: discord.Member = None, *, text: str = ""):
+        """!dm @участник текст — написать участнику в личку от имени бота."""
+        if member is None or not text.strip():
+            await ctx.send("Использование: `!dm @участник текст сообщения`")
+            return
+        try:
+            await member.send(text)
+            await ctx.send(f"✅ Сообщение отправлено {member.mention} в личные сообщения.")
+        except discord.Forbidden:
+            await ctx.send(f"❌ У {member.mention} закрыты личные сообщения.")
+        except Exception as e:
+            await ctx.send(f"❌ Не удалось отправить: {type(e).__name__}: {e}")
+
+    @new_bot.command(name="say", aliases=["сказать"])
+    @commands.has_permissions(administrator=True)
+    async def cmd_say(ctx, channel: discord.TextChannel = None, *, text: str = ""):
+        """!say #канал текст — написать в канал от имени бота."""
+        if channel is None or not text.strip():
+            await ctx.send("Использование: `!say #канал текст сообщения`")
+            return
+        try:
+            await channel.send(text)
+            try:
+                await ctx.message.delete()
+            except Exception:
+                await ctx.send(f"✅ Отправлено в {channel.mention}.")
+        except Exception as e:
+            await ctx.send(f"❌ Не удалось отправить: {type(e).__name__}: {e}")
+
     @new_bot.command(name="paywall", aliases=["платный_доступ"])
     @commands.has_permissions(administrator=True)
     async def cmd_paywall(ctx, action: str = "", mode: str = ""):
