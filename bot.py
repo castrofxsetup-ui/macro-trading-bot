@@ -190,6 +190,22 @@ USER_XP = {}
 # ---------------------------------------------------------------------------
 # POSTGRESQL DATABASE HELPERS
 # ---------------------------------------------------------------------------
+DB_STATE = {"ok": True}
+
+def normalize_db_url(raw: str) -> str:
+    """Приводит строку подключения к виду, который понимает asyncpg (Neon/Supabase/Render и т.д.)."""
+    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+    url = raw.strip().replace("postgres://", "postgresql://", 1)
+    parts = urlsplit(url)
+    # параметры, которых asyncpg не знает (иначе ошибка «unrecognized configuration parameter»)
+    drop = {"channel_binding", "options", "pgbouncer", "connect_timeout"}
+    q = [(k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True) if k not in drop]
+    keys = {k for k, _ in q}
+    host = (parts.hostname or "").lower()
+    if "sslmode" not in keys and "ssl" not in keys and host not in ("localhost", "127.0.0.1", ""):
+        q.append(("sslmode", "require"))   # облачные базы требуют SSL
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(q), parts.fragment))
+
 async def init_db():
     global db_pool, USER_XP
     if not DATABASE_URL:
@@ -197,8 +213,19 @@ async def init_db():
         return
 
     try:
-        url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-        db_pool = await asyncpg.create_pool(dsn=url)
+        if db_pool is not None:
+            try:
+                await db_pool.close()
+            except Exception:
+                pass
+            db_pool = None
+        url = normalize_db_url(DATABASE_URL)
+        # min_size=1 и короткая жизнь простаивающих соединений: бесплатные базы (Neon и др.)
+        # «засыпают» и рвут соединения — пул не должен держать мёртвые.
+        db_pool = await asyncpg.create_pool(dsn=url, min_size=1, max_size=5,
+                                            max_inactive_connection_lifetime=45,
+                                            command_timeout=30, timeout=30)
+        DB_STATE["ok"] = True
 
         async with db_pool.acquire() as conn:
             await conn.execute("""
@@ -263,6 +290,8 @@ async def init_db():
         logger.info("✅ Успешное подключение к PostgreSQL БД и загрузка данных!")
     except Exception as e:
         logger.error(f"❌ Ошибка подключения к базе данных: {e}")
+        DB_STATE["ok"] = False
+        db_pool = None
         return
 
     await db_load_news_cache()
@@ -325,10 +354,12 @@ async def add_user_xp(user_id: int, amount: int = 5):
 
 async def db_load_subs() -> dict:
     if not db_pool:
+        DB_STATE["ok"] = False
         return {}
     try:
         async with db_pool.acquire() as conn:
             rows = await conn.fetch("SELECT user_id, expires_at, days_total, notified_1day FROM subscriptions;")
+            DB_STATE["ok"] = True
             return {
                 str(row["user_id"]): {
                     "expires_at": row["expires_at"],
@@ -339,6 +370,7 @@ async def db_load_subs() -> dict:
             }
     except Exception as e:
         logger.error(f"[DB SUBS LOAD ERROR] {e}")
+        DB_STATE["ok"] = False
         return {}
 
 async def db_save_sub(user_id: int, expires_at: str, days_total: int, notified: bool):
@@ -1564,6 +1596,10 @@ def create_bot(connector=None):
     async def cmd_subslist(ctx):
         try:
             subs = await db_load_subs()
+            if not DB_STATE["ok"]:
+                await ctx.send("❌ **База данных недоступна** — подписки сейчас прочитать нельзя (это не значит, что их нет). "
+                               "Проверьте `DATABASE_URL` и состояние базы на хостинге; подробности — в логах.")
+                return
             if not subs:
                 await ctx.send("📉 База данных подписок пуста.")
                 return
@@ -2530,6 +2566,18 @@ async def run_bot_once(label: str, proxy_url, is_primary: bool):
 async def main():
     await start_web_server()
     await init_db()
+
+    async def _db_reconnect_loop():
+        # если база была недоступна при старте или пропала — пробуем подключиться снова каждые 60 с
+        while True:
+            await asyncio.sleep(60)
+            if DATABASE_URL and (db_pool is None or not DB_STATE["ok"]):
+                logger.warning("🔁 Повторная попытка подключения к базе данных...")
+                try:
+                    await init_db()
+                except Exception as e:
+                    logger.error(f"[DB RECONNECT] {type(e).__name__}: {e}")
+    asyncio.create_task(_db_reconnect_loop())
 
     if not PAID_PROXIES:
         logger.warning("⚠️ Платный прокси не задан (PROXY_URL) — будут пробоваться запасные способы.")
