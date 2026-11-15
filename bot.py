@@ -469,6 +469,96 @@ async def db_set_setting(key: str, value: str):
         except Exception as e:
             logger.error(f"[DB SETTING ERROR] {e}")
 
+
+# --- Резервные копии базы данных ----------------------------------------------
+# Раз в сутки бот выгружает ВСЕ таблицы в один JSON-файл и присылает владельцу в личку.
+# Восстановление: команда !restore с этим файлом во вложении (см. cmd_restore).
+BACKUP_HOUR_MSK = int(os.getenv("BACKUP_HOUR_MSK", "5"))   # во сколько по МСК делать копию
+
+async def db_export_all() -> dict:
+    """Выгружает все таблицы схемы public в словарь {таблица: [строки]}."""
+    out = {"_meta": {"created_at": datetime.now(timezone.utc).isoformat(), "format": 1}, "tables": {}}
+    async with db_pool.acquire() as conn:
+        names = [r["tablename"] for r in await conn.fetch("SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY 1;")]
+        for name in names:
+            q = f'SELECT COALESCE(jsonb_agg(t), \'[]\'::jsonb) FROM "{name}" t;'
+            raw = await conn.fetchval(q)
+            out["tables"][name] = json.loads(raw) if isinstance(raw, str) else raw
+    return out
+
+def backup_to_file(data: dict, label: str = ""):
+    """Возвращает (discord.File, размер_в_байтах, сводка_строкой)."""
+    import gzip
+    raw = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+    day = datetime.now(MSK_TZ).strftime("%Y-%m-%d_%H%M")
+    name = f"legacy_backup_{day}{label}.json"
+    if len(raw) > 7 * 1024 * 1024:
+        raw = gzip.compress(raw)
+        name += ".gz"
+    summary = ", ".join(f"{t}: {len(rows)}" for t, rows in data["tables"].items() if t != "news_cache")
+    return discord.File(io.BytesIO(raw), filename=name), len(raw), summary
+
+async def db_restore_all(data: dict, replace: bool = False) -> list:
+    """Заливает выгрузку в базу. replace=True — таблицы сначала очищаются; иначе существующие строки не трогаются."""
+    report = []
+    tables = data.get("tables", {})
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():
+            existing = {r["tablename"] for r in await conn.fetch("SELECT tablename FROM pg_tables WHERE schemaname = 'public';")}
+            for name, rows in tables.items():
+                if name not in existing or name == "news_cache":
+                    continue
+                if not rows:
+                    continue
+                if replace:
+                    await conn.execute(f'TRUNCATE TABLE "{name}";')
+                else:
+                    has_pk = await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = $1::regclass AND i.indisprimary);", f'public."{name}"')
+                    cnt = await conn.fetchval(f'SELECT COUNT(*) FROM "{name}";')
+                    if not has_pk and cnt:
+                        report.append(f"{name}: пропущено (таблица без ключа уже содержит данные)")
+                        continue
+                await conn.execute(
+                    f'INSERT INTO "{name}" SELECT * FROM jsonb_populate_recordset(NULL::"{name}", $1::jsonb) ON CONFLICT DO NOTHING;',
+                    json.dumps(rows, ensure_ascii=False))
+                report.append(f"{name}: {len(rows)} строк")
+    return report
+
+async def run_daily_backup(force: bool = False) -> bool:
+    """Делает копию и шлёт владельцу в личку. Без force — не чаще раза в сутки (учёт в таблице settings)."""
+    if not db_pool or not bot or not bot.guilds:
+        return False
+    today = datetime.now(MSK_TZ).strftime("%Y-%m-%d")
+    if not force:
+        try:
+            async with db_pool.acquire() as conn:
+                last = await conn.fetchval("SELECT value FROM settings WHERE key = 'last_backup_date';")
+            if last == today:
+                return False
+        except Exception as e:
+            logger.error(f"[BACKUP] не удалось прочитать дату последней копии: {e}")
+            return False
+    guild = bot.guilds[0]
+    owner_id = guild.owner_id
+    if not owner_id:
+        return False
+    try:
+        data = await db_export_all()
+        file, size, summary = backup_to_file(data)
+        owner = bot.get_user(owner_id) or await bot.fetch_user(owner_id)
+        await owner.send(
+            content=(f"💾 **Резервная копия базы The Legacy** ({datetime.now(MSK_TZ).strftime('%d.%m.%Y %H:%M')} МСК)\n"
+                     f"Содержимое: {summary or 'пусто'}\n"
+                     f"Если базу потеряем — пришлите этот файл мне или отправьте боту командой `!restore` (файл во вложении)."),
+            file=file)
+        await db_set_setting("last_backup_date", today)
+        logger.info(f"💾 Резервная копия отправлена владельцу ({size} байт).")
+        return True
+    except Exception as e:
+        logger.error(f"[BACKUP ERROR] {type(e).__name__}: {e}")
+        return False
+
 async def db_replace_paywall_backup(rows: list):
     """Полностью заменяет сохранённый снимок прав (rows=[] — очистить)."""
     PAYWALL_BACKUP.clear()
@@ -1287,6 +1377,8 @@ def create_bot(connector=None):
                 scheduled_news_digests.start()
             if not check_subscriptions_daily_loop.is_running():
                 check_subscriptions_daily_loop.start()
+            if not daily_backup_loop.is_running():
+                daily_backup_loop.start()
             if YOUTUBE_CHANNEL_ID and not check_youtube_streams_loop.is_running():
                 check_youtube_streams_loop.start()
         except Exception as e:
@@ -1703,6 +1795,54 @@ def create_bot(connector=None):
                 await ctx.send(f"✅ Отправлено в {channel.mention}.")
         except Exception as e:
             await ctx.send(f"❌ Не удалось отправить: {type(e).__name__}: {e}")
+
+    @new_bot.command(name="backup", aliases=["бэкап", "резерв"])
+    @commands.has_permissions(administrator=True)
+    async def cmd_backup(ctx):
+        """!backup — прислать резервную копию базы данных вам в личные сообщения прямо сейчас."""
+        if not db_pool:
+            await ctx.send("❌ База данных недоступна — копию сделать нельзя.")
+            return
+        ok = await run_daily_backup(force=True)
+        await ctx.send("✅ Резервная копия отправлена вам в личные сообщения." if ok
+                       else "❌ Не удалось отправить копию (закрыты ЛС или ошибка базы) — подробности в логах.")
+
+    @new_bot.command(name="restore", aliases=["восстановить"])
+    @commands.has_permissions(administrator=True)
+    async def cmd_restore(ctx, mode: str = "", confirm: str = ""):
+        """!restore (с файлом во вложении) — восстановить базу. `!restore replace подтверждаю` — сначала очистить таблицы."""
+        import gzip
+        if not db_pool:
+            await ctx.send("❌ База данных недоступна — сначала подключите базу (`DATABASE_URL`).")
+            return
+        if not ctx.message.attachments:
+            await ctx.send("Прикрепите файл резервной копии к сообщению с командой `!restore`.\n"
+                           "• `!restore` — добавить недостающее, существующие записи не трогать\n"
+                           "• `!restore replace подтверждаю` — полностью заменить данные содержимым файла")
+            return
+        replace = (mode.lower() == "replace")
+        if replace and confirm.lower() not in ("подтверждаю", "confirm", "yes"):
+            await ctx.send("⚠️ Режим `replace` удалит текущие данные. Повторите: `!restore replace подтверждаю` (с файлом).")
+            return
+        att = ctx.message.attachments[0]
+        if att.size > 24 * 1024 * 1024:
+            await ctx.send("❌ Файл слишком большой.")
+            return
+        try:
+            raw = await att.read()
+            if att.filename.endswith(".gz"):
+                raw = gzip.decompress(raw)
+            data = json.loads(raw.decode("utf-8"))
+            if not isinstance(data, dict) or "tables" not in data:
+                await ctx.send("❌ Это не файл резервной копии бота (нет раздела `tables`).")
+                return
+            report = await db_restore_all(data, replace=replace)
+            await init_db()   # перечитать данные в память (рейтинг, опрос и т.д.)
+            await ctx.send("✅ **База восстановлена**" + (" (режим replace)" if replace else "") + ":\n" +
+                           ("\n".join(f"• {r}" for r in report) or "• нечего восстанавливать"))
+        except Exception as e:
+            logger.error(f"[RESTORE ERROR] {type(e).__name__}: {e}")
+            await ctx.send(f"❌ Не удалось восстановить: {type(e).__name__}: {e}")
 
     @new_bot.command(name="paywall", aliases=["платный_доступ"])
     @commands.has_permissions(administrator=True)
@@ -2162,6 +2302,18 @@ async def check_youtube_streams_loop():
                         break
     except Exception as e:
         logger.error(f"[YOUTUBE LOOP ERROR] {e}")
+
+@tasks.loop(hours=1)
+async def daily_backup_loop():
+    try:
+        if not bot:
+            return
+        await bot.wait_until_ready()
+        now = datetime.now(MSK_TZ)
+        if now.hour >= BACKUP_HOUR_MSK:
+            await run_daily_backup()
+    except Exception as e:
+        logger.error(f"[BACKUP LOOP] {type(e).__name__}: {e}")
 
 @tasks.loop(hours=1)
 async def check_subscriptions_daily_loop():
