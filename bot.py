@@ -1947,11 +1947,32 @@ def create_bot(connector=None):
                 ok = await send_closed_announcement(new_bot)
                 await ctx.send("✅ Анонс отправлен." if ok else "❌ Не удалось отправить анонс — смотри логи.")
 
+            elif action in ("on", "flag"):
+                # Только включает «режим paywall» для бота (оповещения новичкам при входе), права каналов НЕ трогает
+                # и ничего не публикует. Нужна, если флаг потерялся (например, после смены базы данных).
+                PAYWALL_STATE["enabled"] = True
+                await db_set_setting("paywall_enabled", "1")
+                await ctx.send("✅ Режим платного доступа включён для бота: новые участники будут получать оповещение в ветке подписки. "
+                               "Права каналов не менялись.\n"
+                               "⚠️ Если база данных менялась, сохранённые прежние права каналов потеряны — команда `!paywall off` уже не вернёт их автоматически.")
+
+            elif action == "notice":
+                if not mode:
+                    await ctx.send("Использование: `!paywall notice @участник` — отправить ему оповещение в ветку подписки.")
+                    return
+                try:
+                    target = await commands.MemberConverter().convert(ctx, mode)
+                except Exception:
+                    await ctx.send("❌ Участник не найден.")
+                    return
+                ok = await send_paywall_notice(new_bot, target)
+                await ctx.send(f"✅ Оповещение для {target.mention} отправлено в ветку." if ok else "❌ Не удалось отправить — смотри логи.")
+
             elif action == "test":
                 ok = await send_paywall_notice(new_bot, ctx.author)
                 await ctx.send("✅ Тестовое оповещение отправлено в ветку." if ok else "❌ Не удалось отправить — смотри логи.")
             else:
-                await ctx.send("Использование: `!paywall`, `!paywall confirm`, `!paywall off`, `!paywall test`, `!paywall announce`")
+                await ctx.send("Использование: `!paywall`, `!paywall confirm`, `!paywall on`, `!paywall off`, `!paywall test`, `!paywall notice @участник`, `!paywall announce`")
         except Exception as e:
             logger.error(f"[PAYWALL COMMAND] {type(e).__name__}: {e}\n{traceback.format_exc()}")
             await ctx.send(f"❌ Ошибка: {type(e).__name__}: {e}")
